@@ -82,6 +82,7 @@ python main.py arxiv-translate 2605.26158v1 --out ./my-output
 | `PAPER_TOOLS_MERGE_MIN` | 短文本块合并阈值（字符，0=关闭） | `50` |
 | `PAPER_TOOLS_CITE_SEARCH` | 引用搜索引擎（google/bing/duckduckgo/semantic_scholar/arxiv） | `bing` |
 | `PAPER_TOOLS_CITE_DISPLAY` | 引用显示模式（short/title） | `short` |
+| `PAPER_TOOLS_EXPORT_FORMATS` | 额外导出格式（**开发中，暂未启用**，预留 docx/pdf/all） | 空 |
 
 ## 项目结构
 

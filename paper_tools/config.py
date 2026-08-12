@@ -63,6 +63,22 @@ class AppSettings:
     # 引用显示模式：short = 只显示作者年份（短链，论文名靠 hover 提示）
     #              title = 显示作者年份 + 完整论文名（信息全但占行宽）
     cite_display_mode: str = "short"
+    # 输出文件命名方式（翻译后的 .zh.md / .glossary.json）：
+    #   id       = 用 arxiv ID 命名（默认，如 2603.16192v1.zh.md）
+    #   title    = 用「原论文英文标题」命名（非法符号自动换为等价中文符号）
+    #   title_zh = 用「翻译后的中文标题」命名（非法符号自动换为等价中文符号）
+    output_name_mode: str = "id"
+    # Token 用量报告：翻译结束后在日志中输出总 token 消耗、缓存命中/未命中及其占比。
+    # 默认关闭，避免控制台刷屏；可通过配置或环境变量 PAPER_TOOLS_TOKEN_REPORT 开启。
+    token_report: bool = False
+    # 导出格式：翻译完成后自动导出为哪些额外格式。
+    # 可选值：docx、pdf、docx_pdf（等同于同时 docx+pdf）、all（docx+pdf）。
+    # 留空表示不导出额外格式，只输出 .zh.md。
+    # 环境变量 PAPER_TOOLS_EXPORT_FORMATS 可覆盖（逗号分隔，如 docx,pdf）。
+    export_formats: str = ""
+    # 是否仍输出 .zh.md（markdown）。默认 True：导出 docx/pdf 时也会保留 markdown。
+    # 设为 False 可只产出 docx/pdf（例如 --no-md / PAPER_TOOLS_OUTPUT_MD=false）。
+    output_markdown: bool = True
 
     def resolve(self) -> "AppSettings":
         """用环境变量/默认值补全缺失字段。"""
@@ -87,8 +103,16 @@ class AppSettings:
             self.cite_search_engine = env.strip().lower()
         if env := os.environ.get("PAPER_TOOLS_CITE_DISPLAY"):
             self.cite_display_mode = env.strip().lower()
+        if env := os.environ.get("PAPER_TOOLS_NAME_MODE"):
+            self.output_name_mode = env.strip().lower()
         if env := os.environ.get("PAPER_TOOLS_MERGE_MIN"):
             self.merge_min_chars = int(env)
+        if env := os.environ.get("PAPER_TOOLS_TOKEN_REPORT"):
+            self.token_report = env.strip().lower() in ("1", "true", "yes", "on")
+        if env := os.environ.get("PAPER_TOOLS_EXPORT_FORMATS"):
+            self.export_formats = env.strip().lower()
+        if env := os.environ.get("PAPER_TOOLS_OUTPUT_MD"):
+            self.output_markdown = env.strip().lower() in ("1", "true", "yes", "on")
         return self
 
 

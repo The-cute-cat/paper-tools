@@ -157,6 +157,57 @@ class Glossary:
                     t.zh = zh.strip()
         return added
 
+    # 扫描英文原文里的“缩写 = 英文全称”定义（如 "H = Hate Speech"、
+    # "MG: Malware Generation"、"F (Fraud)"）。提取为 缩写 -> 英文全称 关联，
+    # 用于让模型在翻译含该缩写的句子（尤其图注/表头）时统一沿用全称译法，
+    # 不依赖任何具体论文的硬编码术语。
+    # 缩写允许单字母（如 H、F）或多字母/含点（如 MG、MIT、U.S.）。
+    _ABBREV_DEF_RE = re.compile(
+        r"(?<![A-Za-z0-9])"                                  # 左侧非字母数字（避免截断词）
+        r"([A-Za-z][A-Za-z0-9.\-]{0,14})"                   # 缩写（首字母大写，1~15 字符）
+        r"\s*[:=]\s*"                                        # = 或 :
+        r"([A-Za-z][A-Za-z0-9 \-]*(?:[A-Za-z0-9]))"         # 英文全称短语
+        r"(?=[,;.)\]\n]|\Z)"                                # 后接标点/结束
+    )
+    _ABBREV_PAREN_RE = re.compile(
+        r"(?<![A-Za-z0-9])"
+        r"([A-Za-z][A-Za-z0-9.\-]{0,14})\s*\(([A-Za-z][A-Za-z0-9 \-]+?)\)"  # ABBR (English)
+    )
+
+    def ingest_abbrev_defs(self, text_en: str) -> list[str]:
+        """从英文原文里提取“缩写 = 英文全称”定义，存入术语表（仅记录英文全称）。
+
+        返回新收录的缩写 key。这些条目暂不含中文译法，待对应图注/定义句翻译后
+        由 ingest_translation 补全；但在翻译含该缩写的其它块时，术语表会提示模型
+        “X 是 Y 的缩写”，从而与图注明文译法保持一致。
+        """
+        added: list[str] = []
+        for m in self._ABBREV_DEF_RE.finditer(text_en or ""):
+            abbr, en_full = m.group(1), m.group(2).strip()
+            if len(en_full) <= len(abbr):  # 全称应明显长于缩写
+                continue
+            if abbr.lower() in self.terms:  # 已是普通术语，跳过
+                continue
+            k = self._norm(abbr)
+            if k not in self.terms:
+                self.terms[k] = Term(zh="", en_full=en_full, note=f"缩写，全称 {en_full}")
+                added.append(abbr)
+            else:
+                t = self.terms[k]
+                if not t.en_full:
+                    t.en_full = en_full
+                if not t.note:
+                    t.note = f"缩写，全称 {en_full}"
+        for m in self._ABBREV_PAREN_RE.finditer(text_en or ""):
+            abbr, en_full = m.group(1), m.group(2).strip()
+            if len(en_full) <= len(abbr):
+                continue
+            k = self._norm(abbr)
+            if k not in self.terms:
+                self.terms[k] = Term(zh="", en_full=en_full, note=f"缩写，全称 {en_full}")
+                added.append(abbr)
+        return added
+
     def to_prompt_lines(self, *, strict: bool = True) -> str:
         """生成喂给模型的术语约束文本。
 
@@ -169,6 +220,9 @@ class Glossary:
         for k, t in self.terms.items():
             if t.zh == KEEP_AS_IS:
                 line = f"- {k} → 【保留英文原文，严禁翻译】"
+            elif t.en_full and not t.zh:
+                # 仅收录了缩写全称、尚未确定中文：提示模型沿用标准译法
+                line = f"- {k}（{t.en_full}）→ 缩写，请采用其中文标准译法并与后文一致"
             elif t.en_full:
                 line = f"- {k}（{t.en_full}）→ 【{t.zh}】"
             else:

@@ -32,6 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", default=None, help="输出根目录（默认读配置 PAPER_TOOLS_OUTPUT）")
     p.add_argument("--model", default=None, help="DeepSeek 模型名（覆盖配置）")
     p.add_argument("--api-key", default=None, help="DeepSeek API key（覆盖环境变量）")
+    p.add_argument("--export", default=None,
+                   help="额外导出格式：docx、pdf、docx_pdf、all（逗号分隔，如 --export docx,pdf）")
+    p.add_argument("--no-md", action="store_true",
+                   help="不输出 .zh.md，仅导出 docx/pdf（默认两种都输出）")
     return parser
 
 
@@ -47,6 +51,10 @@ def main(argv: list[str] | None = None) -> None:
             settings.llm.model = args.model
         if args.api_key:
             settings.llm.api_key = args.api_key
+        if args.export:
+            settings.export_formats = args.export.strip().lower()
+        if args.no_md:
+            settings.output_markdown = False
 
     logger = setup_logging(settings.log_level)
 

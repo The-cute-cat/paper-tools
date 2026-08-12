@@ -2,14 +2,17 @@
 
 import re
 import sys
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Optional
 
+import requests
 from bs4 import BeautifulSoup
 
 from ...config import get_settings
 from ...core.downloader import download_binary, download_text
+from ...core.exporter import html_to_docx, html_to_pdf
 from ...core.glossary import Glossary, KEEP_AS_IS, Term, WRONG_VARIANT_MAP
 from ...core.translator import LLMTranslator
 from ...logging_setup import get_logger
@@ -21,7 +24,7 @@ ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5}(v\d+)?)", re.IGNORECASE)
 
 
 def _new_tqdm(
-    iterable_or_n: Iterable | int,
+    iterable_or_n: Any,
     desc: str,
     unit: str,
     total: int | None = None,
@@ -62,6 +65,96 @@ def parse_arxiv_id(url_or_id: str) -> str:
     return m.group(1)
 
 
+def _resolve_html_url(arxiv_id: str) -> tuple[str, str]:
+    """解析 arxiv HTML 全文页面地址。
+
+    arxiv 的 HTML 版本化资源位于 ``https://arxiv.org/html/<id>vN``，
+    不带版本号的根路径 ``/html/<id>`` 在部分论文上会 404。为稳定获取
+    “最新版本” 的 HTML，这里统一访问 abs 摘要页
+    ``https://arxiv.org/abs/<id>``，解析其中指向 ``/html/`` 的链接，
+    取版本号最大的那个作为 HTML 全文地址。
+
+    返回 (html_url, base_url)：
+      - html_url：可下载的 HTML 全文完整 URL（含版本号）。
+      - base_url：该 HTML 文档根（用于补全相对图片路径），如
+        ``https://arxiv.org/html/2603.16192v1/``。
+    若 abs 页解析失败，回退为直接构造 ``/html/<arxiv_id>``。
+    """
+    base_id = re.sub(r"v\d+$", "", arxiv_id, flags=re.IGNORECASE)
+    abs_url = f"https://arxiv.org/abs/{base_id}"
+    try:
+        resp = requests.get(abs_url, timeout=get_settings().download_timeout,
+                            headers=get_settings().download_headers)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # abs 页 ACCESS PAPER 区域通常有 "HTML (experimental)" 链接指向 /html/<id>vN
+        best: tuple[int, str] | None = None
+        for a in soup.find_all("a", href=re.compile(r"/html/" + re.escape(base_id) + r"v\d+")):
+            href = a.get("href", "")
+            vm = re.search(r"v(\d+)$", href)
+            if not vm:
+                continue
+            ver = int(vm.group(1))
+            cand = "https://arxiv.org" + href if href.startswith("/") else href
+            if best is None or ver > best[0]:
+                best = (ver, cand)
+        if best:
+            html_url = best[1]
+            # ar5iv 的图片 src 是相对于 arxiv html 站点的相对路径，
+            # 形如 ``2603.16192v1/illustration6.png``，完整 URL 为
+            # ``https://arxiv.org/html/<id>vN/<file>``，故文档根为
+            # ``https://arxiv.org/html/``（不带版本号子目录）。
+            base_url = "https://arxiv.org/html/"
+            logger.info(f"从 abs 页解析到最新 HTML 版本: {html_url}")
+            return html_url, base_url
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"解析 abs 页获取 HTML 链接失败，回退直接构造: {e}")
+
+    # 回退：直接使用用户输入（可能含版本号）构造
+    html_url = f"https://arxiv.org/html/{arxiv_id}"
+    base_url = "https://arxiv.org/html/"
+    return html_url, base_url
+
+
+# 文件名非法字符 -> 等价中文/全角符号映射（Windows/Linux 均不支持的字符）
+_FILENAME_ILLEGAL_MAP = {
+    "\\": "＼",   # 全角反斜杠
+    "/": "、",     # 顿号
+    ":": "：",     # 全角冒号
+    "*": "＊",     # 全角星号
+    "?": "？",     # 全角问号
+    '"': "”",      # 右双引号（成对处理时如含左引号也替换）
+    "<": "＜",     # 全角小于
+    ">": "＞",     # 全角大于
+    "|": "｜",     # 全角竖线
+    "\n": "", "\r": "", "\t": "",
+}
+
+
+def _safe_filename(stem: str, max_len: int = 120) -> str:
+    """把任意标题文本转为安全的文件名 stem。
+
+    - 将文件系统非法字符替换为等价中文/全角符号（见 _FILENAME_ILLEGAL_MAP）。
+    - 丢弃控制字符。
+    - 去除首尾空白与句末点（避免 Windows 文件名以点结尾的问题）。
+    - 截断到 max_len（避免超长路径），并去掉截断后产生的尾随空白/点。
+    """
+    out = []
+    for ch in stem:
+        if ch in _FILENAME_ILLEGAL_MAP:
+            out.append(_FILENAME_ILLEGAL_MAP[ch])
+        elif unicodedata.category(ch).startswith("C"):  # 控制字符
+            continue
+        else:
+            out.append(ch)
+    name = "".join(out).strip().strip(".")
+    # 折叠连续空白与折叠重复全角符号（仍保留单空格）
+    name = re.sub(r"\s{2,}", " ", name)
+    if len(name) > max_len:
+        name = name[:max_len].rstrip().rstrip(".")
+    return name or "paper"
+
+
 # 通用学术章节标题映射（领域中立，覆盖绝大多数论文的章节名）。
 # 优先用于 heading 渲染，避免翻译模型把段落幻觉混入标题，
 # 也避免逐篇翻译时章节名译法不一致（如 Abstract 有时译“摘要”有时译“概要”）。
@@ -92,21 +185,34 @@ _SECTION_TITLE_MAP: dict[str, str] = {
 }
 
 
+def _strip_trailing_punct(text: str) -> str:
+    """去除字符串末尾的孤立句号（用于标题渲染前的清理）。
+
+    LLM 翻译时经常在 JSON 输出里给标题末尾多加一个句号（"4.4 分析."、
+    "计算开销."），导致目录与正文中标题出现多余句号。这里只剥离末尾的句号
+    （中英文句号 . 。），章节编号里的点号（如 "4.4.1"）位于字符串内部/前面，
+    不会被剥离。问号、感叹号等标题中合理存在的标点一律保留。
+    """
+    return text.rstrip(".。")
+
+
 def _block_to_md(block: Block, translation: str, img_mapping: dict[str, str]) -> str:
     if block.kind == "title":
-        return f"# {translation}\n"
+        return f"# {_strip_trailing_punct(translation)}\n"
     if block.kind == "heading":
         # 先用通用学术章节标题映射（领域中立、稳定，避免翻译幻觉把段落混入标题）。
         trans = _SECTION_TITLE_MAP.get(block.text.strip().lower(), translation)
-        # 标题翻译易出现“把后续段落混入标题”的幻觉。合理性校验：标题应短、
+        # 标题翻译易出现"把后续段落混入标题"的幻觉。合理性校验：标题应短、
         # 无段落标志词、无多个句末标点、且原文极短时译文不应膨胀为段落。
         # 任一不通过则回退到原文 block.text，保证 markdown 结构正确且不重复。
         if not _looks_like_heading(trans, block.text):
             trans = block.text
-        return f"{'#' * block.level} {trans}\n"
+        # 标题末尾的孤立句末标点（最常见的是模型在 JSON 输出里多加的句号）
+        # 总是剥离，确保目录与正文标题干净无句号。
+        return f"{'#' * block.level} {_strip_trailing_punct(trans)}\n"
     if block.kind in ("paragraph", "list_item"):
         return f"{translation}\n"
-    if block.kind in ("equation", "figure", "table"):
+    if block.kind in ("equation", "figure", "table", "listing"):
         raw = block.raw
         for orig, local in img_mapping.items():
             raw = raw.replace(orig, local)
@@ -119,6 +225,17 @@ def _looks_like_heading(trans: str, orig: str) -> bool:
     if not trans or not trans.strip():
         return False
     t = trans.strip()
+    o = orig.strip()
+    # 译文与原文几乎一致（视为未翻译）：标题必须译成中文，否则返回 False
+    # 允许略去的差异：章节编号首尾空格、大小写、引号；用归一化后做相似度比较。
+    def _norm(s: str) -> str:
+        s = s.lower()
+        s = re.sub(r"^[\s\-\.]+", "", s)
+        s = re.sub(r"[\s\-\.]+$", "", s)
+        s = re.sub(r"[\s\-\.]+", " ", s)
+        return s.strip()
+    if _norm(t) == _norm(o):
+        return False
     # 原文极短（如 "Abstract"），译文长度不应膨胀为段落
     if len(orig) <= 12 and len(t) > 80:
         return False
@@ -161,7 +278,7 @@ def _merge_short_blocks(blocks: list[Block], min_chars: int) -> tuple[list[Block
         return blocks, [[i] for i in range(len(blocks))]
 
     TEXT_KINDS = ("paragraph", "list_item")
-    STRUCT_KINDS = ("title", "heading", "equation", "figure", "table")
+    STRUCT_KINDS = ("title", "heading", "equation", "figure", "table", "listing")
 
     units: list[list[int]] = []
     last_text_unit_idx: Optional[int] = None  # 最近一个文本单元在 units 中的下标
@@ -198,23 +315,39 @@ def _merge_short_blocks(blocks: list[Block], min_chars: int) -> tuple[list[Block
     return blocks, units
 
 
-def _download_images(html_text: str, img_dir: Path) -> dict[str, str]:
-    """从 HTML 文本中解析图片并下载；返回 原始src -> 本地相对路径 映射。"""
-    soup = BeautifulSoup(html_text, "html.parser")
-    imgs = soup.find_all("img")
-    if not imgs:
-        return {}
-    img_dir.mkdir(parents=True, exist_ok=True)
-    mapping: dict[str, str] = {}
-    base = "https://arxiv.org/html/"
+def _download_images(html_text: str, img_dir: Path, base: str = "https://arxiv.org/html/") -> dict[str, str]:
+    """从 HTML 文本中解析图片并下载；返回 原始src -> 本地相对路径 映射。
 
-    # 只统计真正需要下载的图片，过滤掉 data: 与无效 src
-    todo: list[tuple[str, str, str]] = []
-    for img in imgs:
+    base: HTML 文档根 URL（含版本号，如 https://arxiv.org/html/2603.16192v1/），
+          用于把相对图片路径补全为完整网络 URL。
+
+    ar5iv 对较大/矢量图（如阈值敏感性分析的 SVG）用 <object data="*.svg"> 而非
+    <img src="*.png"> 嵌入。这里同时扫描两种标签，保证本地模式下 SVG 也被下载。
+    """
+    soup = BeautifulSoup(html_text, "html.parser")
+    # 兼容 <img src> 与 <object data> 两种资源嵌入方式（图 3 这类 SVG 走 <object>）
+    refs: list[tuple[str, str]] = []
+    for img in soup.find_all("img"):
         src = img.get("src")
         if isinstance(src, list):
             src = src[0] if src else None
-        if not isinstance(src, str) or src.startswith("data:") or not src.rstrip("/").split("/")[-1]:
+        if isinstance(src, str) and src:
+            refs.append(("img", src))
+    for obj in soup.find_all("object"):
+        src = obj.get("data")
+        if isinstance(src, list):
+            src = src[0] if src else None
+        if isinstance(src, str) and src:
+            refs.append(("object", src))
+    if not refs:
+        return {}
+    img_dir.mkdir(parents=True, exist_ok=True)
+    mapping: dict[str, str] = {}
+
+    # 只统计真正需要下载的资源，过滤掉 data: 与无效 src
+    todo: list[tuple[str, str, str]] = []
+    for kind, src in refs:
+        if src.startswith("data:") or not src.rstrip("/").split("/")[-1]:
             continue
         if src.startswith("http"):
             full = src
@@ -235,8 +368,8 @@ def _download_images(html_text: str, img_dir: Path) -> dict[str, str]:
 
 
 def _text_of_block(block: Block) -> str:
-    """取一个块用于翻译的文本（标题/段落/列表用 text，图表表格用 caption）。"""
-    if block.kind in ("equation", "figure", "table"):
+    """取一个块用于翻译的文本（标题/段落/列表用 text，图表表格及伪代码用 caption）。"""
+    if block.kind in ("equation", "figure", "table", "listing"):
         return block.meta.get("caption") or ""
     return block.text or ""
 
@@ -350,20 +483,71 @@ def _translate_unit(translator: LLMTranslator, blocks: list[Block], unit: list[i
     return out
 
 
+def _pre_translate_abbrevs(translator: LLMTranslator, blocks: list[Block],
+                            glossary: Glossary, summary: str = "") -> dict[int, str]:
+    """缩写定义预热：先扫描英文原文里的“缩写 = 英文全称”定义入表，再单线程优先
+    翻译含缩写定义的块（图注/脚注/定义句），把其中文译法 ingest 进术语表。
+
+    返回 {block_index: 预翻译结果}。这些块在后续并发翻译阶段会被直接复用，
+    不再重翻，从而保证表格表头等位置出现的同一缩写与图注译法一致。
+
+    这是通用机制：不依赖任何具体论文的硬编码术语，完全由论文自身文本驱动。
+    """
+    # 1) 英文原文缩写定义扫描入库（仅记录 缩写 -> 英文全称）
+    for b in blocks:
+        text = _text_of_block(b)
+        if text.strip():
+            glossary.ingest_abbrev_defs(text)
+
+    # 2) 找出“含缩写定义”的块：图注/脚注 caption，或正文里出现 “ABBR = English” 的段落
+    ABBR_DEF_HINT = re.compile(r"\b[A-Z][A-Za-z0-9]{1,}\s*[:=]\s*[A-Za-z][A-Za-z0-9 \-]+")
+    pre_idx: list[int] = []
+    for i, b in enumerate(blocks):
+        if b.kind in ("figure", "table", "listing"):  # 图注/表注/伪代码注常含缩写映射
+            pre_idx.append(i)
+            continue
+        if b.kind in ("paragraph", "list_item") and ABBR_DEF_HINT.search(b.text or ""):
+            pre_idx.append(i)
+    if not pre_idx:
+        return {}
+
+    logger.info(f"缩写定义预热：优先翻译 {len(pre_idx)} 个含缩写定义的块以锁定术语")
+    prefilled: dict[int, str] = {}
+    for i in _new_tqdm(pre_idx, "缩写预热", "block"):
+        b = blocks[i]
+        text = _text_of_block(b)
+        if not text.strip():
+            prefilled[i] = ""
+            continue
+        trans, terms = translator.translate(text, glossary, summary=summary)
+        glossary.ingest_terms(terms)
+        glossary.ingest_translation(trans)
+        prefilled[i] = trans
+    return prefilled
+
+
 def _translate_units(translator: LLMTranslator, blocks: list[Block], units: list[list[int]],
                     glossary: Glossary, concurrency: int,
-                    summary: str = "") -> dict[int, tuple[str, list]]:
-    """按翻译单元并发翻译。返回 {block_index: (translation, terms)}。"""
+                    summary: str = "", prefilled: Optional[dict[int, str]] = None) -> dict[int, tuple[str, list]]:
+    """按翻译单元并发翻译。返回 {block_index: (translation, terms)}。
+
+    prefilled: 已预翻译好的块下标 -> 译文，直接复用，不再翻译（用于缩写预热）。
+    """
+    prefilled = prefilled or {}
     results: dict[int, tuple[str, list]] = {}
+    pending_units = [u for u in units if not all(i in prefilled for i in u)]
+    if prefilled:
+        for i, trans in prefilled.items():
+            results[i] = (trans, [])
     if concurrency <= 1:
-        for u in _new_tqdm(units, "翻译", "unit"):
+        for u in _new_tqdm(pending_units, "翻译", "unit"):
             results.update(_translate_unit(translator, blocks, u, glossary, summary))
         return results
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
         fut_map = {
             pool.submit(_translate_unit, translator, blocks, u, glossary, summary): u
-            for u in units
+            for u in pending_units
         }
         for fut in _new_tqdm(as_completed(fut_map), "翻译", "unit", total=len(fut_map)):
             u = fut_map[fut]
@@ -380,10 +564,197 @@ def _retranslate_unit(translator: LLMTranslator, blocks: list[Block], unit: list
         translations[i] = trans
 
 
+def _split_gfm_cells(line: str) -> list[str]:
+    """将 GFM 表格行按 | 拆分为 cell 列表，处理 \\| 转义与 $...$ 内管道。"""
+    if not line.strip().startswith("|"):
+        return []
+    # 去掉首尾 |
+    inner = line.strip()
+    if inner.startswith("|"):
+        inner = inner[1:]
+    if inner.endswith("|"):
+        inner = inner[:-1]
+    cells: list[str] = []
+    depth_math = 0
+    buf: list[str] = []
+    i = 0
+    while i < len(inner):
+        ch = inner[i]
+        if ch == "\\" and i + 1 < len(inner) and inner[i + 1] == "|":
+            buf.append("|")
+            i += 2
+            continue
+        if ch == "$":
+            depth_math ^= 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "|" and depth_math == 0:
+            cells.append("".join(buf).strip())
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    cells.append("".join(buf).strip())
+    return cells
+
+
+_CJK_CHAR_RE = re.compile(r"[\u4E00-\u9FFF\u3400-\u4DBF]")
+_NUMBER_ONLY_RE = re.compile(r"^[\d.\-\s,%†‡∗*†‡]+$")
+
+
+def _cell_is_translatable(cell: str) -> bool:
+    """判断 GFM 表格 cell 是否含有需要翻译的英文文本。
+
+    跳过：纯数字/符号/LaTeX/空/全大写短缩写/已含中文的 cell。
+    为避免学术表格中的"单词专有名词/缩写"（如 ASR、Ordered 这种数据类别名）
+    被错误地强制译为全中文，对**单词（cell 内无空格）且 ≤ 2 个 token** 的
+    cell 跳过；但对**多词短语**一律翻译（含表头多词单元格如 "History Order"
+    "Module Name" 等）。
+    """
+    if not cell or not cell.strip():
+        return False
+    text = cell.strip()
+    # 0) 检测整 cell 是否被 <strong>/<b> 包成"加粗专名"（模型/方法/产品名）
+    #    如 <strong>Qwen</strong> / <b>Llama</b>。这类在 ar5iv 表格中作列头或
+    #    行标签，LLM 容易误译（Qwen→千问、Llama→美洲驼），代码侧强制保留。
+    #    必须在"HTML 标签剥除"之前判断，否则标签会被后续步骤删掉导致漏判。
+    _BOLD_RE = re.compile(r"^\s*<(?:strong|b)>([^<]+)</(?:strong|b)>\s*$",
+                          re.IGNORECASE)
+    _bm = _BOLD_RE.match(text)
+    if _bm:
+        _inner = _bm.group(1).strip()
+        _iw = _inner.split()
+        if len(_iw) == 1:
+            _bs = _iw[0]
+            # 首字母大写、其余全小写、长度 2-12（典型模型/品牌名：Qwen/Llama/Claude）
+            if re.fullmatch(r"[A-Z][a-z]+", _bs) and 2 <= len(_bs) <= 12:
+                return False
+            # CamelCase（如 SageClassifier / MixtralXX）
+            if re.fullmatch(r"[A-Z][a-z]+(?:[A-Z][a-z]*)+", _bs) and len(_bs) <= 12:
+                return False
+    # 1) 剥除常见格式标记，否则后续词拆分会被标签污染
+    #    - markdown **bold** / *italic*
+    #    - HTML <strong> <b> <em> <i> <u>（parser 在表格里把 ** 规范化为 <strong>）
+    text_no_fmt = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text_no_fmt = re.sub(r"\*([^*]+)\*", r"\1", text_no_fmt)
+    text_no_fmt = re.sub(r"<(?:strong|b|em|i|u)>([^<]*)</(?:strong|b|em|i|u)>",
+                          r"\1", text_no_fmt, flags=re.IGNORECASE)
+
+    # 2) 纯数字/符号/单位 → 跳过
+    if _NUMBER_ONLY_RE.match(text_no_fmt):
+        return False
+    # 3) 已含中文 → 跳过（已翻译过，或中文专有名词）
+    if _CJK_CHAR_RE.search(text_no_fmt):
+        return False
+    # 4) 去掉 LaTeX $...$，避免公式影响判断
+    text_no_math = re.sub(r"\$[^$\n]+?\$", "", text_no_fmt)
+    if not text_no_math.strip():
+        return False
+
+    words = text_no_math.strip().split()
+    # 5) 至少含一个字母长度 ≥ 3 的"词"，否则说明全是符号/数字 → 跳过
+    has_word = any(re.search(r"[A-Za-z]", w) and len(re.sub(r"[^A-Za-z]", "", w)) >= 3
+                   for w in words)
+    if not has_word:
+        return False
+    # 6) 检测"版本号/模型名 + 数字"（如 Qwen2.5-7B、Llama3-8B、GPT-4o、
+    #    Claude-3.5、SAGE-v2 等）。这类整 cell 只由"字母+数字+.-_"
+    #    构成、首字符为字母、含至少一个数字，一律视作专名 → 跳过。
+    if len(words) == 1:
+        single = text_no_math.strip()
+        if (re.fullmatch(r"[A-Za-z][A-Za-z0-9.\-_]*\d[A-Za-z0-9.\-_]*", single)
+                and any(c.isalpha() for c in single)
+                and not " " in single):
+            return False
+    # 7) 全大写短缩写（GCG / PRP / ASR 等）→ 不翻译。
+    #    注：对单词 cell 而言，prompt 已经要求 LLM 保留专名，所以这里不再
+    #    单独保护首字母大写单词（如 Qwen / Llama / Half / Linear 等）——
+    #    留给 LLM 自行判断，避免代码侧过度保守。
+    alpha_tokens = [re.sub(r"[^A-Za-z]", "", w) for w in words]
+    alpha_tokens = [w for w in alpha_tokens if w]
+    if alpha_tokens:
+        all_upper = all(w.isupper() and len(w) <= 5 for w in alpha_tokens)
+        if all_upper:
+            return False
+    return True
+
+
+def _translate_table_cells(
+    table_md: str,
+    translator: LLMTranslator,
+    glossary: Glossary,
+    summary: str = "",
+) -> str:
+    """对 GFM 表格做 cell 级别翻译：只翻译含英文文本的 cell，保留结构 / 数字 / LaTeX。
+
+    策略：
+      - 解析表格为行×列网格。
+      - 对每个 translatable cell 调用 translator.translate，LaTeX 由 protect_math 保护。
+      - 重建 GFM 表格字符串。
+      - 若表格无可译 cell，直接返回原文。
+    """
+    lines = table_md.strip().split("\n")
+    if len(lines) < 2:
+        return table_md
+
+    # 解析为网格（保留分隔行位置信息）
+    grid: list[list[str]] = []
+    sep_idx: int | None = None
+    for ln in lines:
+        cells = _split_gfm_cells(ln)
+        if not cells:
+            continue
+        # 检测分隔行（如 | --- | --- |）
+        if all(re.match(r"^:?-{3,}:?$", c) for c in cells):
+            grid.append(cells)
+            sep_idx = len(grid) - 1
+        else:
+            grid.append(cells)
+
+    if not grid or sep_idx is None:
+        return table_md
+
+    # 收集所有需要翻译的 cell（row, col）
+    todo: list[tuple[int, int, str]] = []
+    for ri, row in enumerate(grid):
+        if ri == sep_idx:  # 分隔行跳过
+            continue
+        for ci, cell in enumerate(row):
+            if _cell_is_translatable(cell):
+                todo.append((ri, ci, cell))
+
+    if not todo:
+        return table_md  # 没有可翻译 cell，直接返回原表
+
+    # 翻译每个 cell
+    translated: dict[tuple[int, int], str] = {}
+    for ri, ci, cell_text in todo:
+        try:
+            trans, _ = translator.translate(cell_text, glossary, summary=summary)
+            translated[(ri, ci)] = trans
+        except Exception as e:
+            logger.warning(f"表格 cell({ri},{ci}) 翻译失败: {e}")
+            translated[(ri, ci)] = cell_text
+
+    # 重建表格
+    out_lines: list[str] = []
+    for ri, row in enumerate(grid):
+        new_row: list[str] = []
+        for ci, cell in enumerate(row):
+            if ri == sep_idx:
+                new_row.append(cell)  # 分隔行原样
+            else:
+                new_row.append(translated.get((ri, ci), cell))
+        out_lines.append("| " + " | ".join(new_row) + " |")
+    return "\n".join(out_lines)
+
+
 def _translate_tables(translator: LLMTranslator, blocks: list[Block],
                      glossary: Glossary, concurrency: int,
                      summary: str = "") -> dict[int, str]:
-    """并发翻译所有 table 块的 table_md 内容。返回 {block_index: translated_table_md}。"""
+    """并发翻译所有 table 块：以 cell 粒度翻译文本内容，保留数字 / 公式 / 结构。"""
     tasks: list[tuple[int, str]] = []
     for i, block in enumerate(blocks):
         if block.kind != "table":
@@ -396,15 +767,24 @@ def _translate_tables(translator: LLMTranslator, blocks: list[Block],
     if not tasks:
         return {}
 
-    logger.info(f"检测到 {len(tasks)} 个表格需要单独翻译")
+    logger.info(f"检测到 {len(tasks)} 个表格，以 cell 粒度翻译 ...")
     results: dict[int, str] = {}
+
+    translatable_count = 0
+    for _, table_md in tasks:
+        for line in table_md.split("\n"):
+            cells = _split_gfm_cells(line)
+            for cell in cells:
+                if _cell_is_translatable(cell):
+                    translatable_count += 1
+    logger.info(f"  其中 {translatable_count} 个 cell 含英文文本需翻译，其余保留原文")
 
     def _do(idx_text: tuple[int, str]) -> tuple[int, str]:
         i, text = idx_text
         try:
-            trans, _ = translator.translate(text, glossary, summary=summary)
+            trans = _translate_table_cells(text, translator, glossary, summary)
         except Exception as e:
-            logger.warning(f"表格 {i} 翻译失败: {e}")
+            logger.warning(f"表格 {i} cell-level 翻译失败，回退原文: {e}")
             trans = text
         return i, trans
 
@@ -515,10 +895,10 @@ def run(url_or_id: str) -> Path:
     workdir.mkdir(parents=True, exist_ok=True)
     img_dir = workdir / "images"
 
-    # 1. 下载 HTML
-    url = f"https://arxiv.org/html/{arxiv_id}"
-    logger.info(f"下载 HTML: {url}")
-    html_text = download_text(url)
+    # 1. 下载 HTML（通过 abs 页解析最新版本化 HTML 地址，规避无版本号 404）
+    html_url, html_base = _resolve_html_url(arxiv_id)
+    logger.info(f"下载 HTML: {html_url}")
+    html_text = download_text(html_url)
     html_path = workdir / f"{arxiv_id}.html"
     html_path.write_text(html_text, encoding="utf-8")
     logger.info(f"  已保存: {html_path}")
@@ -527,14 +907,21 @@ def run(url_or_id: str) -> Path:
     img_mapping: dict[str, str] = {}
     if settings.image_local:
         logger.info("下载论文图片（本地模式） ...")
-        img_mapping = _download_images(html_text, img_dir)
+        img_mapping = _download_images(html_text, img_dir, base=html_base)
     else:
         logger.info("图片本地模式未开启，引用保持原网络 URL，跳过下载")
 
     # 3. 解析
     logger.info("解析 HTML 结构 ...")
-    blocks = parse_arxiv_html(html_path, img_mapping=img_mapping)
+    blocks, html_soup = parse_arxiv_html(html_path, img_mapping=img_mapping, base_url=html_base)
     logger.info(f"  提取到 {len(blocks)} 个内容块")
+
+    # 记录原论文英文标题（用于 title 命名模式）
+    orig_title = ""
+    for b in blocks:
+        if b.kind == "title" and b.text:
+            orig_title = b.text
+            break
 
     # 3.1 短块合并：过短的相邻文本块组成翻译单元一起请求（JSON 分块翻译，但各块内容保持独立）
     blocks, units = _merge_short_blocks(blocks, settings.merge_min_chars)
@@ -553,10 +940,15 @@ def run(url_or_id: str) -> Path:
     # 摘要仅作为内部 prompt 上下文传给 translator，不向用户控制台输出全文。
     summary = _build_paper_summary(blocks, translator)
 
+    # 4.1.2 缩写定义预热：扫描英文原文缩写定义 + 优先翻译图注/脚注等含缩写块，
+    # 使术语表先锁定缩写译法，保证后续表格表头与图注一致。通用机制，无硬编码。
+    prefilled = _pre_translate_abbrevs(translator, blocks, glossary, summary=summary)
+
     # 4.2 并发翻译阶段（按翻译单元调度；合并组以 JSON 数组分块翻译）
     logger.info("开始并发翻译 ...")
     results = _translate_units(
-        translator, blocks, units, glossary, settings.translate_concurrency, summary=summary
+        translator, blocks, units, glossary, settings.translate_concurrency,
+        summary=summary, prefilled=prefilled
     )
     translations = {i: results[i][0] for i in results}
     all_terms = [results[i][1] for i in results]
@@ -615,7 +1007,7 @@ def run(url_or_id: str) -> Path:
             title_text = trans or block.text
             # 标题已在文件头部统一输出，避免正文中重复出现
             continue
-        if block.kind in ("figure", "table"):
+        if block.kind in ("figure", "table", "listing"):
             cap_zh = trans
             if block.kind == "figure":
                 # 图片引用路径由 parser 阶段计算好（本地模式为 images/...，
@@ -624,6 +1016,16 @@ def run(url_or_id: str) -> Path:
                 img_ref = block.meta.get("local_src") or block.meta.get("src") or ""
                 prefix = f"![figure]({img_ref})\n\n> " if img_ref else "> "
                 block.raw = (prefix + cap_zh) if cap_zh else (prefix.strip() or "(图)")
+            elif block.kind == "listing":
+                # 伪代码块：代码内容以两列 GFM 表格原样保留（行号列 + 代码列），
+                # 仅替换 caption 译文放在表格下方。
+                code_block = block.meta.get("listing_md") or ""
+                parts = []
+                if code_block:
+                    parts.append(code_block)
+                if cap_zh:
+                    parts.append("> " + cap_zh)
+                block.raw = "\n\n".join(parts) if parts else "(伪代码)"
             elif block.kind == "table":
                 # 表格内容（含表头）已提前并发翻译完成，直接回填；保留 Markdown 表格语法、
                 # | 分隔符与列内 LaTeX 公式。
@@ -642,8 +1044,16 @@ def run(url_or_id: str) -> Path:
             md_parts.append(_block_to_md(block, trans, img_mapping))
 
     # 5. 写出
-    out_md = workdir / f"{arxiv_id}.zh.md"
-    glossary_path = workdir / f"{arxiv_id}.glossary.json"
+    # 输出文件名命名方式：id / title / title_zh（非法字符自动换为等价中文符号）
+    mode = (settings.output_name_mode or "id").strip().lower()
+    if mode == "title":
+        out_stem = _safe_filename(orig_title or arxiv_id)
+    elif mode == "title_zh":
+        out_stem = _safe_filename(title_text or orig_title or arxiv_id)
+    else:  # id（默认）
+        out_stem = arxiv_id
+    glossary_path = workdir / f"{out_stem}.glossary.json"
+    logger.info(f"输出文件命名方式: {mode}（文件名基: {out_stem}）")
     logger.info("保存术语表与 Markdown 文件 ...")
     glossary.save(glossary_path)
     logger.info(f"术语表已保存: {glossary_path}（共 {len(glossary.terms)} 条）")
@@ -657,10 +1067,162 @@ def run(url_or_id: str) -> Path:
     # 中英文/数字排版间距自动修复（pangu 风格）：先保护公式与链接，修复后再还原
     logger.info("进行中英文排版间距修复 ...")
     body = _fix_cjk_spacing(body)
-    logger.info(f"写出 Markdown 文件 ({len(body):,} 字符) ...")
-    out_md.write_text(header + body, encoding="utf-8")
-    logger.info(f"翻译完成: 共 {n_translated} 块 -> {out_md}")
-    return out_md
+
+    # 5.1 生成保留原 HTML 结构（表格合并/颜色/图片）的 .zh.html。
+    # 注意：DOCX / PDF 导出功能尚未开发完毕，暂时禁用，此处仅作为 Markdown 的中间产物。
+    zh_html_path = workdir / f"{out_stem}.zh.html"
+    try:
+        _build_zh_html(
+            html_soup, blocks, translations, table_translations,
+            glossary, img_mapping, zh_html_path, translator, summary,
+        )
+    except Exception as e:
+        logger.warning(f"生成 .zh.html 失败: {e}")
+        zh_html_path = None
+
+    out_md = workdir / f"{out_stem}.zh.md"
+    if settings.output_markdown:
+        logger.info(f"写出 Markdown 文件 ({len(body):,} 字符) ...")
+        out_md.write_text(header + body, encoding="utf-8")
+        logger.info(f"翻译完成: 共 {n_translated} 块 -> {out_md}")
+    else:
+        logger.info(f"已跳过 Markdown 输出（output_markdown=False），仅导出: "
+                    f"{(settings.export_formats or '').strip() or '(无)'}")
+        out_md = None
+
+    # 6. 导出额外格式（DOCX / PDF）—— 功能尚未开发完毕，暂时禁用
+    # _export_formats(out_md, zh_html_path, settings)
+
+    # 7. Token 用量报告（可配置开启）
+    if settings.token_report:
+        for line in translator.usage.report_lines():
+            logger.info(line)
+    return out_md or zh_html_path
+
+
+# ---------- 生成保留原 HTML 结构的 .zh.html（供 DOCX/PDF 导出） ----------
+_CJK_CHAR = re.compile(r"[一-鿿]")
+
+
+def _has_cjk(text: str) -> bool:
+    return bool(_CJK_CHAR.search(text or ""))
+
+
+def _translate_tag_keep_color(tag, translator, glossary, summary: str) -> None:
+    """把 tag 内的英文文本逐父级翻译并写回，保留内联样式（如 color）。
+
+    对每个"文本叶子父元素"单独翻译一次：带 color 的内联 span 翻译后仍保留
+    其 style 颜色；普通段落文本则整体替换。已含中文的内容跳过（已译）。
+    """
+    # 按"直接父元素"分组所有文本叶子，减少翻译调用并保持结构/颜色
+    groups: dict = {}
+    for s in tag.find_all(string=True):
+        if not str(s).strip():
+            continue
+        groups.setdefault(s.parent, []).append(s)
+    for parent, strs in groups.items():
+        joined = "".join(str(x) for x in strs)
+        if _has_cjk(joined):
+            continue
+        try:
+            zh = translator.translate(joined, glossary, summary=summary)
+        except Exception:
+            continue
+        if not zh:
+            continue
+        for x in strs:
+            x.extract()
+        parent.append(zh)
+
+
+def _build_zh_html(soup, blocks, translations, table_translations,
+                   glossary, img_mapping, out_html: Path, translator, summary: str = "") -> None:
+    """在原始 HTML（已带 data-zh-id）基础上回填译文，写出 .zh.html。
+
+    保留原 HTML 的表格合并（colspan/rowspan）、内联文字颜色、图片结构，
+    仅把可翻译文本替换为中文。图片路径：本地模式下已替换为本地相对路径，
+    导出时由 exporter 进一步内嵌。
+    """
+    for i, block in enumerate(blocks):
+        hid = block.meta.get("html_id")
+        if not hid:
+            continue
+        el = soup.find(attrs={"data-zh-id": hid})
+        if el is None:
+            continue
+
+        if block.kind == "table":
+            # 逐单元格翻译（保留 colspan/rowspan 合并结构），颜色也保留
+            for cell in el.find_all(["td", "th"]):
+                _translate_tag_keep_color(cell, translator, glossary, summary)
+            # 表标题（caption）
+            cap = el.find(class_="ltx_caption") or el.find("caption")
+            if cap and translations.get(i) and not _has_cjk(cap.get_text(" ", strip=True)):
+                cap.clear()
+                cap.append(translations[i])
+            continue
+
+        if block.kind in ("figure", "listing"):
+            # 图片/算法：只翻译图注（caption），图片本身不翻译
+            cap = el.find(class_="ltx_caption") or el.find("figcaption")
+            if cap and translations.get(i) and not _has_cjk(cap.get_text(" ", strip=True)):
+                cap.clear()
+                cap.append(translations[i])
+            # 本地图片模式下，img src 已在 parse 阶段替换为本地相对路径
+            continue
+
+        # 公式：保留原公式（LaTeX），不翻译内容；如需中文标签可忽略
+        if block.kind == "equation":
+            continue
+
+        # 段落 / 标题 / 列表项：整体回填译文，尽量保留颜色
+        src = translations.get(i, "")
+        if src and not _has_cjk(el.get_text(" ", strip=True)):
+            _translate_tag_keep_color(el, translator, glossary, summary)
+
+    # 把无用的导航/参考文献/页脚等区域删除，减小导出体积（保留正文即可）
+    for sel in ("ltx_page_navbar", "ltx_bibliography", "ltx_page_footer",
+                "ltx_appendix", "ltx_errors", "ltx_page_logo"):
+        for node in soup.find_all(class_=sel):
+            node.extract()
+
+    out_html.write_text(str(soup), encoding="utf-8")
+
+
+def _export_formats(md_path: Optional[Path], zh_html_path: Optional[Path], settings) -> None:
+    """根据配置将译文导出为 DOCX / PDF（可选）。
+
+    DOCX/PDF 优先基于保留原 HTML 结构的 .zh.html（支持表格合并单元格、
+    内联文字颜色、图片内嵌），若缺失则退化为基于 markdown 导出。
+    """
+    fmts = (settings.export_formats or "").strip().lower()
+    if not fmts:
+        return
+
+    parts = [f.strip() for f in fmts.replace("，", ",").split(",")]
+    want_docx = "docx" in parts or "docx_pdf" in parts or "all" in parts
+    want_pdf = "pdf" in parts or "docx_pdf" in parts or "all" in parts
+
+    if want_docx:
+        try:
+            if zh_html_path and zh_html_path.exists():
+                html_to_docx(zh_html_path)
+            elif md_path:
+                html_to_docx(md_path)
+            else:
+                logger.warning("无可用源文件，跳过 DOCX 导出")
+        except Exception as e:
+            logger.warning(f"DOCX 导出失败，已跳过: {e}")
+    if want_pdf:
+        try:
+            if zh_html_path and zh_html_path.exists():
+                html_to_pdf(zh_html_path)
+            elif md_path:
+                html_to_pdf(md_path)
+            else:
+                logger.warning("无可用源文件，跳过 PDF 导出")
+        except Exception as e:
+            logger.warning(f"PDF 导出失败，已跳过: {e}")
 
 
 # ---------- 中英文排版间距修复（pangu 风格） ----------

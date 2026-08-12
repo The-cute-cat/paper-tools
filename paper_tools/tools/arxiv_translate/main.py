@@ -28,7 +28,7 @@ def main() -> None:
     logger.info("arxiv 论文翻译工具启动")
 
     # ===== 在这里填写参数 =====
-    INPUT = "2605.26158v1"  # arxiv 链接或 ID，例如 "https://arxiv.org/abs/2605.26158v1" 或 "2605.26158v1"
+    INPUT = "2606.01738"  # arxiv 链接或 ID，例如 "https://arxiv.org/abs/2605.26158v1" 或 "2605.26158v1"
     API_KEY = ""            # 留空则用 .env / 环境变量里的 DEEPSEEK_API_KEY
     MODEL = ""              # 留空则用配置里的默认模型（deepseek-v4-flash）
     OUT_DIR = ""            # 留空则用配置里的默认输出目录（项目根/output）
@@ -42,6 +42,10 @@ def main() -> None:
     # 短块合并阈值（按纯文本字符数）：相邻同类过短文本块（段落/列表项）会合并到前一块
     # 一起翻译，减少碎片、保持上下文。设为 0 关闭合并。
     MERGE_MIN_CHARS = 50
+    # 额外导出格式：DOCX / PDF 导出功能尚未开发完毕，暂时禁用，固定为空。
+    EXPORT_FORMATS = ""
+    # 是否仍输出 .zh.md：True 默认（始终输出 markdown）。
+    OUTPUT_MARKDOWN = True
 
     # ===== 参数生效 =====
     if API_KEY:
@@ -58,6 +62,10 @@ def main() -> None:
         settings.image_local = True
     if MERGE_MIN_CHARS:
         settings.merge_min_chars = int(MERGE_MIN_CHARS)
+    if EXPORT_FORMATS:
+        settings.export_formats = EXPORT_FORMATS.strip().lower()
+    if str(OUTPUT_MARKDOWN).strip().lower() in ("0", "false", "no", "off"):
+        settings.output_markdown = False
 
     if not settings.llm.api_key:
         logger.error("未配置 API key：请在 .env 设置 DEEPSEEK_API_KEY，或在下方 API_KEY 常量中填写。")
