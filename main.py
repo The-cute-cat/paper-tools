@@ -1,0 +1,63 @@
+"""paper-tools 统一命令行入口。
+
+用法：
+    python main.py arxiv-translate <arxiv链接或ID> [--out 目录] [--model xxx]
+    python main.py arxiv-translate 2605.26158v1
+
+可用工具：
+    arxiv-translate   下载 arxiv HTML 论文并翻译为中文 markdown
+
+环境变量（在 .env 或系统中配置）：
+    DEEPSEEK_API_KEY      必填，DeepSeek API key
+    DEEPSEEK_MODEL        可选，模型名（默认 deepseek-v4-flash）
+    DEEPSEEK_BASE_URL     可选，API 地址
+    PAPER_TOOLS_OUTPUT    可选，默认输出根目录
+    PAPER_TOOLS_LOG_LEVEL 可选，日志级别（默认 INFO）
+"""
+
+import argparse
+import sys
+
+from paper_tools.config import get_settings
+from paper_tools.logging_setup import setup_logging
+from paper_tools.tools import arxiv_translate
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="paper-tools", description="论文相关实用工具集合")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("arxiv-translate", help="下载 arxiv HTML 论文并翻译为中文 markdown")
+    p.add_argument("input", help="arxiv 链接 (https://arxiv.org/abs/...) 或 ID (如 2605.26158v1)")
+    p.add_argument("--out", default=None, help="输出根目录（默认读配置 PAPER_TOOLS_OUTPUT）")
+    p.add_argument("--model", default=None, help="DeepSeek 模型名（覆盖配置）")
+    p.add_argument("--api-key", default=None, help="DeepSeek API key（覆盖环境变量）")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = build_parser().parse_args(argv)
+
+    # 应用配置 + 日志
+    settings = get_settings()
+    if args.command == "arxiv-translate":
+        if args.out:
+            settings.output_dir = __import__("pathlib").Path(args.out)
+        if args.model:
+            settings.llm.model = args.model
+        if args.api_key:
+            settings.llm.api_key = args.api_key
+
+    logger = setup_logging(settings.log_level)
+
+    try:
+        if args.command == "arxiv-translate":
+            out = arxiv_translate.run(args.input)
+            logger.info(f"结果文件: {out}")
+    except Exception as e:  # noqa: BLE001
+        logger.exception(f"执行失败: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

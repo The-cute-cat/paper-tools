@@ -1,0 +1,21 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# IDE files
+.idea/
+.vscode/
+
+uv.toml
+temp/
+output/
+
+# 本地配置（含密钥，勿提交）
+.env
