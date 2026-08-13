@@ -28,7 +28,7 @@ def main() -> None:
     logger.info("arxiv 论文翻译工具启动")
 
     # ===== 在这里填写参数 =====
-    INPUT = "2606.01738"  # arxiv 链接或 ID，例如 "https://arxiv.org/abs/2605.26158v1" 或 "2605.26158v1"
+    INPUT = "2604.25921"  # arxiv 链接或 ID，例如 "https://arxiv.org/abs/2605.26158v1" 或 "2605.26158v1"
     API_KEY = ""            # 留空则用 .env / 环境变量里的 DEEPSEEK_API_KEY
     MODEL = ""              # 留空则用配置里的默认模型（deepseek-v4-flash）
     OUT_DIR = ""            # 留空则用配置里的默认输出目录（项目根/output）
@@ -39,9 +39,13 @@ def main() -> None:
     CITE_DISPLAY = "short"
     # 图片本地模式：True = 下载图片到本地并改用本地相对路径；False = 引用保持原网络 URL（不下载）
     IMAGE_LOCAL = False
-    # 短块合并阈值（按纯文本字符数）：相邻同类过短文本块（段落/列表项）会合并到前一块
-    # 一起翻译，减少碎片、保持上下文。设为 0 关闭合并。
-    MERGE_MIN_CHARS = 50
+    # 翻译单元目标长度下限（按纯文本字符数）：相邻同类文本块（段落/列表项/文本框）
+    # 会被贪心凑成长度在 [MERGE_MIN_CHARS, MERGE_TARGET_MAX] 区间的翻译单元，一起
+    # 以 JSON 分块翻译，减少碎片、保持上下文连贯。设为 0 关闭合并。
+    MERGE_MIN_CHARS = 1000
+    # 翻译单元目标长度上限（字符）：凑单元时累计长度达到该值即关闭当前单元；
+    # 单块长度 ≥ 该值时独立成单元（不强行拆分）。设为 0 表示不限制上限。
+    MERGE_TARGET_MAX = 1500
     # 额外导出格式：DOCX / PDF 导出功能尚未开发完毕，暂时禁用，固定为空。
     EXPORT_FORMATS = ""
     # 是否仍输出 .zh.md：True 默认（始终输出 markdown）。
@@ -62,6 +66,8 @@ def main() -> None:
         settings.image_local = True
     if MERGE_MIN_CHARS:
         settings.merge_min_chars = int(MERGE_MIN_CHARS)
+    if MERGE_TARGET_MAX:
+        settings.merge_target_max = int(MERGE_TARGET_MAX)
     if EXPORT_FORMATS:
         settings.export_formats = EXPORT_FORMATS.strip().lower()
     if str(OUTPUT_MARKDOWN).strip().lower() in ("0", "false", "no", "off"):

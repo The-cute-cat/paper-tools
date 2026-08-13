@@ -8,13 +8,13 @@ from pathlib import Path
 from typing import Any, Optional
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 
 from ...config import get_settings
 from ...core.downloader import download_binary, download_text
 from ...core.exporter import html_to_docx, html_to_pdf
 from ...core.glossary import Glossary, KEEP_AS_IS, Term, WRONG_VARIANT_MAP
-from ...core.translator import LLMTranslator
+from ...core.translator import LLMTranslator, TABLE_UNTRANSLATABLE_MARKER
 from ...logging_setup import get_logger
 from .parser import Block, parse_arxiv_html
 
@@ -198,7 +198,8 @@ def _strip_trailing_punct(text: str) -> str:
 
 def _block_to_md(block: Block, translation: str, img_mapping: dict[str, str]) -> str:
     if block.kind == "title":
-        return f"# {_strip_trailing_punct(translation)}\n"
+        # 标题强制换行，不需要 ⟦NEWPAR⟧ 标记，统一剥离以防模型误带（兼容半角 [NEWPAR]）。
+        return f"# {_strip_trailing_punct(_NEWPAR_RE.sub('', translation).strip())}\n"
     if block.kind == "heading":
         # 先用通用学术章节标题映射（领域中立、稳定，避免翻译幻觉把段落混入标题）。
         trans = _SECTION_TITLE_MAP.get(block.text.strip().lower(), translation)
@@ -207,11 +208,36 @@ def _block_to_md(block: Block, translation: str, img_mapping: dict[str, str]) ->
         # 任一不通过则回退到原文 block.text，保证 markdown 结构正确且不重复。
         if not _looks_like_heading(trans, block.text):
             trans = block.text
-        # 标题末尾的孤立句末标点（最常见的是模型在 JSON 输出里多加的句号）
-        # 总是剥离，确保目录与正文标题干净无句号。
+        # 标题强制换行，⟦NEWPAR⟧ 标记无用，剥离；末尾孤立句末标点也剥离，
+        # 确保目录与正文标题干净无句号。
+        trans = _NEWPAR_RE.sub("", trans).strip()
         return f"{'#' * block.level} {_strip_trailing_punct(trans)}\n"
-    if block.kind in ("paragraph", "list_item"):
-        return f"{translation}\n"
+    if block.kind == "text_box":
+        # ar5iv 把带边框的"图片化文本框"（如 Prompt 示例框）渲染成 SVG，
+        # 但 svg 内嵌的 <span class="ltx_p"> 仍保留真实文本。parser 阶段
+        # 把所有段落合并成 kind=text_box 的 Block，原文 raw 已是 "> ..." 引用块
+        # 模板。这里把译文按行拆分，逐行加 "> " 前缀（仅 1 层），最终 markdown
+        # 渲染是一个引用块；多余空行也保留 "> " 占位，避免破坏块结构。
+        # 同时清除可能混入的 ⟦NEWPAR⟧ 标记（text_box 已按原文固定段落拆分渲染）。
+        lines = _split_text_box_lines(_NEWPAR_RE.sub("", translation).strip())
+        return "\n".join(f"> {ln}" if ln else "> " for ln in lines) + "\n"
+    if block.kind == "list_item":
+        # 列表项严格保持单段渲染：一个块 = 一条 list_item，
+        # 即便译文里残留了 ⟦NEWPAR⟧ 标记（不该出现，兜底清洗），也不应拆段。
+        # 强制 strip 防止模型混入标记破坏 markdown 列表结构。
+        cleaned = _NEWPAR_RE.sub("", translation).strip()
+        return f"{cleaned}\n"
+    if block.kind == "paragraph":
+        # LLM 段尾标记 ⟦NEWPAR⟧：一个翻译单元可能含多块，模型把"段尾"
+        # 加标记、"段内连续"不加。我们按标记拆分，每段独立成段；
+        # 拆出 1 段时与原行为兼容（仍是单段 + 末尾换行）。
+        pieces = [p for p in _split_at_newpar(translation) if p.strip()]
+        if not pieces:
+            return f"{translation.strip()}\n"
+        if len(pieces) == 1:
+            return f"{pieces[0]}\n"
+        # 多段：段之间用空行分隔，末尾单换行（避免与下一块产生双空行）
+        return "\n\n".join(pieces) + "\n"
     if block.kind in ("equation", "figure", "table", "listing"):
         raw = block.raw
         for orig, local in img_mapping.items():
@@ -260,58 +286,103 @@ def _looks_like_heading(trans: str, orig: str) -> bool:
     return True
 
 
-def _merge_short_blocks(blocks: list[Block], min_chars: int) -> tuple[list[Block], list[list[int]]]:
-    """将过短的相邻同类型文本块组成「翻译单元」一起翻译，但各块内容保持独立。
+def _merge_short_blocks(blocks: list[Block], target_min: int,
+                         target_max: int = 1500) -> tuple[list[Block], list[list[int]]]:
+    """将相邻同类型文本块按「目标长度」组成翻译单元，减少碎片、保持上下文连贯。
 
     返回 (blocks, units)：
       - blocks：原块列表（不拼接文本，保持每个块独立用于最终渲染）。
-      - units：翻译单元列表，每个单元是若干块下标（相邻同类型且后块过短则归入前块所在单元）。
-        单块单元为 [i]，合并组单元为 [i, j, k, ...]。
+      - units：翻译单元列表，每个单元是若干相邻同类文本块下标，或单个结构块下标。
 
-    设计要点：
-      - 仅将 paragraph↔paragraph 与 list_item↔list_item 的过短后块并入前一文本块所在单元，
-        但各块文本互不拼接，翻译时以 JSON 数组分别发给模型、分别回收译文。
-      - 结构块（title/heading/equation/figure/table）始终独立成单元，并作为合并链的分隔符。
-      - min_chars <= 0 时关闭合并（每个块自成单元）。
+    单元组织策略（贪心凑长度）：
+      - 文本块类型：paragraph / list_item / text_box（text_box 虽由多段合并，但仍作为
+        一个独立翻译单元参与凑长度，内部以 JSON 分块翻译其它块时它自身也独立翻译）。
+      - 开启一个「开放单元」，依次把后续同类型文本块纳入，直到累计纯文本字符数
+        ≥ target_min（下限，之后遇到下一个块若会越过 target_max 就先结束本单元）；
+        或累计已 ≥ target_max（上限，单块超上限则独立成单元，不强行拆分）。
+      - 结构块（title/heading/equation/figure/table/listing）始终独立成单元，
+        并作为合并链的分隔符（强制关闭当前开放单元）。
+      - 各块文本互不拼接，翻译时以 JSON 数组分别发给模型、分别回收译文。
+
+    配置：
+      - target_min <= 0 时关闭合并（每个文本块自成单元）。
+      - target_max <= 0 视作不限制（仍受 target_min 触发关闭），默认 1500。
     """
-    if min_chars <= 0:
+    if target_min <= 0:
         return blocks, [[i] for i in range(len(blocks))]
 
-    TEXT_KINDS = ("paragraph", "list_item")
+    TEXT_KINDS = ("paragraph", "list_item", "text_box")
     STRUCT_KINDS = ("title", "heading", "equation", "figure", "table", "listing")
 
+    def _len(b: Block) -> int:
+        return len((b.text or "").strip())
+
     units: list[list[int]] = []
-    last_text_unit_idx: Optional[int] = None  # 最近一个文本单元在 units 中的下标
-    merged = 0
+    open_unit: list[int] = []        # 当前开放单元（同类文本块累计）
+    open_kind: Optional[str] = None
 
-    def flush_single(i: int) -> None:
-        nonlocal last_text_unit_idx
-        units.append([i])
-        last_text_unit_idx = None  # 占位，下面结构块会覆盖
+    def _close() -> None:
+        nonlocal open_unit, open_kind
+        if open_unit:
+            units.append(open_unit)
+            open_unit = []
+            open_kind = None
 
+    def _cur_total() -> int:
+        return sum(_len(blocks[j]) for j in open_unit)
+
+    merged_blocks = 0
     for i, b in enumerate(blocks):
         if b.kind in STRUCT_KINDS:
+            _close()
             units.append([i])
-            last_text_unit_idx = None
             continue
         if b.kind in TEXT_KINDS:
-            if (last_text_unit_idx is not None
-                    and blocks[units[last_text_unit_idx][0]].kind == b.kind
-                    and len(b.text.strip()) < min_chars):
-                # 过短后块并入前一文本块所在单元（保持各自独立下标）
-                units[last_text_unit_idx].append(i)
-                merged += 1
+            blen = _len(b)
+            # 无开放单元：直接开新单元（单块超上限则立即关闭独立成单元）
+            if not open_unit:
+                open_unit = [i]
+                open_kind = b.kind
+                if target_max > 0 and blen >= target_max:
+                    _close()
                 continue
-            # 开新文本单元
-            units.append([i])
-            last_text_unit_idx = len(units) - 1
+            # 类型不同：先关旧单元，本块开新单元
+            if b.kind != open_kind:
+                _close()
+                open_unit = [i]
+                open_kind = b.kind
+                if target_max > 0 and blen >= target_max:
+                    _close()
+                continue
+            # 同类：预判「纳入后」长度，决定是否先关旧单元再开新单元
+            after = _cur_total() + blen
+            if target_max > 0 and after > target_max:
+                # 纳入会越过上限 → 先关旧单元，本块新开单元（宁可本块单独
+                # 略低于下限，也不让合并组超过上限；单块超上限则独立成单元）
+                _close()
+                open_unit = [i]
+                if blen >= target_max:
+                    _close()
+                continue
+            # 纳入当前单元
+            open_unit.append(i)
+            merged_blocks += 1
+            # 达标（达到上限，或已达下限且再加会越过上限）即关闭
+            total = _cur_total()
+            if (target_max > 0 and total >= target_max) or (
+                total >= target_min and (target_max <= 0 or total + blen >= target_max)
+            ):
+                _close()
             continue
-        # 未知 kind 直接保留并断开
+        # 未知 kind 直接保留并打断
+        _close()
         units.append([i])
-        last_text_unit_idx = None
 
-    if merged:
-        logger.info(f"短块合并：{merged} 个过短文本块并入相邻翻译单元（以 JSON 分块翻译）")
+    _close()  # 收尾
+
+    if merged_blocks:
+        logger.info(f"短块合并：{merged_blocks} 个相邻文本块按目标长度 "
+                    f"({target_min}-{target_max}) 凑成翻译单元（以 JSON 分块翻译）")
     return blocks, units
 
 
@@ -365,6 +436,45 @@ def _download_images(html_text: str, img_dir: Path, base: str = "https://arxiv.o
             success += 1
     logger.info(f"图片下载完成: {success}/{len(todo)} 成功")
     return mapping
+
+
+_NEWPAR_MARKER = "⟦NEWPAR⟧"
+# LLM 偶发会把段尾标记误写成半角 [NEWPAR]（而非规范的全角 ⟦NEWPAR⟧），
+# 直接 replace 全角版本会漏清。用正则同时兼容两种括号形态，并允许标记内
+# 出现空格/忽略大小写。"NEWPAR" 为专用指令词，真实论文正文不会自然出现，
+# 故直接全局清除、不额外要求两侧为空白，避免残留到最终 markdown。
+_NEWPAR_RE = re.compile(r"(?:⟦|\[)\s*NEWPAR\s*(?:⟧|\])", re.IGNORECASE)
+
+
+def _split_at_newpar(translation: str) -> list[str]:
+    """把段落译文按 LLM 输出的 ⟦NEWPAR⟧ 段尾标记拆分为多个独立段。
+
+    设计要点：
+      - LLM 在每段独立段尾追加 ⟦NEWPAR⟧（紧贴最后字符、无空格）；
+      - 我们用纯字符串 split，保留空段（用 strip 兜底）；
+      - 拆分后每段都会被 markdown 输出为独立段落（前后空行），从而解决
+        合并翻译后多个 paragraph 紧贴成一行的可读性问题。
+    """
+    if not translation:
+        return [""]
+    parts = _NEWPAR_RE.split(translation)
+    cleaned: list[str] = []
+    for p in parts:
+        cleaned.append(p.strip("\n"))
+    # 保证非空（即便 LLM 输出空字符串也保留一个空段，以免丢内容）
+    return cleaned or [""]
+
+
+def _split_text_box_lines(translation: str) -> list[str]:
+    """把 text_box 译文按行拆分，逐行加 "> " 前缀。
+
+    处理：
+      - 真实换行 ("\n") → 拆成多个引用块行
+      - 行内多余空行（连续 \n\n\n）→ 保留 "> " 占位，避免引用块断裂
+      - 行尾空格 → 保留
+    """
+    s = translation.replace("\r\n", "\n")
+    return s.split("\n")
 
 
 def _text_of_block(block: Block) -> str:
@@ -678,6 +788,18 @@ def _cell_is_translatable(cell: str) -> bool:
         all_upper = all(w.isupper() and len(w) <= 5 for w in alpha_tokens)
         if all_upper:
             return False
+    # 8) 单词级"专名"补强：cell 整体无空格（单一 token）、长度 2-25，并且
+    #    整体由字母/数字 + 限定符号 (- . /) 组成（典型如 Gemini-pro、
+    #    Llama2、Qwen2.5、GPT-3.5、Claude-3 等模型/产品名）。
+    #    这类词由 LLM "自由发挥"翻译极易出错（Qwen→千问、Llama→美洲驼，
+    #    或直接输出一段不相关的"补充介绍"），必须视作专名保留原文。
+    #    例外：含空格的短语、含中文、长度超 25 都继续走 LLM 翻译。
+    if len(words) == 1:
+        single = text_no_math.strip()
+        if 2 <= len(single) <= 25 and re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9._/\-]*", single
+        ):
+            return False
     return True
 
 
@@ -728,15 +850,25 @@ def _translate_table_cells(
     if not todo:
         return table_md  # 没有可翻译 cell，直接返回原表
 
-    # 翻译每个 cell
+    # 翻译每个 cell（cell_mode=True：提示词强制"只翻译、不解释"，
+    # 空/乱码单元格返回固定标记 TABLE_UNTRANSLATABLE_MARKER 而非胡编）。
     translated: dict[tuple[int, int], str] = {}
     for ri, ci, cell_text in todo:
         try:
-            trans, _ = translator.translate(cell_text, glossary, summary=summary)
-            translated[(ri, ci)] = trans
+            trans, _ = translator.translate(
+                cell_text, glossary, summary=summary, cell_mode=True
+            )
         except Exception as e:
             logger.warning(f"表格 cell({ri},{ci}) 翻译失败: {e}")
-            translated[(ri, ci)] = cell_text
+            trans = cell_text
+        # 干净回退：仅当译文就是"无法翻译"固定标记时才回退原文。
+        # 不依赖任何启发式（长度/正则/句号数），因此无误伤风险。
+        if trans.strip() == TABLE_UNTRANSLATABLE_MARKER:
+            logger.info(
+                f"表格 cell({ri},{ci}) 模型判定无可译内容，回退原文: {cell_text!r}"
+            )
+            trans = cell_text
+        translated[(ri, ci)] = trans
 
     # 重建表格
     out_lines: list[str] = []
@@ -924,7 +1056,8 @@ def run(url_or_id: str) -> Path:
             break
 
     # 3.1 短块合并：过短的相邻文本块组成翻译单元一起请求（JSON 分块翻译，但各块内容保持独立）
-    blocks, units = _merge_short_blocks(blocks, settings.merge_min_chars)
+    blocks, units = _merge_short_blocks(
+        blocks, settings.merge_min_chars, settings.merge_target_max)
     logger.info(f"翻译单元: {len(units)} 个（其中合并组 "
                 f"{sum(1 for u in units if len(u) > 1)} 个）")
 
@@ -1004,7 +1137,9 @@ def run(url_or_id: str) -> Path:
         trans = translations.get(i, "")
         n_translated += 1
         if block.kind == "title":
-            title_text = trans or block.text
+            # 标题仅在文件头部 (header) 输出，需单独清洗段尾换行标记 ⟦NEWPAR⟧
+            # （body 的标题分支会清洗，但 header 里的 title_text 不走该分支，易遗漏）。
+            title_text = _NEWPAR_RE.sub("", trans or block.text).strip()
             # 标题已在文件头部统一输出，避免正文中重复出现
             continue
         if block.kind in ("figure", "table", "listing"):
@@ -1068,6 +1203,10 @@ def run(url_or_id: str) -> Path:
     logger.info("进行中英文排版间距修复 ...")
     body = _fix_cjk_spacing(body)
 
+    # 兜底：清除译文里可能残留的段尾换行标记（理论上已被 _block_to_md 拆分消费，
+    # 但模型偶发漏加/误加、或误写成半角 [NEWPAR] 时仍保证最终 markdown 干净无标记字面）。
+    body = _NEWPAR_RE.sub("", body)
+
     # 5.1 生成保留原 HTML 结构（表格合并/颜色/图片）的 .zh.html。
     # 注意：DOCX / PDF 导出功能尚未开发完毕，暂时禁用，此处仅作为 Markdown 的中间产物。
     zh_html_path = workdir / f"{out_stem}.zh.html"
@@ -1095,7 +1234,7 @@ def run(url_or_id: str) -> Path:
 
     # 7. Token 用量报告（可配置开启）
     if settings.token_report:
-        for line in translator.usage.report_lines():
+        for line in translator.usage.report_lines(model=translator.llm.model):
             logger.info(line)
     return out_md or zh_html_path
 
@@ -1119,20 +1258,32 @@ def _translate_tag_keep_color(tag, translator, glossary, summary: str) -> None:
     for s in tag.find_all(string=True):
         if not str(s).strip():
             continue
-        groups.setdefault(s.parent, []).append(s)
+        parent = getattr(s, "parent", None)
+        # 防御：个别游离/异常节点（无 parent 或非 Tag）跳过，避免
+        # 'tuple' object has no attribute 'parent' 之类异常中断整段回填。
+        if parent is None or not isinstance(parent, Tag):
+            continue
+        groups.setdefault(parent, []).append(s)
     for parent, strs in groups.items():
         joined = "".join(str(x) for x in strs)
         if _has_cjk(joined):
             continue
         try:
-            zh = translator.translate(joined, glossary, summary=summary)
+            # translate 返回 (译文, 术语列表)，此处只需译文文本
+            zh = translator.translate(joined, glossary, summary=summary)[0]
         except Exception:
             continue
         if not zh:
             continue
         for x in strs:
-            x.extract()
-        parent.append(zh)
+            try:
+                x.extract()
+            except Exception:
+                pass
+        try:
+            parent.append(zh)
+        except Exception:
+            continue
 
 
 def _build_zh_html(soup, blocks, translations, table_translations,

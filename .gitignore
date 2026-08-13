@@ -16,6 +16,10 @@ wheels/
 uv.toml
 temp/
 output/
+.pytest_cache/
 
 # 本地配置（含密钥，勿提交）
 .env
+
+# 价目表本地缓存（运行时从官方定价页实时抓取生成，非源码）
+paper_tools/core/pricing_cache.json

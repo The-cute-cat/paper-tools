@@ -46,6 +46,42 @@ def _cite_search_url(query: str, engine: Optional[str] = None) -> str:
     return template.format(query=quote(query))
 
 
+# ar5iv 正文引用 <cite><a href="#bib...">作者 年份</a></cite> 的 <a title> 通常为空，
+# 论文题目其实保存在文末 bibliography 区块（#bib.xxx 对应的 <li class="ltx_bibitem">）。
+# 正文引用解析时从这里取论文名，才能生成带"搜索引擎链接 + 悬浮论文名"的引用，
+# 否则引用只能退化成无链接的纯文字（再经翻译后彻底丢失）。
+# 该映射在 parse_arxiv_html 开头按当前 soup 重建，避免跨文件调用串味。
+_BIB_MAP: dict[str, str] = {}
+
+
+def _build_bib_map(soup: "BeautifulSoup") -> dict[str, str]:
+    """解析 ar5iv bibliography，建立 #bib.xxx -> 论文标题 映射。
+
+    ar5iv 的 <li class="ltx_bibitem" id="bib.bibN"> 内通常含多个 <span
+    class="ltx_bibblock">：第一个多为 "Author. Year."，后续含论文标题与 URL。
+    策略：取所有 ltx_bibblock 文本，剔除含 http 的（那是链接块），再从剩余里
+    取第一个不含 4 位年份的块作为标题（标题一般形如 "Introducing chatgpt."）。
+    """
+    bib_map: dict[str, str] = {}
+    for item in soup.find_all("li", class_="ltx_bibitem"):
+        bid = item.get("id")
+        if not isinstance(bid, str) or not bid.startswith("bib."):
+            continue
+        anchor = "#" + bid
+        blocks = [b.get_text(" ", strip=True) for b in item.find_all(class_="ltx_bibblock")]
+        blocks = [b for b in blocks if b and "http" not in b.lower()]
+        title = ""
+        for b in reversed(blocks):
+            if not re.search(r"\b(?:19|20)\d{2}\b", b):
+                title = b.rstrip(". ").strip()
+                break
+        if not title and blocks:
+            title = blocks[-1].rstrip(". ").strip()
+        if title:
+            bib_map[anchor] = title
+    return bib_map
+
+
 @dataclass
 class Block:
     """一个内容块，对应 markdown 中的一段可翻译单元。"""
@@ -171,6 +207,12 @@ def _rich_text(tag: Tag) -> str:
                 if isinstance(c, Tag) and c.name == "a" and "ltx_ref" in (c.get("class") or []):
                     title = _as_str(c.get("title")) or ""
                     visible = c.get_text().strip()
+                    # 正文引用的 <a title> 通常为空，论文名在 bibliography 区块；
+                    # 用预解析的 #bib.xxx -> 论文标题 映射补上，确保引用仍能生成
+                    # 带"搜索引擎链接 + 悬浮论文名"的可点击引用。
+                    if not title:
+                        href = _as_str(c.get("href")) or ""
+                        title = _BIB_MAP.get(href, "")
                     if title:
                         # 去掉 title 末尾的 bibkey 年份后缀，如 ", 2024a" → "Title"
                         clean_title = re.sub(r",\s*\d{4}[a-z]?\s*$", "", title).strip()
@@ -211,6 +253,22 @@ def _rich_text(tag: Tag) -> str:
             parts.append(f"${sym}{{{inner}}}$")
             return
         if name == "br":
+            parts.append("\n")
+            return
+        # 块级元素边界插入换行，便于表格 cell 等"行内多段"场景保留段落结构。
+        # ar5iv Table 1 等对话示例用 <span class="ltx_p"> / <p class="ltx_p">
+        # 把多轮 User/Assistant 分段；如果这里不产生换行，所有内容会被吞成
+        # 一段空白分隔的长串，导致模型翻译出来的对话丢失结构（参见 issue：
+        # ICD 对话示例被压成一行）。下面的 re.sub(r"\n{2,}", "\n") 会把多换
+        # 行折叠成单 \n，普通段落调用方不受影响（GFM 段落忽略单换行）。
+        _BLOCK_NAMES = {
+            "p", "div", "li", "ul", "ol", "tr", "td", "th",
+            "blockquote", "pre", "section", "article",
+        }
+        if name in _BLOCK_NAMES:
+            parts.append("\n")
+            for c in node.children:
+                walk(c)
             parts.append("\n")
             return
         if "ltx_emph" in cls or name in ("em", "i"):
@@ -400,6 +458,10 @@ def parse_arxiv_html(
     # （生成 .zh.html，保留原 HTML 的表格合并/颜色/图片结构）。
     _assign_html_ids(soup)
 
+    # 预解析 bibliography，建立 #bib.xxx -> 论文标题 映射，供正文引用生成链接用。
+    global _BIB_MAP
+    _BIB_MAP = _build_bib_map(soup)
+
     # 本地图片模式：把 <img src> / <object data> 改写为本地相对路径，
     # 这样生成的 .zh.html 可被 DOCX/PDF 导出器正确内嵌图片。
     if img_mapping:
@@ -451,6 +513,84 @@ def parse_arxiv_html(
     return blocks, soup
 
 
+def _emit_list(ul: Tag, blocks: list[Block]) -> None:
+    """把一个 <ul>/<ol> 列表切成若干 list_item Block。
+
+    ar5iv 列表项（<li class="ltx_item">）内部有两种结构：
+      1) <li><p class="ltx_p">...</p></li>                  （扁平，p 是 li 直接子节点）
+      2) <li><div class="ltx_para"><p class="ltx_p">...</p></div></li>
+                                                                 （p 嵌在 div.ltx_para 里一层）
+    因此查找 <p> 必须用 recursive=True，否则第 2 种结构下 li 直接子节点只有
+    <span class="ltx_tag_item"> 和 <div>，<p> 在 div 内 → 列表项被整体漏掉。
+    """
+    if not any(c in " ".join(ul.get("class") or []) for c in ("ltx_itemize", "ltx_enumerate")):
+        return
+    for li in ul.find_all(class_="ltx_item", recursive=False):
+        for p in li.find_all(class_="ltx_p", recursive=True):
+            rich = _rich_text(p)
+            if rich:
+                blocks.append(Block(kind="list_item", level=0,
+                                    text=_plain_text_for_translation(p), raw="- " + rich,
+                                    meta={"html_id": _html_id_of(p)}))
+
+
+def _emit_text_box(span: Tag, blocks: list[Block]) -> None:
+    """处理 ar5iv 的"图片化文本框"（带边框的灰色提示框，通常是 Prompt 示例、
+    调用样例等可视化代码块）。
+
+    ar5iv 把这类文本框直接渲染成一张 SVG 图片（<span class="ltx_inline-block">
+    包 <svg class="ltx_picture"> + <foreignobject>），但 SVG 内部仍然保留
+    真实段落（<span class="ltx_p">），可结构化提取。早期实现只识别
+    <p>/<table>/<ul>/<ol>，对这种 span 容器直接 continue，导致整段内容丢失。
+
+    策略：把 span 内的所有 <span class="ltx_p"> 段落**合并成一个** Block（类型
+    ``text_box``），原始 markdown 用 ``> `` 引用块逐行包裹，保留"框"的视觉语义。
+    合并的多段一起翻译，确保模型/手动翻译时能保留段落间上下文衔接。
+    """
+    # 防御：必须是 ltx_inline-block；非则不处理
+    if "ltx_inline-block" not in " ".join(span.get("class") or []):
+        return
+
+    # 找出"实在的"段落：<span class="ltx_p"> 内嵌在 foreignobject 之下。
+    paragraphs = span.find_all(class_="ltx_p", recursive=True)
+    real_ps: list[Tag] = []
+    for p in paragraphs:
+        if not _rich_text(p).strip():
+            continue
+        real_ps.append(p)
+    if not real_ps:
+        return
+
+    # 合并所有段落：原文按 "\n" 拼接（保持多段结构），富文本 raw 用 "> " 逐段包裹
+    plain_parts: list[str] = []
+    rich_parts: list[str] = []
+    for p in real_ps:
+        rich = _rich_text(p)
+        plain = _plain_text_for_translation(p)
+        if not rich.strip():
+            continue
+        plain_parts.append(plain)
+        rich_parts.append(f"> {rich}")
+
+    if not rich_parts:
+        return
+
+    # 主动给这个 text_box 容器打一个 data-zh-id，供后续 .zh.html 回填时定位。
+    # 它内嵌在 SVG <foreignobject> 里，不会被子流程 _assign_html_ids 自动打标。
+    # 用块序号生成稳定 id（soup 在 parse 阶段已经过 _assign_html_ids，
+    # 这里追加的新 id 不会与已有冲突，因为已用的 id 是 zh-N 形式）。
+    box_id = f"zh-textbox-{len(blocks)}"
+    span["data-zh-id"] = box_id
+
+    blocks.append(Block(
+        kind="text_box",
+        text="\n".join(plain_parts),
+        raw="\n".join(rich_parts),
+        meta={"html_id": box_id,
+              "text_box_md": "\n".join(rich_parts)},
+    ))
+
+
 def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
                   base_url: str = "") -> None:
     """按文档顺序遍历 section 的直接子内容节点。"""
@@ -479,7 +619,7 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
             #       P1, P2, P4, Eq1, Eq2, Eq3, Eq4）。
             # 修复：按子节点文档顺序遍历，逐节点分发到 paragraph / equation append，
             #       保留原始位置关系。
-            for sub in child.find_all(["p", "table"], recursive=False):
+            for sub in child.find_all(["p", "table", "ul", "ol", "span"], recursive=False):
                 sub_cls = sub.get("class") or []
                 if "ltx_p" in sub_cls:
                     rich = _rich_text(sub)
@@ -492,6 +632,18 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
                         ))
                 elif "ltx_equation" in sub_cls or "ltx_equationgroup" in sub_cls:
                     _append_equation(sub, blocks)
+                elif sub.name in ("ul", "ol"):
+                    # ltx_para 内可能直接嵌套列表（这是 ar5iv 把整个小节包进
+                    # 一个 ltx_para 时的常见结构，例如 4.2 Datasets 节：
+                    # <div class="ltx_para"><ul class="ltx_itemize">...</ul></div>）。
+                    # 早期实现漏掉了这种情况，导致列表项整体丢失。
+                    _emit_list(sub, blocks)
+                elif "ltx_inline-block" in sub_cls:
+                    # ar5iv 把"Prompt 示例"等带框内容渲染成 SVG 图片
+                    # （<span class="ltx_inline-block"><svg class="ltx_picture">...
+                    # <foreignobject><span class="ltx_p">真实文本</span></foreignobject>）。
+                    # 实际文本可回收利用，必须在 ltx_para 分支里递归挖出来。
+                    _emit_text_box(sub, blocks)
             continue
 
         # ar5iv 实际生成的段落容器是 <section class="ltx_paragraph">，与上文
@@ -562,13 +714,7 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
         if child.name in ("ul", "ol") and any(
             c in " ".join(cls) for c in ("ltx_itemize", "ltx_enumerate")
         ):
-            for li in child.find_all(class_="ltx_item", recursive=False):
-                for p in li.find_all(class_="ltx_p", recursive=False):
-                    rich = _rich_text(p)
-                    if rich:
-                        blocks.append(Block(kind="list_item", level=0,
-                                            text=_plain_text_for_translation(p), raw="- " + rich,
-                                            meta={"html_id": _html_id_of(p)}))
+            _emit_list(child, blocks)
             continue
 
         if "ltx_equation" in cls:
@@ -772,21 +918,28 @@ def _collect_table_text(tbl: Tag) -> str:
         return ""
 
     def _cell_text(td: Tag) -> str:
-        text = _rich_text(td).replace("\n", " ").strip()
-        text = text.replace("\xa0", " ").strip()
+        rich = _rich_text(td)
+        # 把行内换行折叠成单个 "\n"（_rich_text 已把相邻 \n 压成单个），
+        # 然后再按行去除首尾空白后用 "<br>" 拼接 —— 这样表格 cell 里的
+        # 多段对话（ar5iv 常用 <span class="ltx_p"> 模拟多行）能保留可读
+        # 结构，不会被压成一行。原实现直接 replace("\n"," ") 会把同一
+        # 个 cell 的所有对话挤成一段乱序文本，对 LLM 输入和最终渲染都不利。
+        lines = [ln.strip().replace("\xa0", " ") for ln in rich.split("\n")]
+        # 过滤纯空行（不影响相邻 <br>）
+        text = "<br>".join(ln for ln in lines if ln)
         text = text.replace("|", "\\|")
         # 规范化：$...$ 与 **..** 之间必须有空格分隔，否则部分渲染器
         # （如 Typora / 部分 markdown → HTML 转换器）会把紧贴的 ** 误判为
         # 数学公式内部符号（特别是 KaTeX/MathJax 的“^”或“…”)，导致列被吞掉。
         # 同时压缩内部多余空格。
-        text = re.sub(r"\$([^$\n]+?)\$\*\*", r"$ \1$ **", text)
-        text = re.sub(r"\*\*\$([^$\n]+?)\$", r"** $ \1$", text)
+        text = re.sub(r"\$([^$\n|]+?)\$\*\*", r"$ \1$ **", text)
+        text = re.sub(r"\*\*\$([^$\n|]+?)\$", r"** $ \1$", text)
         text = re.sub(r"[ \t]{2,}", " ", text)
         # 把已配对的 **...** 转成 <strong>...</strong>（HTML bold）。
         # 这样在双层 header 用 <br> 拼接 cell 时，markdown ** 不会跨 <br>
         # 错误配对（GFM 表格 cell 完全支持 HTML 标签，且 KaTeX auto-render
         # 会扫描 <strong> 内部文本识别 $...$ 数学）。
-        text = re.sub(r"\*\*([^*\n]+?)\*\*", r"<strong>\1</strong>", text)
+        text = re.sub(r"\*\*([^*\n|]+?)\*\*", r"<strong>\1</strong>", text)
         return text
 
     # 第一遍：解析每行 cells + 标记表头 + 统计 max_cols（取所有非分组行中 colspan=1 cell 数最大值）
@@ -1079,6 +1232,31 @@ def _collect_table_text(tbl: Tag) -> str:
              "| " + " | ".join(["---"] * max_cols) + " |"]
     for r in body_rows:
         lines.append("| " + " | ".join(r) + " |")
+
+    # 丢弃"全为空"的尾列：ar5iv 把 LaTeX 的右 border 装饰 td 渲染成空的尾
+    # `<td></td>`（用于在 PDF 里给表格画线），不带任何 cell 文本。如果整张表的
+    # 头/体每一行该列都是空字符串，则在 markdown 里就是一个纯空 cell 列，
+    # 多余且对渲染毫无意义。这里智能剔除，最右优先（PDF 装饰 td 在尾）。
+    # 安全：只在至少保留 2 列时剔除（避免单/双列表被删光，破坏数据）。
+    if max_cols >= 3:
+        def _col_is_all_empty(c: int) -> bool:
+            if c < len(header_row) and header_row[c].strip():
+                return False
+            for r in body_rows:
+                if c < len(r) and r[c].strip():
+                    return False
+            return True
+
+        # 从右往左扫描（典型 ar5iv 装饰尾列在尾部），可连续删除多个全空尾列
+        while len(header_row) > 2 and _col_is_all_empty(len(header_row) - 1):
+            cur = len(header_row) - 1
+            header_row = header_row[:cur]
+            body_rows = [r[:cur] for r in body_rows]
+        # 同步重建 lines
+        lines = ["| " + " | ".join(header_row) + " |",
+                 "| " + " | ".join(["---"] * len(header_row)) + " |"]
+        lines.extend("| " + " | ".join(r) + " |" for r in body_rows)
+
     return "\n".join(lines)
 
 

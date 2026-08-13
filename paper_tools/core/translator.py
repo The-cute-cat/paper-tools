@@ -1,5 +1,6 @@
 """翻译器：封装 DeepSeek (OpenAI 兼容) API，可被任意工具复用。"""
 
+import itertools
 import json
 import logging
 import re
@@ -16,6 +17,11 @@ from ..config import LLMSettings, get_settings
 from .glossary import Glossary, KEEP_AS_IS
 
 _log = logging.getLogger("paper-tools")
+
+# 表格单元格"无法翻译"标记：当单元格内容为空 / 纯符号乱码 / 无自然语言可译时，
+# 翻译模型应原样返回此标记（见 translator_prompts.yaml 的 table_cell_extra 规则）。
+# 下游（pipeline._translate_table_cells）据此干净回退原文，无任何启发式误伤风险。
+TABLE_UNTRANSLATABLE_MARKER = "⟦SKIP⟧"
 
 # 行内 $...$ 与行间 $$...$$ 公式保护：翻译前替换为占位符，翻译后还原，
 # 避免模型把长公式当文本改写或注入乱码。
@@ -60,11 +66,47 @@ _METRIC_CHANGE_RE = re.compile(r"\b[A-Z][A-Za-z0-9_]*\s*[↑↓]")
 # 「X」前缀是真实论文中绝不可能出现的字符（真实引用只有数字），LLM 不会
 # 把它当成真实编号改写，也就不会破坏占位符结构。
 _REFERENCES_RE = re.compile(r"\[(\d+(?:[\s,\-\u2013\u2014]\d+)*)\]")
+# 所有 markdown 链接 [显示文本](url "可选title")。链接（含 url 与显示文本）属于
+# 引用/专有名词/网址，绝不应被 LLM 翻译或改写，否则文献引用会退化为纯文字、
+# 链接彻底丢失，正文里的普通链接也会被改坏。与 [数字] 引用共用 references 列表
+# 与 ⟦REF_Xn⟧ 占位符，restore 时原样还原。
+# 说明：ar5iv 文献引用 <cite><a href="#bib...">作者 年份</a></cite> 经 parser 处理后会
+# 渲染成 [作者 年份](搜索引擎url "论文名")；正是这类链接需要被保护。保护全部链接
+# 而非仅 #bib 锚点，可同时覆盖搜索引擎链接与正文普通链接。
+_LINK_RE = re.compile(r"\[[^\]\[\n]*?\]\((?:[^()\n]|\([^()\n]*\))*\)")
 # 使用 ⟦MATH_n⟧ / ⟦REF_Xn⟧ 而非 <MATH_n>，避免被模型误当成 HTML/Markdown 标签而吃掉或改写。
+# 公式占位符的 n 为**全局唯一** id（跨所有块/合并组单调递增），而非"单块内序号"——
+# 这样在合并组（translate_group）场景下，不同子块的公式占位符不会因各自从 0 编号而冲突。
+# restore 时通过 formula_table（以 id 为主键）查表还原，而非依赖"列表下标"。
 _MATH_PH_RE = re.compile(r"⟦MATH_(\d+)⟧")
 _REF_PH_RE = re.compile(r"⟦REF_X(\d+)⟧")
 _MATH_PH_FMT = "⟦MATH_{}⟧"
 _REF_PH_FMT = "⟦REF_X{}⟧"
+
+# 公式占位符全局唯一 id 计数器（线程安全）。protect_math 每保护一个公式就分配一个新 id，
+# 保证跨块、跨合并组均不重复；还原时 formula_table 以 id 为键精确映射。
+_formula_id_counter = itertools.count()
+_formula_id_lock = threading.Lock()
+
+
+def _next_formula_id() -> int:
+    """分配一个全局唯一的公式占位符 id。"""
+    with _formula_id_lock:
+        return next(_formula_id_counter)
+
+
+# 与公式占位符同理，引用占位符 ⟦REF_Xn⟧ 的 n 也采用**全局唯一** id
+# （跨所有块/合并组单调递增）。否则在合并组（translate_group）场景下，各子块
+# 的引用编号都从 0 起、重复出现 ⟦REF_X0⟧/⟦REF_X1⟧，模型在输出时无法区分属于
+# 哪个子块，极易错位搬移，导致还原时 ref_map[idx] 查不到而残留裸占位符。
+_ref_id_counter = itertools.count()
+_ref_id_lock = threading.Lock()
+
+
+def _next_ref_id() -> int:
+    """分配一个全局唯一的引用占位符 id。"""
+    with _ref_id_lock:
+        return next(_ref_id_counter)
 
 # ---------- 提示词模板：从 YAML 加载，不硬编码在代码中 ----------
 _PROMPT_PATH = Path(__file__).resolve().parent / "translator_prompts.yaml"
@@ -130,8 +172,12 @@ class TokenUsage:
             self.cache_hit_tokens += other.cache_hit_tokens
             self.requests += other.requests
 
-    def report_lines(self) -> list[str]:
-        """生成可读的用量报告行（供 logger 输出）。"""
+    def report_lines(self, model: Optional[str] = None) -> list[str]:
+        """生成可读的用量报告行（供 logger 输出）。
+
+        model 传入时，基于动态获取的 DeepSeek 价目表估算本次翻译花费（人民币元），
+        并在报告末尾追加一行费用估算；不传入则不显示费用。
+        """
         pt = self.prompt_tokens
         ct = self.completion_tokens
         hit = self.cache_hit_tokens
@@ -140,7 +186,7 @@ class TokenUsage:
         pct = (hit / pt * 100) if pt else 0.0
         miss_pct = (miss / pt * 100) if pt else 0.0
         write_pct = (ct / total * 100) if total else 0.0
-        return [
+        lines = [
             "────────── Token 用量报告 ──────────",
             f"  API 调用次数      : {self.requests}",
             f"  输入 token 总量  : {pt:,}",
@@ -148,8 +194,36 @@ class TokenUsage:
             f"    未命中(读)      : {miss:,}  ({miss_pct:5.1f}%)",
             f"  输出 token 总量  : {ct:,}  ({write_pct:5.1f}% of total)",
             f"  合计 token        : {total:,}",
-            "────────────────────────────────────",
         ]
+        if model is not None:
+            cost = self.estimated_cost(model)
+            if cost is not None:
+                lines.append(f"  估算花费(¥)       : ¥{cost:,.4f}")
+        lines.append("────────────────────────────────────")
+        return lines
+
+    def estimated_cost(self, model: str) -> Optional[float]:
+        """按模型动态价目表估算花费（人民币元），未知模型返回 None。
+
+        费用 = 缓存命中输入/1e6 * 命中单价 + 未命中输入/1e6 * 未命中单价
+               + 输出/1e6 * 输出单价。
+        单价来自 paper_tools.core.pricing（实时抓取官方定价页并本地缓存，
+        不写死在代码中）。
+        """
+        from .pricing import get_model_price  # 延迟导入，避免循环依赖
+
+        price = get_model_price(model)
+        if price is None:
+            _log.warning("未获取到模型 %s 的价目，无法估算费用", model)
+            return None
+        hit = self.cache_hit_tokens
+        miss = self.cache_miss_tokens
+        ct = self.completion_tokens
+        return (
+            hit / 1_000_000 * price["cache_hit"]
+            + miss / 1_000_000 * price["cache_miss"]
+            + ct / 1_000_000 * price["output"]
+        )
 
 
 class LLMTranslator:
@@ -173,38 +247,67 @@ class LLMTranslator:
 
     # ---------- 公式/引用占位符保护 ----------
     @staticmethod
-    def protect_math(text: str) -> tuple[str, list[str], list[str]]:
-        """将公式与参考文献引用替换为 ⟦MATH_n⟧ / ⟦REF_n⟧ 占位符。
+    def protect_math(text: str) -> tuple[str, list[dict], dict[int, str]]:
+        """将公式与参考文献引用替换为 ⟦MATH_n⟧ / ⟦REF_Xn⟧ 占位符。
 
-        返回 (保护后文本, 公式列表, 引用列表)。公式列表索引 n 对应 ⟦MATH_n⟧；
-        引用列表索引 n 对应 ⟦REF_n⟧。两个列表分别管理、互不干扰。
+        返回 (保护后文本, 公式表, 引用表)。公式表为
+        ``[{id, latex, display}, ...]``：``id`` 是**全局唯一**编号（跨所有块 /
+        合并组单调递增，由模块级计数器分配），``latex`` 为原始 LaTeX 源码，
+        ``display`` 标记是否为行间公式（True=行间/$$，False=行内/$）。
+
+        引用表为 ``{id: 原文引用串, ...}``：``id`` 同样是**全局唯一**编号
+        （跨所有块/合并组单调递增），``原文引用串`` 为被保护的 ``[18]``、
+        ``[Kuhn et al., 2021](#bib.xxx)`` 等原文。这样在合并组（translate_group）
+        场景下多个子块的引用占位符互不重复，模型不会错位搬移，restore 时按 id
+        精确还原。
+
+        公式表/引用表仅作为翻译时的"上下文"输入给模型（见 ``translate`` /
+        ``translate_group`` 的 ``formulas`` 字段），帮助模型结合公式语义提升翻译
+        质量；它们**不要求模型回写**，模型只需在译文中照抄占位符即可，最终由
+        ``restore_math`` 用两张表精确还原。
         """
-        formulas: list[str] = []
+        formula_table: list[dict] = []
+
+        def _register(latex: str, display: bool) -> str:
+            fid = _next_formula_id()
+            formula_table.append({"id": fid, "latex": latex, "display": display})
+            return _MATH_PH_FMT.format(fid)
 
         def _sub_block(m):
-            formulas.append(m.group(0))
-            return _MATH_PH_FMT.format(len(formulas) - 1)
+            return _register(m.group(0), display=True)
+
+        def _sub_inline(m):
+            # 行内/指标/裸 LaTeX 公式均按"行内"登记（display=False），
+            # 让模型知道它们嵌入句子中、非独立成行。
+            return _register(m.group(0), display=False)
 
         protected = _MATH_BLOCK_RE.sub(_sub_block, text)
         # 保护行内 $...$ 公式
-        protected = _MATH_INLINE_RE.sub(_sub_block, protected)
+        protected = _MATH_INLINE_RE.sub(_sub_inline, protected)
         # 指标+箭头+LaTeX 混合脏写法整体保护（如 HD↓max{}_{\max}\downarrow）
-        protected = _METRIC_DIRTY_RE.sub(_sub_block, protected)
+        protected = _METRIC_DIRTY_RE.sub(_sub_inline, protected)
         # 简单指标变化表达式（ASR↑、HDmax ↓ 等）
-        protected = _METRIC_CHANGE_RE.sub(_sub_block, protected)
+        protected = _METRIC_CHANGE_RE.sub(_sub_inline, protected)
         # 兜底：残留的裸 LaTeX 命令（最后处理，避免与公式/指标规则冲突）
-        protected = _MATH_BARE_RE.sub(_sub_block, protected)
+        protected = _MATH_BARE_RE.sub(_sub_inline, protected)
 
-        # 保护参考文献引用 ⟦REF_n⟧（[18]、[1, 2]、[18-20] 等）。这一步放在所有
+        # 保护参考文献引用 ⟦REF_Xn⟧（[18]、[1, 2]、[18-20] 等）。这一步放在所有
         # _MATH_*_RE 之后，避免误把"[$...$]"类切片当公式吞噬。_REFERENCES_RE
         # 只匹配 [数字] 这种紧凑格式，不会与公式规则冲突。
-        references: list[str] = []
+        # references 以「全局唯一 id -> 原文引用串」的字典形式返回，restore 时按
+        # id 查表还原（支持跨块/合并组全局唯一，避免编号重复导致的错位残留）。
+        references: dict[int, str] = {}
 
         def _sub_ref(m):
-            references.append(m.group(0))
-            return _REF_PH_FMT.format(len(references) - 1)
+            rid = _next_ref_id()
+            references[rid] = m.group(0)
+            return _REF_PH_FMT.format(rid)
 
         protected = _REFERENCES_RE.sub(_sub_ref, protected)
+        # 所有 markdown 链接（[显示文本](url "title")）：与 [数字] 引用共用
+        # references 字典与 ⟦REF_Xn⟧ 占位符，restore 时原样还原，避免链接
+        # （文献引用 / 普通链接）被 LLM 翻译改写而丢失。
+        protected = _LINK_RE.sub(_sub_ref, protected)
 
         # ── 防御性自检：占位符之外不应残留 $ ──
         cleaned = re.sub(r"⟦(?:MATH|REF)_\d+⟧", "", protected)
@@ -218,11 +321,15 @@ class LLMTranslator:
                 dangling[:6],
             )
 
-        return protected, formulas, references
+        return protected, formula_table, references
 
     @staticmethod
-    def restore_math(text: str, formulas: list[str], references: Optional[list[str]] = None) -> str:
-        """将 ⟦MATH_n⟧ 还原为公式，将 ⟦REF_n⟧ 还原为参考文献引用串。
+    def restore_math(text: str, formula_table: list[dict], references: Optional[dict[int, str]] = None) -> str:
+        """将 ⟦MATH_n⟧ 还原为公式，将 ⟦REF_Xn⟧ 还原为参考文献引用串。
+
+        公式通过占位符中的全局 id 在 formula_table 中查表还原（公式本身未进入
+        模型，不会被改写）；引用通过全局 id 在 references 字典（id->原文）中查表
+        还原，天然支持跨块/合并组全局唯一，避免编号重复导致的错位残留。
 
         同时对还原出的公式逐个做 KaTeX 兼容性清洗：原 arXiv PDF 源码可能
         包含 KaTeX 不支持/兼容性差的 LaTeX 命令（如 \\textsc{}——small caps，
@@ -230,24 +337,27 @@ class LLMTranslator:
         KaTeX 支持的等价命令，否则最终 markdown 在 Typora 等基于 KaTeX 的
         渲染器中整段 $$ 块无法显示。
         """
-        references = references or []
+        references = references or {}
 
         def _sanitize_one(formula: str) -> str:
             # 与 _sanitize_bare_latex 中"模式 4"对齐。
             # 注意：原 \\textsc 后是大写单词（如 Unsafe/Safe），非贪婪匹配 {…}。
             return re.sub(r"\\textsc\{", r"\\text{", formula)
 
+        # 建立 id -> latex 查表（以占位符 id 为主键，天然支持跨块/合并组全局唯一）。
+        formula_by_id = {entry["id"]: entry["latex"] for entry in formula_table}
+
         # 还原公式
         def _sub_math(m):
-            idx = int(m.group(1))
-            if 0 <= idx < len(formulas):
-                return _sanitize_one(formulas[idx])
+            fid = int(m.group(1))
+            if fid in formula_by_id:
+                return _sanitize_one(formula_by_id[fid])
             return m.group(0)
         text = _MATH_PH_RE.sub(_sub_math, text)
-        # 还原引用
+        # 还原引用（按全局 id 查表；查不到则保留占位符以便后续排查）
         def _sub_ref(m):
-            n = int(m.group(1))
-            return references[n] if 0 <= n < len(references) else m.group(0)
+            rid = int(m.group(1))
+            return references.get(rid, m.group(0))
         return _REF_PH_RE.sub(_sub_ref, text)
 
     @staticmethod
@@ -322,7 +432,8 @@ class LLMTranslator:
 
     def _build_system(self, glossary: Optional[Glossary],
                       summary: Optional[str] = None,
-                      multi_block: bool = False) -> str:
+                      multi_block: bool = False,
+                      cell_mode: bool = False) -> str:
         """从 YAML 模板构建系统提示词。编号按有/无 summary+glossary 自动递增。"""
         prompts = _load_prompts()
         rule_num = len(prompts["rules"])
@@ -334,9 +445,20 @@ class LLMTranslator:
         if gl_text:
             rule_num += 1
             parts.append(prompts["glossary_rule"].format(n=rule_num, glossary=gl_text))
+        # 表格单元格专属约束：只在单元格翻译场景下注入（强制"只翻译、不解释"，
+        # 以及"无法翻译时返回固定标记 ⟦SKIP⟧"），避免污染正文/标题翻译的系统提示。
+        if cell_mode:
+            rule_num += 1
+            parts.append(prompts["table_cell_extra"].format(
+                n=rule_num, marker=TABLE_UNTRANSLATABLE_MARKER))
         # 输出格式
         key = "output_multi" if multi_block else "output_single"
-        parts.append(prompts[key].replace("{keep_as_is}", KEEP_AS_IS))
+        out = prompts[key].replace("{keep_as_is}", KEEP_AS_IS)
+        if cell_mode:
+            # 单元格场景下补充说明：无内容可译时返回固定标记而非硬翻。
+            out = (out + f"\n  · 本单元格无自然语言可译（空/纯符号/乱码）时，"
+                          f"translation 字段直接填 {TABLE_UNTRANSLATABLE_MARKER}（前后无空格）。")
+        parts.append(out)
         return "\n\n".join(parts)
 
     @staticmethod
@@ -357,22 +479,32 @@ class LLMTranslator:
         return text
 
     def translate(self, text: str, glossary: Optional[Glossary] = None,
-                  summary: Optional[str] = None) -> tuple[str, list[dict[str, Any]]]:
+                  summary: Optional[str] = None,
+                  cell_mode: bool = False) -> tuple[str, list[dict[str, Any]]]:
         """翻译一段文本。
 
         返回 (译文, 本段确定的术语列表)。
         术语列表元素形如 {"en":..., "zh":..., "en_full"?:..., "note"?:...}。
+
+        :param cell_mode: 为 True 时按"表格单元格"场景构建提示词（只翻译、
+            不解释；无法翻译的空/乱码单元格返回固定标记 TABLE_UNTRANSLATABLE_MARKER）。
         """
         if not text.strip():
             return text, []
         # 公式占位符保护：避免模型改写公式
-        protected, formulas, references = self.protect_math(text)
-        system = self._build_system(glossary, summary=summary)
+        protected, formula_table, references = self.protect_math(text)
+        system = self._build_system(glossary, summary=summary, cell_mode=cell_mode)
+        # user payload 携带公式表（仅输入，不要求模型回写），让模型能看到原始
+        # LaTeX 语义以提升翻译质量；模型只需在译文中照抄占位符即可。
+        user_payload = json.dumps(
+            {"text": protected, "formulas": formula_table},
+            ensure_ascii=False,
+        )
         resp = self._client.chat.completions.create(
             model=self.llm.model,
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": protected},
+                {"role": "user", "content": user_payload},
             ],
             temperature=self.llm.temperature,
             response_format={"type": "json_object"},
@@ -383,7 +515,7 @@ class LLMTranslator:
         raw = (resp.choices[0].message.content or "").strip()
         translation, terms = self._parse_json(raw)
         # 还原公式 + 后处理：修复 LLM 自行生成的裸 LaTeX 残骸
-        translation = self.restore_math(translation, formulas, references)
+        translation = self.restore_math(translation, formula_table, references)
         translation = self._sanitize_bare_latex(translation)
         # 作者脚注标记 → 中文
         translation = self._normalize_author_marks(translation)
@@ -404,23 +536,25 @@ class LLMTranslator:
             t, terms = self.translate(texts[0], glossary, summary)
             return [t], terms
 
-        # 逐块公式保护
+        # 逐块公式保护（占位符 id 全局唯一，跨块不冲突，故可在顶层统一给模型一张公式表）
         protected_blocks: list[dict[str, Any]] = []
-        formula_map: list[list[str]] = []  # 每个子块对应的占位符公式列表
-        ref_map: list[list[str]] = []      # 每个子块对应的占位符引用列表
+        formula_map: list[list[dict]] = []   # 每个子块对应的公式表 [{id,latex,display}]
+        ref_map: list[list[str]] = []        # 每个子块对应的占位符引用列表
+        merged_formulas: list[dict] = []      # 合并组统一公式表（输入给模型，仅输入不回写）
         for i, text in enumerate(texts):
             if not text.strip():
                 protected_blocks.append({"id": i, "text": text})
                 formula_map.append([])
                 ref_map.append([])
                 continue
-            protected, formulas, references = self.protect_math(text)
+            protected, formula_table, references = self.protect_math(text)
             protected_blocks.append({"id": i, "text": protected})
-            formula_map.append(formulas)
+            formula_map.append(formula_table)
             ref_map.append(references)
+            merged_formulas.extend(formula_table)
 
         user_payload = json.dumps(
-            {"blocks": protected_blocks},
+            {"blocks": protected_blocks, "formulas": merged_formulas},
             ensure_ascii=False,
         )
         system = self._build_system(glossary, summary=summary, multi_block=True)
@@ -462,6 +596,16 @@ class LLMTranslator:
                 translations[idx] = self.restore_math(
                     str(item.get("translation", "")), formula_map[idx], ref_map[idx]
                 )
+        # 跨块兜底：合并组里模型可能把某块的引用占位符 ⟦REF_Xn⟧ 写到了另一块的
+        # 译文中（全局唯一 id 下不会重复，但块级 ref_map 不含该 id）。把所有块的
+        # references 合并成全量表，对每块译文再补一次还原，消除残留裸占位符。
+        all_refs: dict[int, str] = {}
+        for r in ref_map:
+            all_refs.update(r)
+        if all_refs:
+            translations = [
+                self.restore_math(t, [], all_refs) for t in translations
+            ]
         # 若模型漏掉某些块，用原文兜底并补翻
         for idx, t in enumerate(translations):
             if not t.strip():

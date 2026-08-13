@@ -54,9 +54,14 @@ class AppSettings:
     # 翻译相关
     translate_concurrency: int = 8     # 并发翻译线程数（0/1 表示单线程）
     translate_repair: bool = True      # 翻译后是否做一致性检查与返修
-    # 短块合并阈值（字符，按纯文本长度）：相邻同类型的过短文本块（段落/列表项）
-    # 会合并到前一个块一起翻译，以减少碎片、保持上下文连贯。设为 0 关闭合并。
-    merge_min_chars: int = 50
+    # 翻译单元「目标长度」下限（字符，按纯文本长度）：相邻同类型文本块（段落/
+    # 列表项/文本框）会被贪心凑成长度在 [merge_min_chars, merge_target_max] 区间
+    # 的翻译单元，一起以 JSON 分块翻译，减少碎片、保持上下文连贯。
+    # 单块长度 ≥ merge_target_max 时独立成单元（不强行拆分）。设为 0 关闭合并。
+    merge_min_chars: int = 1000
+    # 翻译单元「目标长度」上限（字符）。凑单元时累计长度达到该值即关闭当前单元。
+    # 设为 0 表示不限制上限（仍受 merge_min_chars 触发关闭）。
+    merge_target_max: int = 1500
     # 引用搜索引擎：google | bing | duckduckgo | semantic_scholar | arxiv
     #   默认 bing（国内可访问），Google 在国内常被拦截
     cite_search_engine: str = "bing"
@@ -107,6 +112,8 @@ class AppSettings:
             self.output_name_mode = env.strip().lower()
         if env := os.environ.get("PAPER_TOOLS_MERGE_MIN"):
             self.merge_min_chars = int(env)
+        if env := os.environ.get("PAPER_TOOLS_MERGE_MAX"):
+            self.merge_target_max = int(env)
         if env := os.environ.get("PAPER_TOOLS_TOKEN_REPORT"):
             self.token_report = env.strip().lower() in ("1", "true", "yes", "on")
         if env := os.environ.get("PAPER_TOOLS_EXPORT_FORMATS"):

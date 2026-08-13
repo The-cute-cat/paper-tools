@@ -7,12 +7,18 @@
 可用工具：
     arxiv-translate   下载 arxiv HTML 论文并翻译为中文 markdown
 
-环境变量（在 .env 或系统中配置）：
+环境变量（在 .env 或系统中配置，详见 README）：
     DEEPSEEK_API_KEY      必填，DeepSeek API key
     DEEPSEEK_MODEL        可选，模型名（默认 deepseek-v4-flash）
     DEEPSEEK_BASE_URL     可选，API 地址
     PAPER_TOOLS_OUTPUT    可选，默认输出根目录
     PAPER_TOOLS_LOG_LEVEL 可选，日志级别（默认 INFO）
+    PAPER_TOOLS_CONCURRENCY  可选，并发翻译线程数（默认 8）
+    PAPER_TOOLS_MERGE_MIN / _MAX  可选，翻译单元长度下限/上限（默认 1000/1500）
+    PAPER_TOOLS_CITE_SEARCH / _DISPLAY  可选，引用搜索引擎/显示模式
+    PAPER_TOOLS_NAME_MODE  可选，输出文件命名方式（id/title/title_zh）
+    PAPER_TOOLS_TOKEN_REPORT  可选，翻译后输出 token 用量与费用估算
+    PAPER_TOOLS_EXPORT_FORMATS / _OUTPUT_MD  可选，额外导出格式相关
 """
 
 import argparse
