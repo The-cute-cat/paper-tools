@@ -492,7 +492,7 @@ def parse_arxiv_html(
         for p in abstract.find_all(class_="ltx_p", recursive=False):
             rich = _rich_text(p)
             blocks.append(Block(kind="paragraph", text=_plain_text_for_translation(p), raw=rich,
-                                meta={"html_id": _html_id_of(p)}))
+                                meta={"html_id": _html_id_of(p), "section": "abstract"}))
         keywords = abstract.find(class_="ltx_keywords")
         if keywords:
             blocks.append(Block(kind="paragraph", text=_plain_text(keywords),
@@ -693,17 +693,57 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
                 if "ltx_algorithm" in sub_cls_set or "ltx_listing" in sub_cls_set:
                     _append_listing(sub, blocks)
                     return
-                if sub.name == "div" and "ltx_para" in sub_cls_set:
-                    # 嵌套段落容器：递归把它的直接 paragraph / equation
-                    # 子元素追加到外层 block 列表（保持与外层 figure/table/listing
-                    # 在同一文档顺序里）。
-                    for inner_p in sub.find_all(class_="ltx_p", recursive=False):
-                        _emit(inner_p)
-                    for inner_eq in sub.find_all(
-                        class_=re.compile(r"ltx_equation(|group)"),
-                        recursive=False,
-                    ):
-                        _emit(inner_eq)
+                if sub.name == "div" and ("ltx_logical-block" in sub_cls_set
+                                           or "ltx_para" in sub_cls_set):
+                    # 嵌套段落容器：把它的 paragraph / equation / figure / table
+                    # 子元素按文档顺序追加到外层 block 列表（递归传递 transparent
+                    # 包装容器 ltx_logical_block 与 ltx_para，使整张示意图保留）。
+                    #
+                    # 兼容两种包装：
+                    #   * <div class="ltx_para">         —— 段落容器，承载单/多个
+                    #     <p class="ltx_p"> 段落和 <table class="ltx_equation...">
+                    #     公式块。
+                    #   * <div class="ltx_logical-block"> —— ar5iv 经常用它把一组居中排版的
+                    #     <span class="ltx_p ltx_minipage ..."> 包起来模拟两/三列并排示意
+                    #     （典型如 prompt 模板的 Original → Transformed 对照表）。
+                    #     它内部还会再嵌套 <div class="ltx_para">，因此这里用
+                    #     recursive=True 才能跨越中间包装层把最里层的 ltx_p
+                    #     /figure/table/equation 都正确挖出来。
+                    #
+                    # 忽略两者会令整张示意图被静默丢弃（参见 issue：Datasets 节里
+                    # Original → Transformed 翻译后消失）。
+                    def _walk_transparent(node: Tag, depth: int) -> None:
+                        if depth > 8:
+                            return
+                        node_cls = node.get("class") or []
+                        is_transparent = (
+                            "ltx_logical-block" in node_cls
+                            or "ltx_para" in node_cls
+                        )
+                        if is_transparent:
+                            for c in node.children:
+                                if isinstance(c, Tag):
+                                    _walk_transparent(c, depth + 1)
+                            return
+                        if node.name == "p" and "ltx_p" in node_cls:
+                            _emit(node)
+                            return
+                        if node.name == "table" and (
+                            "ltx_equation" in node_cls
+                            or "ltx_equationgroup" in node_cls
+                        ):
+                            _emit(node)
+                            return
+                        if node.name in ("figure", "table"):
+                            _emit(node)
+                            return
+                        # 其他容器（比如更深层 div）继续透传
+                        if node.name in ("div", "section"):
+                            for c in node.children:
+                                if isinstance(c, Tag):
+                                    _walk_transparent(c, depth + 1)
+
+                    _walk_transparent(sub, 0)
                     return
                 # 其他标签（maketitle 残余等）：不展开，避免污染。
 
@@ -908,14 +948,56 @@ def _listing_line_text(tag: Tag) -> str:
 
 
 def _collect_table_text(tbl: Tag) -> str:
-    """将 ar5iv 表格转为 markdown 表格，正确处理 colspan / rowspan 与分组头。
-合并单元格：在每行重复上方 cell 文本以保持列对齐（markdown 不支持原生合并）。
-分组头：单 cell + colspan >= max_cols 表示分组标识，后续子项行第 1 列复用该文本。
-"""
+    """将 ar5iv 表格转为 markdown 或 HTML 字符串。
+
+    简单表格（无 colspan/rowspan、无分组标识行）：输出 GFM markdown；
+      如有"双层表头"则用 <br> 堆叠保留信息。
+    复杂表格（任一 cell 含 colspan>1 或 rowspan>1、或含"分组标识行"
+      即单 cell + colspan>=2）：改走 HTML 路径，输出原始 <table>
+      HTML 字符串。GFM 允许 raw HTML 嵌入，markdown 渲染器会保留
+      colspan/rowspan 合并、双层表头、分组行等所有原结构；
+      pipeline 翻译阶段单独走"按 cell 翻译"路径，不会损坏结构。
+
+    返回值仅为一个字符串，pipeline 通过"是否以 '<table' 开头"
+    判断走哪种 cell 翻译通道；两种路径都把字符串也用作最终的
+    block.raw 直接落地（markdown 路径→ GFM；HTML 路径 → raw HTML）。
+    """
     tabular = tbl.find(class_="ltx_tabular") or tbl
     html_table = tabular if tabular.name == "table" else tabular.find("table")
     if html_table is None:
         return ""
+
+    # 复杂度先判定：任一 cell 含 colspan>1 或 rowspan>1 → HTML 路径。
+    has_complex = False
+    for cell in html_table.find_all(["td", "th"]):
+        try:
+            cs = int(cell.get("colspan") or 1)
+        except ValueError:
+            cs = 1
+        try:
+            rs = int(cell.get("rowspan") or 1)
+        except ValueError:
+            rs = 1
+        if cs > 1 or rs > 1:
+            has_complex = True
+            break
+
+    if has_complex:
+        # 重置 BeautifulSoup 的属性避免 selector 序列化干扰；保留原 ltx 标签。
+        # 直接 str() 输出，让 markdown 渲染器（GFM + Typora）原样保留表格。
+        # 关键：必须把内部 cell 文本里的换行折叠（_cell_text 已处理），但保留
+        # 任何原始 HTML 标签（<strong>、<b>、<sup>、$...$ 公式由 LLM 翻译阶段
+        # 内的 protect_math + _rich_text 处理）。
+        # 这里调用 decode_contents 不可行：bs4 解析器会漏 cdata 与实体；
+        # prefer 直接抓 outer HTML。
+        # 注意：ar5iv 表格内 table 元素可能含 ltx 的子 class，需要保留。
+        html = str(html_table)
+        # 防止 Typora 把独占一行的 GFM 表格分隔线误判；表格 HTML 块前后
+        # 加空行并非必须（GFM 块级 HTML 由空行分隔），但 remove 掉前后
+        # 的可能空白更稳。
+        return html.strip() + "\n"
+
+    # ===== 后续是简单表格 markdown 路径（保持原行为）=====
 
     def _cell_text(td: Tag) -> str:
         rich = _rich_text(td)

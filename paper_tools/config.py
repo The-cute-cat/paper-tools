@@ -84,6 +84,15 @@ class AppSettings:
     # 是否仍输出 .zh.md（markdown）。默认 True：导出 docx/pdf 时也会保留 markdown。
     # 设为 False 可只产出 docx/pdf（例如 --no-md / PAPER_TOOLS_OUTPUT_MD=false）。
     output_markdown: bool = True
+    # 生成「全局立场摘要」时送入 LLM 的摘要文本字符上限。
+    # 0（默认）= 不截断，使用完整论文摘要；>0 = 超过该字符数则截断（极少数学术
+    # 摘要极长时可设一个上限，避免无谓的 token 消耗）。
+    summary_max_abstract_chars: int = 0
+    # 断点续译模式：检测到上次异常退出的翻译缓存时如何处理。
+    #   ask  （默认）= 在终端询问用户 恢复(r) / 重新翻译(n) / 退出(q)
+    #   auto  = 自动恢复（无交互环境或 CI 下默认沿用缓存，跳过已翻译块）
+    #   never = 总是从头翻译（忽略缓存，启动即删除）
+    resume_mode: str = "ask"
 
     def resolve(self) -> "AppSettings":
         """用环境变量/默认值补全缺失字段。"""
@@ -120,6 +129,10 @@ class AppSettings:
             self.export_formats = env.strip().lower()
         if env := os.environ.get("PAPER_TOOLS_OUTPUT_MD"):
             self.output_markdown = env.strip().lower() in ("1", "true", "yes", "on")
+        if env := os.environ.get("PAPER_TOOLS_SUMMARY_MAX_CHARS"):
+            self.summary_max_abstract_chars = int(env)
+        if env := os.environ.get("PAPER_TOOLS_RESUME_MODE"):
+            self.resume_mode = env.strip().lower()
         return self
 
 

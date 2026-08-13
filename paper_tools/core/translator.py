@@ -521,6 +521,76 @@ class LLMTranslator:
         translation = self._normalize_author_marks(translation)
         return translation, terms
 
+    def generate_summary(self, title: str, abstract: str,
+                         max_abstract_chars: int = 0) -> str:
+        """真正调用一次 LLM，基于【标题 + 摘要】生成结构化的"全局立场摘要"。
+
+        与旧实现（pipeline 内把"前 3 段"字符串拼接成一句提示）不同，这里让模型
+        读完整段摘要、归纳出 任务/方法/主要发现/立场 四要素，输出更精准、可用于
+        约束全文翻译口径的立场锚定文本。返回空串表示生成失败（调用方应回退到
+        基于标题的轻量锚定，不阻断流程）。
+
+        :param max_abstract_chars: 摘要字符上限，0（默认）表示不截断，使用完整摘要。
+        """
+        title = (title or "").strip()
+        abstract = (abstract or "").strip()
+        if not title and not abstract:
+            return ""
+        if max_abstract_chars and len(abstract) > max_abstract_chars:
+            abstract = abstract[:max_abstract_chars].rstrip() + "…"
+        prompts = _load_prompts()
+        system = (
+            "你是一名严谨的学术论文分析助手，只依据给定文本提炼结构化摘要，"
+            "不臆造、不评论。"
+        )
+        user = prompts["summary_gen"].format(title=title, abstract=abstract)
+        try:
+            resp = self._client.chat.completions.create(
+                model=self.llm.model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            )
+        except Exception as exc:  # 摘要生成失败不应阻断整篇翻译
+            _log.warning("生成全局立场摘要失败，回退到标题锚定：%s", exc)
+            return ""
+        if getattr(resp, "usage", None) is not None:
+            self.usage.add(TokenUsage.from_response(resp.usage))
+        raw = (resp.choices[0].message.content or "").strip()
+        # summary_gen 模板要求纯文本输出，但部分模型仍可能包成 JSON；做一层容错解析。
+        summary = self._extract_summary_text(raw)
+        return summary
+
+    @staticmethod
+    def _extract_summary_text(raw: str) -> str:
+        """从模型返回中稳妥提取摘要纯文本。
+
+        模板要求纯文本，但部分提供方在 json_object 模式下会把内容包成
+        {"summary": "..."} 或 {"translation": "..."}。这里做最小容错：
+        能解析出单值字符串就取之，否则原样返回（保留换行结构）。
+        """
+        if not raw:
+            return ""
+        try:
+            obj = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return raw
+        if isinstance(obj, str):
+            return obj
+        if isinstance(obj, dict):
+            # 常见键名兜底
+            for key in ("summary", "摘要", "translation", "text", "result"):
+                if key in obj and isinstance(obj[key], str):
+                    return obj[key]
+            # 否则把所有字符串值拼回
+            parts = [str(v) for v in obj.values() if isinstance(v, str)]
+            if parts:
+                return "\n".join(parts)
+        return raw
+
     def translate_group(self, texts: list[str], glossary: Optional[Glossary] = None,
                         summary: Optional[str] = None) -> tuple[list[str], list[dict[str, Any]]]:
         """一次性翻译一组（合并的）短块。

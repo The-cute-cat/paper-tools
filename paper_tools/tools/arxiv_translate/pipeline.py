@@ -2,6 +2,7 @@
 
 import re
 import sys
+import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -21,6 +22,129 @@ from .parser import Block, parse_arxiv_html
 logger = get_logger()
 
 ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5}(v\d+)?)", re.IGNORECASE)
+
+# 翻译缓存文件格式版本。结构变化（如字段增删）时 +1，旧版本缓存会被视为不兼容而忽略。
+_TRANSLATE_CACHE_VERSION = 1
+
+
+class _TranslateCache:
+    """翻译阶段译文断点缓存。
+
+    把「翻译单元 -> 译文」按 block_index 增量持久化到磁盘 JSON，使异常退出后
+    下次启动可恢复，避免重跑已翻译块、浪费 Token。
+
+    设计要点：
+    * 文件命名 `.<stem>.translate_cache.json`，与最终 `.zh.md` 区分（隐藏点文件）。
+    * 每次完成一个 unit 即增量 flush，而非全量结束才写，保证崩溃点之后的块仍可恢复。
+    * 同时记录 arxiv_id 与版本号，避免不同论文/不同格式缓存互相串用。
+    * 成功后由调用方显式 clear()，否则残留文件即代表「上次异常退出产物」。
+    """
+
+    def __init__(self, path: Path, arxiv_id: str):
+        self.path = path
+        self.arxiv_id = arxiv_id
+        self.data: dict[str, Any] = {}
+        self._loaded = False
+
+    # —— 存在性 / 加载 ——
+    def exists(self) -> bool:
+        return self.path.is_file()
+
+    def load(self) -> bool:
+        """加载已有缓存。版本/论文不匹配时返回 False（视为不可用）。"""
+        if not self.exists():
+            return False
+        try:
+            import json
+            raw = json.loads(self.path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            logger.warning(f"翻译缓存读取失败，将忽略并重新翻译：{e}")
+            return False
+        if raw.get("version") != _TRANSLATE_CACHE_VERSION:
+            return False
+        if raw.get("arxiv_id") != self.arxiv_id:
+            return False
+        self.data = raw.get("translations", {})
+        self._loaded = True
+        return True
+
+    # —— 查询 / 写入 ——
+    def get(self, idx: int) -> Optional[str]:
+        item = self.data.get(str(idx))
+        if isinstance(item, dict):
+            return item.get("translation")
+        return None
+
+    def put(self, idx: int, translation: str) -> None:
+        self.data[str(idx)] = {"translation": translation}
+
+    def save(self) -> None:
+        """把当前缓存原子写入磁盘（先写临时文件再 rename，避免半截文件）。"""
+        import json
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        try:
+            payload = {
+                "version": _TRANSLATE_CACHE_VERSION,
+                "arxiv_id": self.arxiv_id,
+                "translations": self.data,
+            }
+            tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.path)
+        except OSError as e:
+            logger.warning(f"翻译缓存写入失败（不影响本次翻译）：{e}")
+
+    def clear(self) -> None:
+        try:
+            if self.path.is_file():
+                self.path.unlink()
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            if tmp.is_file():
+                tmp.unlink()
+        except OSError as e:
+            logger.warning(f"翻译缓存清理失败：{e}")
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+
+def _ask_resume(cache: _TranslateCache) -> str:
+    """向用户询问断点恢复方式。返回 'resume' / 'new' / 'quit'。
+
+    * resume_mode=ask 且标准输入是 tty：打印选项并用 input() 读取单字符。
+    * 非 tty（CI / 重定向）或 resume_mode=auto：返回 'resume'。
+    * resume_mode=never：返回 'new'。
+    """
+    mode = (get_settings().resume_mode or "ask").strip().lower()
+    if mode == "never":
+        return "new"
+    if mode == "auto":
+        return "resume"
+
+    # ask 模式但无交互终端：退化为 auto，避免卡死
+    if not sys.stdin or not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
+        logger.warning("检测到断点缓存但当前非交互终端，按 resume_mode=auto 自动恢复。")
+        return "resume"
+
+    prompt = (
+        f"\n检测到上次异常退出的翻译缓存（已翻译 {len(cache)} 个块）。请选择：\n"
+        f"  [r] 恢复（复用已翻译内容，仅翻译剩余部分，节省 Token）\n"
+        f"  [n] 重新翻译（丢弃缓存，从头开始）\n"
+        f"  [q] 退出（不执行任何操作）\n"
+        f"请输入 r / n / q 后回车："
+    )
+    while True:
+        try:
+            ans = input(prompt).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            logger.warning("读取用户输入中断，按 resume_mode=auto 自动恢复。")
+            return "resume"
+        if ans in ("r", "resume"):
+            return "resume"
+        if ans in ("n", "new"):
+            return "new"
+        if ans in ("q", "quit", "exit"):
+            return "quit"
+        print("无法识别，请重新输入 r / n / q。")
 
 
 def _new_tqdm(
@@ -503,29 +627,55 @@ def _build_seed_glossary(translator: LLMTranslator, blocks: list[Block]) -> Glos
         return glossary
     text = "\n\n".join(seed_parts)
     logger.info("正在构建初始术语表（锁定专有名词/易错词译法）...")
+    _t0 = time.monotonic()
     _, terms = translator.translate(text, glossary)
     glossary.ingest_terms(terms)
-    logger.info(f"建表阶段完成，初始术语 {len(glossary.terms)} 条（含种子 {base_count} 条）")
+    logger.info(f"建表阶段完成，初始术语 {len(glossary.terms)} 条（含种子 {base_count} 条），"
+                f"耗时 {time.monotonic() - _t0:.1f}s")
     return glossary
 
 
 def _build_paper_summary(blocks: list[Block], translator: LLMTranslator) -> str:
-    """生成一句论文全局立场摘要（锚定翻译基调，防幻觉/串文）。
+    """生成论文"全局立场摘要"（锚定翻译基调，防幻觉/串文）。
 
-    零成本实现：用标题 + 摘要段落直接拼成一句简短说明；
-    若摘要为空则回退到标题。
+    实现：优先抽取 parser 显式标记的 `section == "abstract"` 段落作为摘要正文，
+    回退到"标题之后的前几段"；再调用 translator.generate_summary() 让 LLM 基于
+    **标题 + 真实摘要**归纳出 任务/方法/主要发现/立场 四要素的结构化立场文本。
+    若 LLM 调用失败，则回退到基于标题 + 摘要原文的轻量字符串拼接（旧行为），
+    保证不阻断整篇翻译流程。
     """
     title = ""
     abstract_parts: list[str] = []
     for b in blocks:
         if b.kind == "title" and b.text:
             title = b.text
-        elif b.kind == "paragraph" and b.text:
+        # 精确抽取摘要：parser 已为 abstract 段落打 section="abstract" 标记
+        elif b.meta and b.meta.get("section") == "abstract" and b.text:
             abstract_parts.append(b.text)
-        if title and len(abstract_parts) >= 3:
-            break
-    if title and abstract_parts:
-        joined = " ".join(abstract_parts)
+
+    # 回退：无显式 abstract 标记时，取标题之后前 3 个段落（兼容 ar5iv 未标记的情况）
+    if not abstract_parts:
+        for b in blocks:
+            if b.kind == "paragraph" and b.text:
+                abstract_parts.append(b.text)
+            if len(abstract_parts) >= 3:
+                break
+
+    abstract_text = "\n".join(abstract_parts).strip()
+
+    # 真正生成一次结构化全局摘要（额外一次 LLM 调用）。
+    # 摘要字符上限来自配置 summary_max_abstract_chars（0 = 不截断，使用完整摘要）。
+    max_chars = get_settings().summary_max_abstract_chars
+
+    # 真正生成一次结构化全局摘要（额外一次 LLM 调用）
+    if title or abstract_text:
+        generated = translator.generate_summary(title, abstract_text, max_abstract_chars=max_chars)
+        if generated:
+            return generated.strip()
+
+    # —— 回退路径：LLM 生成失败时的轻量锚定（不阻断流程）——
+    if title and abstract_text:
+        joined = abstract_text
         if len(joined) > 600:
             joined = joined[:600] + "…"
         return (
@@ -638,10 +788,13 @@ def _pre_translate_abbrevs(translator: LLMTranslator, blocks: list[Block],
 
 def _translate_units(translator: LLMTranslator, blocks: list[Block], units: list[list[int]],
                     glossary: Glossary, concurrency: int,
-                    summary: str = "", prefilled: Optional[dict[int, str]] = None) -> dict[int, tuple[str, list]]:
+                    summary: str = "", prefilled: Optional[dict[int, str]] = None,
+                    cache: Optional["_TranslateCache"] = None) -> dict[int, tuple[str, list]]:
     """按翻译单元并发翻译。返回 {block_index: (translation, terms)}。
 
     prefilled: 已预翻译好的块下标 -> 译文，直接复用，不再翻译（用于缩写预热）。
+    cache:     断点续译缓存（恢复模式）。命中缓存的 unit 直接复用译文、不再调 LLM，
+               新完成的 unit 在结果回收时增量写入缓存，使中途崩溃后下次可恢复。
     """
     prefilled = prefilled or {}
     results: dict[int, tuple[str, list]] = {}
@@ -649,9 +802,31 @@ def _translate_units(translator: LLMTranslator, blocks: list[Block], units: list
     if prefilled:
         for i, trans in prefilled.items():
             results[i] = (trans, [])
+
+    # 恢复模式：缓存已覆盖的 unit 直接复用，不进并发队列。
+    if cache is not None:
+        resume_units = [u for u in pending_units
+                        if all(cache.get(i) is not None for i in u)]
+        pending_units = [u for u in pending_units
+                         if not all(cache.get(i) is not None for i in u)]
+        for u in resume_units:
+            for i in u:
+                results[i] = (cache.get(i), [])
+        if resume_units:
+            logger.info(f"断点续译：跳过缓存命中的 {len(resume_units)} 个单元，"
+                        f"剩余 {len(pending_units)} 个待翻译。")
+
+    if not pending_units:
+        return results
+
     if concurrency <= 1:
         for u in _new_tqdm(pending_units, "翻译", "unit"):
-            results.update(_translate_unit(translator, blocks, u, glossary, summary))
+            res = _translate_unit(translator, blocks, u, glossary, summary)
+            results.update(res)
+            if cache is not None:
+                for i, (trans, _) in res.items():
+                    cache.put(i, trans)
+                cache.save()
         return results
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -661,7 +836,12 @@ def _translate_units(translator: LLMTranslator, blocks: list[Block], units: list
         }
         for fut in _new_tqdm(as_completed(fut_map), "翻译", "unit", total=len(fut_map)):
             u = fut_map[fut]
-            results.update(fut.result())
+            res = fut.result()
+            results.update(res)
+            if cache is not None:
+                for i, (trans, _) in res.items():
+                    cache.put(i, trans)
+                cache.save()
     return results
 
 
@@ -803,6 +983,82 @@ def _cell_is_translatable(cell: str) -> bool:
     return True
 
 
+def _translate_html_table(
+    table_html: str,
+    translator: LLMTranslator,
+    glossary: Glossary,
+    summary: str = "",
+) -> str:
+    """对 HTML <table> 字符串做 cell 级别翻译，逐 cell 用 ASCII 占位符
+    `<<<TCELL_R_C>>>` 替换原文，批量翻译后再回填。保留 colspan/rowspan/
+    <thead>/<tbody>/双层表头/分组标识行等所有结构。
+    """
+    raw = table_html.strip()
+    if not (raw.startswith("<table") or "<table" in raw[:32]):
+        return table_html
+    soup = BeautifulSoup(raw, "html.parser")
+    table = soup.find("table")
+    if table is None:
+        return table_html
+
+    rows = table.find_all("tr", recursive=False)
+    translatable_cells: list[tuple[int, int, Tag]] = []
+    placeholder_to_text: dict[str, str] = {}
+    for ri, row in enumerate(rows):
+        cells = row.find_all(["td", "th"], recursive=False)
+        for ci, cell in enumerate(cells):
+            inner_text = cell.get_text(" ", strip=True)
+            if not _cell_is_translatable(inner_text):
+                continue
+            placeholder = f"<<<TCELL_{ri}_{ci}>>>"
+            translatable_cells.append((ri, ci, cell))
+            placeholder_to_text[placeholder] = inner_text
+
+    if not placeholder_to_text:
+        return table_html
+
+    logger.info(f"    HTML 表格：共 {len(rows)} 行，{len(placeholder_to_text)} 个可译 cell")
+
+    # 先把所有可译 cell 文本替换为占位符，避免 LLM 输出把 cell 间混淆。
+    for ri, ci, cell in translatable_cells:
+        ph = f"<<<TCELL_{ri}_{ci}>>>"
+        # 提取 cell 内部：保留所有 HTML（strong/b/sup/...），只在最深文本节点上
+        # 做替换。简化做法：序列化 cell HTML、把最末一个文本节点外的内容剥掉。
+        # 实际更稳的方法：把 cell 内容用一个 sentinel nested tag 包裹。
+        # 我们采用：直接清掉 cell 的所有文本节点，只留一个文本节点 = ph。
+        for child in list(cell.contents):
+            cell.extract()
+        cell.append(soup.new_string(ph))
+
+    skeleton = str(table)
+    translatable_count = len(placeholder_to_text)
+
+    # 把 skeleton 里的占位符切出供 LLM 翻译。
+    placeholders = list(placeholder_to_text.keys())
+    batch_payload = "\n".join(placeholder_to_text[p] for p in placeholders)
+    try:
+        translated_lines = translator.translate(batch_payload, glossary)
+    except Exception as e:
+        logger.warning(f"HTML 表格 cell 翻译失败：{e}；保留原表")
+        return table_html
+
+    translated = translated_lines.split("\n") if "\n" in translated_lines else [translated_lines]
+    translated = [t for t in translated if t.strip() != ""]
+    if len(translated) < translatable_count:
+        # LLM 给出更少行：补齐占位为原文。
+        translated.extend([""] * (translatable_count - len(translated)))
+
+    ordered_ph = placeholders[: len(translated)]
+    mapping = {
+        ph: translated[idx] if translated[idx].strip() else placeholder_to_text[ph]
+        for idx, ph in enumerate(ordered_ph)
+    }
+    for ph, line in mapping.items():
+        skeleton = skeleton.replace(ph, line)
+
+    return skeleton
+
+
 def _translate_table_cells(
     table_md: str,
     translator: LLMTranslator,
@@ -886,38 +1142,60 @@ def _translate_table_cells(
 def _translate_tables(translator: LLMTranslator, blocks: list[Block],
                      glossary: Glossary, concurrency: int,
                      summary: str = "") -> dict[int, str]:
-    """并发翻译所有 table 块：以 cell 粒度翻译文本内容，保留数字 / 公式 / 结构。"""
-    tasks: list[tuple[int, str]] = []
+    """并发翻译所有 table 块：以 cell 粒度翻译文本内容，保留数字 / 公式 / 结构。
+    复杂表格（含 colspan/rowspan/分组行）走 HTML 路径，整体 <table> 保留并
+    嵌入 markdown；简单表格仍走 GFM 路径。"""
+    tasks: list[tuple[int, str, bool]] = []  # (idx, payload, is_html)
     for i, block in enumerate(blocks):
         if block.kind != "table":
             continue
         table_md = block.meta.get("table_md") or ""
         if table_md:
-            tasks.append((i, table_md))
+            is_html = table_md.lstrip().startswith("<table")
+            tasks.append((i, table_md, is_html))
         elif block.text.strip():
-            tasks.append((i, block.text))
+            tasks.append((i, block.text, False))
     if not tasks:
         return {}
 
-    logger.info(f"检测到 {len(tasks)} 个表格，以 cell 粒度翻译 ...")
+    html_n = sum(1 for _, _, h in tasks if h)
+    gfm_n = len(tasks) - html_n
+    if html_n and gfm_n:
+        logger.info(f"检测到 {len(tasks)} 个表格（{html_n} 复杂 → HTML / {gfm_n} 简单 → GFM），以 cell 粒度翻译 ...")
+    elif html_n:
+        logger.info(f"检测到 {len(tasks)} 个复杂表格（含 colspan/rowspan），走 HTML 路径以保留结构 ...")
+    else:
+        logger.info(f"检测到 {len(tasks)} 个表格，以 cell 粒度翻译 ...")
     results: dict[int, str] = {}
 
     translatable_count = 0
-    for _, table_md in tasks:
-        for line in table_md.split("\n"):
-            cells = _split_gfm_cells(line)
-            for cell in cells:
-                if _cell_is_translatable(cell):
+    for _, payload, is_html in tasks:
+        if is_html:
+            soup = BeautifulSoup(payload, "html.parser")
+            table = soup.find("table")
+            if table is None:
+                continue
+            for cell in table.find_all(["td", "th"]):
+                if _cell_is_translatable(cell.get_text(" ", strip=True)):
                     translatable_count += 1
+        else:
+            for line in payload.split("\n"):
+                cells = _split_gfm_cells(line)
+                for cell in cells:
+                    if _cell_is_translatable(cell):
+                        translatable_count += 1
     logger.info(f"  其中 {translatable_count} 个 cell 含英文文本需翻译，其余保留原文")
 
-    def _do(idx_text: tuple[int, str]) -> tuple[int, str]:
-        i, text = idx_text
+    def _do(idx_payload: tuple[int, str, bool]) -> tuple[int, str]:
+        i, payload, is_html = idx_payload
         try:
-            trans = _translate_table_cells(text, translator, glossary, summary)
+            if is_html:
+                trans = _translate_html_table(payload, translator, glossary, summary)
+            else:
+                trans = _translate_table_cells(payload, translator, glossary, summary)
         except Exception as e:
             logger.warning(f"表格 {i} cell-level 翻译失败，回退原文: {e}")
-            trans = text
+            trans = payload
         return i, trans
 
     if concurrency <= 1:
@@ -1066,22 +1344,47 @@ def run(url_or_id: str) -> Path:
     logger.info(f"初始化翻译器 (model={translator.llm.model}, "
                 f"并发={settings.translate_concurrency})")
 
+    # 4.0 断点续译：检测上次异常退出的翻译缓存。
+    # 缓存以 arxiv_id 为唯一基（与最终文件名命名模式无关），避免不同论文串用。
+    cache = _TranslateCache(workdir / f".{arxiv_id}.translate_cache.json", arxiv_id)
+    resume = False
+    if cache.load():  # 加载成功 = 存在且版本/论文匹配
+        choice = _ask_resume(cache)
+        if choice == "quit":
+            logger.info("用户选择退出，不执行翻译。")
+            raise SystemExit(0)
+        if choice == "new":
+            logger.info("用户选择重新翻译，丢弃已有缓存。")
+            cache.clear()
+        else:  # resume
+            resume = True
+            logger.info(f"恢复模式：复用缓存中已翻译的 {len(cache)} 个块，"
+                        f"仅翻译剩余块。")
+    else:
+        # 存在但不兼容（版本/论文不匹配）的残留缓存直接清掉，避免干扰
+        if cache.exists():
+            cache.clear()
+
     # 4.1 建表阶段（单线程）：锁定易错术语，供并发共享
     glossary = _build_seed_glossary(translator, blocks)
 
     # 4.1.1 生成论文全局立场摘要（锚定翻译基调，防幻觉/串文）
     # 摘要仅作为内部 prompt 上下文传给 translator，不向用户控制台输出全文。
+    logger.info("正在生成论文全局立场摘要（基于标题 + 完整摘要，一次 LLM 调用）...")
+    _t0 = time.monotonic()
     summary = _build_paper_summary(blocks, translator)
+    logger.info(f"全局立场摘要生成完成，耗时 {time.monotonic() - _t0:.1f}s")
 
     # 4.1.2 缩写定义预热：扫描英文原文缩写定义 + 优先翻译图注/脚注等含缩写块，
     # 使术语表先锁定缩写译法，保证后续表格表头与图注一致。通用机制，无硬编码。
     prefilled = _pre_translate_abbrevs(translator, blocks, glossary, summary=summary)
 
     # 4.2 并发翻译阶段（按翻译单元调度；合并组以 JSON 数组分块翻译）
+    # 恢复模式下 _translate_units 会跳过缓存中已有的块，并把新完成块增量写入缓存。
     logger.info("开始并发翻译 ...")
     results = _translate_units(
         translator, blocks, units, glossary, settings.translate_concurrency,
-        summary=summary, prefilled=prefilled
+        summary=summary, prefilled=prefilled, cache=cache,
     )
     translations = {i: results[i][0] for i in results}
     all_terms = [results[i][1] for i in results]
@@ -1209,15 +1512,23 @@ def run(url_or_id: str) -> Path:
 
     # 5.1 生成保留原 HTML 结构（表格合并/颜色/图片）的 .zh.html。
     # 注意：DOCX / PDF 导出功能尚未开发完毕，暂时禁用，此处仅作为 Markdown 的中间产物。
-    zh_html_path = workdir / f"{out_stem}.zh.html"
-    try:
-        _build_zh_html(
-            html_soup, blocks, translations, table_translations,
-            glossary, img_mapping, zh_html_path, translator, summary,
-        )
-    except Exception as e:
-        logger.warning(f"生成 .zh.html 失败: {e}")
-        zh_html_path = None
+    # 关键：生成 .zh.html 时 _build_zh_html 会对每个块/表格 cell 串行走 LLM 重翻一遍
+    # （保留内联颜色），耗时很长；而它唯一的消费者是尚未启用的 DOCX/PDF 导出。
+    # 因此未开启 export_formats 时直接跳过，避免无谓的 5+ 分钟 LLM 调用与卡顿。
+    zh_html_path = None
+    if (settings.export_formats or "").strip():
+        zh_html_path = workdir / f"{out_stem}.zh.html"
+        try:
+            _build_zh_html(
+                html_soup, blocks, translations, table_translations,
+                glossary, img_mapping, zh_html_path, translator, summary,
+            )
+        except Exception as e:
+            logger.warning(f"生成 .zh.html 失败: {e}")
+            zh_html_path = None
+    else:
+        logger.info("未开启导出格式（export_formats 为空），跳过 .zh.html 生成"
+                    "（其依赖逐块 LLM 重翻，目前消费者 DOCX/PDF 导出尚未启用）")
 
     out_md = workdir / f"{out_stem}.zh.md"
     if settings.output_markdown:
@@ -1236,6 +1547,11 @@ def run(url_or_id: str) -> Path:
     if settings.token_report:
         for line in translator.usage.report_lines(model=translator.llm.model):
             logger.info(line)
+
+    # 8. 翻译完整成功：清理断点缓存，避免残留文件被下次误判为「异常退出产物」。
+    if cache is not None:
+        cache.clear()
+
     return out_md or zh_html_path
 
 
