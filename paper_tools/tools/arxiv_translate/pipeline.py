@@ -320,18 +320,28 @@ def _strip_trailing_punct(text: str) -> str:
     return text.rstrip(".。")
 
 
-def _block_to_md(block: Block, translation: str, img_mapping: dict[str, str]) -> str:
+def _block_to_md(block: Block, translation: str, img_mapping: dict[str, str],
+                 use_original: bool = False) -> str:
+    """把单个块渲染为 markdown。
+
+    use_original=True 时（translate_skip 模式）直接输出解析后的英文原文，
+    跳过章节标题中文化映射，确保输出是未经翻译的原文。
+    """
     if block.kind == "title":
         # 标题强制换行，不需要 ⟦NEWPAR⟧ 标记，统一剥离以防模型误带（兼容半角 [NEWPAR]）。
-        return f"# {_strip_trailing_punct(_NEWPAR_RE.sub('', translation).strip())}\n"
+        text = block.text if use_original else translation
+        return f"# {_strip_trailing_punct(_NEWPAR_RE.sub('', text).strip())}\n"
     if block.kind == "heading":
-        # 先用通用学术章节标题映射（领域中立、稳定，避免翻译幻觉把段落混入标题）。
-        trans = _SECTION_TITLE_MAP.get(block.text.strip().lower(), translation)
-        # 标题翻译易出现"把后续段落混入标题"的幻觉。合理性校验：标题应短、
-        # 无段落标志词、无多个句末标点、且原文极短时译文不应膨胀为段落。
-        # 任一不通过则回退到原文 block.text，保证 markdown 结构正确且不重复。
-        if not _looks_like_heading(trans, block.text):
+        if use_original:
             trans = block.text
+        else:
+            # 先用通用学术章节标题映射（领域中立、稳定，避免翻译幻觉把段落混入标题）。
+            trans = _SECTION_TITLE_MAP.get(block.text.strip().lower(), translation)
+            # 标题翻译易出现"把后续段落混入标题"的幻觉。合理性校验：标题应短、
+            # 无段落标志词、无多个句末标点、且原文极短时译文不应膨胀为段落。
+            # 任一不通过则回退到原文 block.text，保证 markdown 结构正确且不重复。
+            if not _looks_like_heading(trans, block.text):
+                trans = block.text
         # 标题强制换行，⟦NEWPAR⟧ 标记无用，剥离；末尾孤立句末标点也剥离，
         # 确保目录与正文标题干净无句号。
         trans = _NEWPAR_RE.sub("", trans).strip()
@@ -343,21 +353,28 @@ def _block_to_md(block: Block, translation: str, img_mapping: dict[str, str]) ->
         # 模板。这里把译文按行拆分，逐行加 "> " 前缀（仅 1 层），最终 markdown
         # 渲染是一个引用块；多余空行也保留 "> " 占位，避免破坏块结构。
         # 同时清除可能混入的 ⟦NEWPAR⟧ 标记（text_box 已按原文固定段落拆分渲染）。
-        lines = _split_text_box_lines(_NEWPAR_RE.sub("", translation).strip())
+        text = block.text if use_original else translation
+        lines = _split_text_box_lines(_NEWPAR_RE.sub("", text).strip())
         return "\n".join(f"> {ln}" if ln else "> " for ln in lines) + "\n"
     if block.kind == "list_item":
         # 列表项严格保持单段渲染：一个块 = 一条 list_item，
         # 即便译文里残留了 ⟦NEWPAR⟧ 标记（不该出现，兜底清洗），也不应拆段。
         # 强制 strip 防止模型混入标记破坏 markdown 列表结构。
-        cleaned = _NEWPAR_RE.sub("", translation).strip()
+        text = block.text if use_original else translation
+        cleaned = _NEWPAR_RE.sub("", text).strip()
         return f"{cleaned}\n"
     if block.kind == "paragraph":
         # LLM 段尾标记 ⟦NEWPAR⟧：一个翻译单元可能含多块，模型把"段尾"
         # 加标记、"段内连续"不加。我们按标记拆分，每段独立成段；
         # 拆出 1 段时与原行为兼容（仍是单段 + 末尾换行）。
-        pieces = [p for p in _split_at_newpar(translation) if p.strip()]
+        text = block.text if use_original else translation
+        pieces = [p for p in _split_at_newpar(text) if p.strip()]
         if not pieces:
-            return f"{translation.strip()}\n"
+            # 兜底：translation 为空（罕见：模型偶发返回空）→ 用原文块内容，
+            # 至少保留段落存在、不至于让该段在 markdown 中消失。
+            if block.text and block.text.strip():
+                return f"{block.text.strip()}\n"
+            return f"{text.strip()}\n"
         if len(pieces) == 1:
             return f"{pieces[0]}\n"
         # 多段：段之间用空行分隔，末尾单换行（避免与下一块产生双空行）
@@ -367,7 +384,7 @@ def _block_to_md(block: Block, translation: str, img_mapping: dict[str, str]) ->
         for orig, local in img_mapping.items():
             raw = raw.replace(orig, local)
         return f"{raw}\n"
-    return f"{translation}\n"
+    return f"{block.text if use_original else translation}\n"
 
 
 # 标题翻译合理性判定：返回 True 表示当前 translation 适合作为标题。
@@ -733,6 +750,11 @@ def _translate_unit(translator: LLMTranslator, blocks: list[Block], unit: list[i
         if not text.strip():
             return {i: ("", [])}
         trans, terms = translator.translate(text, glossary, summary=summary)
+        # 兜底：单块翻译若返回空串（极少数：模型偶发返回空响应），不要直接吞，
+        # 而是把原文作为 fallback 留作渲染层处理（_block_to_md 会再兜底一次）。
+        if not (trans or "").strip():
+            logger.warning(f"翻译单元 {i}（单块）返回空译文，保留原文块作为兜底")
+            trans = text
         return {i: (trans, terms)}
 
     texts = [_text_of_block(blocks[i]) for i in unit]
@@ -983,6 +1005,27 @@ def _cell_is_translatable(cell: str) -> bool:
     return True
 
 
+def _strip_padding_cells(table_html: str) -> str:
+    """移除 ar5iv 表格每行末尾的纯空 td（CSS 布局占位 cell）。
+
+    ar5iv 在每个 tr 末尾常常追加一个空 td（无文本、或仅含 ``&nbsp;`` / 空白），
+    作用是 CSS 渲染时撑开列宽。这些 cell 在 markdown/HTML 输出中会多出一列
+    空白，既不美观又干扰阅读。仅剥离"纯空"的 td：有任意可见文本则保留。
+    """
+    soup = BeautifulSoup(table_html, "html.parser")
+    for tr in soup.find_all("tr"):
+        cells = tr.find_all(["td", "th"], recursive=False)
+        if not cells:
+            continue
+        # 仅当最后一个 cell 是纯空时剥离；遇到第一个非空 cell 立即停止。
+        for cell in reversed(cells):
+            txt = cell.get_text(" ", strip=True).replace("\xa0", "").strip()
+            if txt:
+                break
+            cell.decompose()
+    return str(soup)
+
+
 def _translate_html_table(
     table_html: str,
     translator: LLMTranslator,
@@ -1037,7 +1080,9 @@ def _translate_html_table(
     placeholders = list(placeholder_to_text.keys())
     batch_payload = "\n".join(placeholder_to_text[p] for p in placeholders)
     try:
-        translated_lines = translator.translate(batch_payload, glossary)
+        translated_lines, _ = translator.translate(
+            batch_payload, glossary, summary=summary, cell_mode=True
+        )
     except Exception as e:
         logger.warning(f"HTML 表格 cell 翻译失败：{e}；保留原表")
         return table_html
@@ -1055,6 +1100,11 @@ def _translate_html_table(
     }
     for ph, line in mapping.items():
         skeleton = skeleton.replace(ph, line)
+
+    # 清理行尾纯空 td：ar5iv 表格常在每行末尾追加一个空 td（CSS 布局占位），
+    # 原样输出会让 markdown 渲染时多出一列空白。仅剥离"空文本或仅含 &nbsp; / 空白"
+    # 的 td，不影响有内容的尾列。
+    skeleton = _strip_padding_cells(skeleton)
 
     return skeleton
 
@@ -1339,91 +1389,100 @@ def run(url_or_id: str) -> Path:
     logger.info(f"翻译单元: {len(units)} 个（其中合并组 "
                 f"{sum(1 for u in units if len(u) > 1)} 个）")
 
-    # 4. 翻译
-    translator = LLMTranslator()
-    logger.info(f"初始化翻译器 (model={translator.llm.model}, "
-                f"并发={settings.translate_concurrency})")
-
-    # 4.0 断点续译：检测上次异常退出的翻译缓存。
-    # 缓存以 arxiv_id 为唯一基（与最终文件名命名模式无关），避免不同论文串用。
-    cache = _TranslateCache(workdir / f".{arxiv_id}.translate_cache.json", arxiv_id)
-    resume = False
-    if cache.load():  # 加载成功 = 存在且版本/论文匹配
-        choice = _ask_resume(cache)
-        if choice == "quit":
-            logger.info("用户选择退出，不执行翻译。")
-            raise SystemExit(0)
-        if choice == "new":
-            logger.info("用户选择重新翻译，丢弃已有缓存。")
-            cache.clear()
-        else:  # resume
-            resume = True
-            logger.info(f"恢复模式：复用缓存中已翻译的 {len(cache)} 个块，"
-                        f"仅翻译剩余块。")
+    # 4. 翻译（translate_skip 开启时跳过全部 LLM 步骤，仅输出解析后的论文原文）
+    skip = settings.translate_skip
+    cache = None
+    if skip:
+        logger.info("translate_skip 开启：跳过 LLM 翻译，仅输出解析后的论文原文")
+        translator = None
+        glossary = Glossary()
+        translations: dict[int, str] = {}
+        table_translations: dict[int, str] = {}
     else:
-        # 存在但不兼容（版本/论文不匹配）的残留缓存直接清掉，避免干扰
-        if cache.exists():
-            cache.clear()
+        translator = LLMTranslator()
+        logger.info(f"初始化翻译器 (model={translator.llm.model}, "
+                    f"并发={settings.translate_concurrency})")
 
-    # 4.1 建表阶段（单线程）：锁定易错术语，供并发共享
-    glossary = _build_seed_glossary(translator, blocks)
+        # 4.0 断点续译：检测上次异常退出的翻译缓存。
+        # 缓存以 arxiv_id 为唯一基（与最终文件名命名模式无关），避免不同论文串用。
+        cache = _TranslateCache(workdir / f".{arxiv_id}.translate_cache.json", arxiv_id)
+        resume = False
+        if cache.load():  # 加载成功 = 存在且版本/论文匹配
+            choice = _ask_resume(cache)
+            if choice == "quit":
+                logger.info("用户选择退出，不执行翻译。")
+                raise SystemExit(0)
+            if choice == "new":
+                logger.info("用户选择重新翻译，丢弃已有缓存。")
+                cache.clear()
+            else:  # resume
+                resume = True
+                logger.info(f"恢复模式：复用缓存中已翻译的 {len(cache)} 个块，"
+                            f"仅翻译剩余块。")
+        else:
+            # 存在但不兼容（版本/论文不匹配）的残留缓存直接清掉，避免干扰
+            if cache.exists():
+                cache.clear()
 
-    # 4.1.1 生成论文全局立场摘要（锚定翻译基调，防幻觉/串文）
-    # 摘要仅作为内部 prompt 上下文传给 translator，不向用户控制台输出全文。
-    logger.info("正在生成论文全局立场摘要（基于标题 + 完整摘要，一次 LLM 调用）...")
-    _t0 = time.monotonic()
-    summary = _build_paper_summary(blocks, translator)
-    logger.info(f"全局立场摘要生成完成，耗时 {time.monotonic() - _t0:.1f}s")
+        # 4.1 建表阶段（单线程）：锁定易错术语，供并发共享
+        glossary = _build_seed_glossary(translator, blocks)
 
-    # 4.1.2 缩写定义预热：扫描英文原文缩写定义 + 优先翻译图注/脚注等含缩写块，
-    # 使术语表先锁定缩写译法，保证后续表格表头与图注一致。通用机制，无硬编码。
-    prefilled = _pre_translate_abbrevs(translator, blocks, glossary, summary=summary)
+        # 4.1.1 生成论文全局立场摘要（锚定翻译基调，防幻觉/串文）
+        # 摘要仅作为内部 prompt 上下文传给 translator，不向用户控制台输出全文。
+        logger.info("正在生成论文全局立场摘要（基于标题 + 完整摘要，一次 LLM 调用）...")
+        _t0 = time.monotonic()
+        summary = _build_paper_summary(blocks, translator)
+        logger.info(f"全局立场摘要生成完成，耗时 {time.monotonic() - _t0:.1f}s")
 
-    # 4.2 并发翻译阶段（按翻译单元调度；合并组以 JSON 数组分块翻译）
-    # 恢复模式下 _translate_units 会跳过缓存中已有的块，并把新完成块增量写入缓存。
-    logger.info("开始并发翻译 ...")
-    results = _translate_units(
-        translator, blocks, units, glossary, settings.translate_concurrency,
-        summary=summary, prefilled=prefilled, cache=cache,
-    )
-    translations = {i: results[i][0] for i in results}
-    all_terms = [results[i][1] for i in results]
+        # 4.1.2 缩写定义预热：扫描英文原文缩写定义 + 优先翻译图注/脚注等含缩写块，
+        # 使术语表先锁定缩写译法，保证后续表格表头与图注一致。通用机制，无硬编码。
+        prefilled = _pre_translate_abbrevs(translator, blocks, glossary, summary=summary)
 
-    # 4.3 合并术语 + 一致性检查返修
-    if settings.translate_repair:
-        final_glossary = _finalize_glossary(glossary, all_terms)
-        logger.info(f"合并术语表: {len(final_glossary.terms)} 条，开始一致性检查/返修 ...")
-        # 按翻译单元做返修判断：合并组内任一子块需返修则整组重翻
-        repair_units: list[list[int]] = []
-        for u in units:
-            need = False
-            for i in u:
-                if _needs_repair(blocks[i], translations.get(i, ""), final_glossary):
-                    need = True
-                    break
-            if need:
-                repair_units.append(u)
-        if repair_units:
-            logger.info(f"检出 {len(repair_units)} 个翻译单元（含 "
-                        f"{sum(len(u) for u in repair_units)} 块）需返修")
-            # 并发返修：各单元写不同块下标，无竞争；合并组仍以 JSON 分块翻译
-            n = max(1, settings.translate_concurrency)
-            if n <= 1:
-                for u in _new_tqdm(repair_units, "返修", "单元"):
-                    _retranslate_unit(translator, blocks, u, final_glossary, summary, translations)
-            else:
-                with ThreadPoolExecutor(max_workers=n) as pool:
-                    futs = [
-                        pool.submit(_retranslate_unit, translator, blocks, u,
-                                    final_glossary, summary, translations)
-                        for u in repair_units
-                    ]
-                    for _ in _new_tqdm(as_completed(futs), "返修", "单元", total=len(futs)):
-                        pass
-            logger.info(f"返修完成: {len(repair_units)} 单元")
-        glossary = final_glossary
-    else:
-        glossary.ingest_terms(t for terms in all_terms for t in terms)
+        # 4.2 并发翻译阶段（按翻译单元调度；合并组以 JSON 数组分块翻译）
+        # 恢复模式下 _translate_units 会跳过缓存中已有的块，并把新完成块增量写入缓存。
+        logger.info("开始并发翻译 ...")
+        results = _translate_units(
+            translator, blocks, units, glossary, settings.translate_concurrency,
+            summary=summary, prefilled=prefilled, cache=cache,
+        )
+        translations = {i: results[i][0] for i in results}
+        all_terms = [results[i][1] for i in results]
+
+        # 4.3 合并术语 + 一致性检查返修
+        if settings.translate_repair:
+            final_glossary = _finalize_glossary(glossary, all_terms)
+            logger.info(f"合并术语表: {len(final_glossary.terms)} 条，开始一致性检查/返修 ...")
+            # 按翻译单元做返修判断：合并组内任一子块需返修则整组重翻
+            repair_units: list[list[int]] = []
+            for u in units:
+                need = False
+                for i in u:
+                    if _needs_repair(blocks[i], translations.get(i, ""), final_glossary):
+                        need = True
+                        break
+                if need:
+                    repair_units.append(u)
+            if repair_units:
+                logger.info(f"检出 {len(repair_units)} 个翻译单元（含 "
+                            f"{sum(len(u) for u in repair_units)} 块）需返修")
+                # 并发返修：各单元写不同块下标，无竞争；合并组仍以 JSON 分块翻译
+                n = max(1, settings.translate_concurrency)
+                if n <= 1:
+                    for u in _new_tqdm(repair_units, "返修", "单元"):
+                        _retranslate_unit(translator, blocks, u, final_glossary, summary, translations)
+                else:
+                    with ThreadPoolExecutor(max_workers=n) as pool:
+                        futs = [
+                            pool.submit(_retranslate_unit, translator, blocks, u,
+                                        final_glossary, summary, translations)
+                            for u in repair_units
+                        ]
+                        for _ in _new_tqdm(as_completed(futs), "返修", "单元", total=len(futs)):
+                            pass
+                logger.info(f"返修完成: {len(repair_units)} 单元")
+            glossary = final_glossary
+        else:
+            glossary.ingest_terms(t for terms in all_terms for t in terms)
 
     # 4.4 组装输出
     logger.info("组装输出 ...")
@@ -1431,13 +1490,14 @@ def run(url_or_id: str) -> Path:
     title_text = ""
     n_translated = 0
 
-    # 4.4.1 表格并发翻译：先收集所有 table 块的 markdown，一次性并发翻译，避免串行卡顿
-    table_translations = _translate_tables(
-        translator, blocks, glossary, settings.translate_concurrency, summary=summary
-    )
+    # 4.4.1 表格翻译（仅翻译模式需要；skip 模式用解析后的原文表格）
+    if not skip:
+        table_translations = _translate_tables(
+            translator, blocks, glossary, settings.translate_concurrency, summary=summary
+        )
 
     for i, block in enumerate(blocks):
-        trans = translations.get(i, "")
+        trans = block.text if skip else translations.get(i, "")
         n_translated += 1
         if block.kind == "title":
             # 标题仅在文件头部 (header) 输出，需单独清洗段尾换行标记 ⟦NEWPAR⟧
@@ -1446,6 +1506,11 @@ def run(url_or_id: str) -> Path:
             # 标题已在文件头部统一输出，避免正文中重复出现
             continue
         if block.kind in ("figure", "table", "listing"):
+            if skip:
+                # 原文模式：直接输出 parser 解析好的原始结构（含原文 caption），
+                # 不做任何译文回填。
+                md_parts.append(_block_to_md(block, "", img_mapping, use_original=True))
+                continue
             cap_zh = trans
             if block.kind == "figure":
                 # 图片引用路径由 parser 阶段计算好（本地模式为 images/...，
@@ -1479,7 +1544,7 @@ def run(url_or_id: str) -> Path:
         else:
             # equation / heading / paragraph / list_item：默认走 _block_to_md。
             # equation 无需翻译也不参与特殊拼接，直接输出 block.raw 中的完整公式。
-            md_parts.append(_block_to_md(block, trans, img_mapping))
+            md_parts.append(_block_to_md(block, trans, img_mapping, use_original=skip))
 
     # 5. 写出
     # 输出文件名命名方式：id / title / title_zh（非法字符自动换为等价中文符号）
@@ -1492,23 +1557,36 @@ def run(url_or_id: str) -> Path:
         out_stem = arxiv_id
     glossary_path = workdir / f"{out_stem}.glossary.json"
     logger.info(f"输出文件命名方式: {mode}（文件名基: {out_stem}）")
-    logger.info("保存术语表与 Markdown 文件 ...")
-    glossary.save(glossary_path)
-    logger.info(f"术语表已保存: {glossary_path}（共 {len(glossary.terms)} 条）")
+
+    # 原文模式（translate_skip）不生成术语表、不生成 .zh.html，也无需 token 报告。
+    if skip:
+        logger.info("原文模式：跳过术语表/ .zh.html 导出与 token 报告")
+    else:
+        logger.info("保存术语表与 Markdown 文件 ...")
+        glossary.save(glossary_path)
+        logger.info(f"术语表已保存: {glossary_path}（共 {len(glossary.terms)} 条）")
 
     header = (
         f"# {title_text}\n\n"
         f"> 原文: https://arxiv.org/abs/{arxiv_id}\n"
-        f"> 本译文由 DeepSeek 自动翻译，公式与结构保留原文，仅供参考。\n\n---\n\n"
+        + (
+            f"> 本文件为解析后的论文原文（translate_skip：未翻译），公式与结构保留。\n\n---\n\n"
+            if skip else
+            f"> 本译文由 DeepSeek 自动翻译，公式与结构保留原文，仅供参考。\n\n---\n\n"
+        )
     )
     body = "\n".join(md_parts) + "\n"
-    # 中英文/数字排版间距自动修复（pangu 风格）：先保护公式与链接，修复后再还原
-    logger.info("进行中英文排版间距修复 ...")
-    body = _fix_cjk_spacing(body)
+    if skip:
+        # 原文模式无需做中英文间距修复（本身即英文），仅兜底清理残留标记。
+        body = _NEWPAR_RE.sub("", body)
+    else:
+        # 中英文/数字排版间距自动修复（pangu 风格）：先保护公式与链接，修复后再还原
+        logger.info("进行中英文排版间距修复 ...")
+        body = _fix_cjk_spacing(body)
 
-    # 兜底：清除译文里可能残留的段尾换行标记（理论上已被 _block_to_md 拆分消费，
-    # 但模型偶发漏加/误加、或误写成半角 [NEWPAR] 时仍保证最终 markdown 干净无标记字面）。
-    body = _NEWPAR_RE.sub("", body)
+        # 兜底：清除译文里可能残留的段尾换行标记（理论上已被 _block_to_md 拆分消费，
+        # 但模型偶发漏加/误加、或误写成半角 [NEWPAR] 时仍保证最终 markdown 干净无标记字面）。
+        body = _NEWPAR_RE.sub("", body)
 
     # 5.1 生成保留原 HTML 结构（表格合并/颜色/图片）的 .zh.html。
     # 注意：DOCX / PDF 导出功能尚未开发完毕，暂时禁用，此处仅作为 Markdown 的中间产物。
@@ -1516,7 +1594,7 @@ def run(url_or_id: str) -> Path:
     # （保留内联颜色），耗时很长；而它唯一的消费者是尚未启用的 DOCX/PDF 导出。
     # 因此未开启 export_formats 时直接跳过，避免无谓的 5+ 分钟 LLM 调用与卡顿。
     zh_html_path = None
-    if (settings.export_formats or "").strip():
+    if (settings.export_formats or "").strip() and not skip:
         zh_html_path = workdir / f"{out_stem}.zh.html"
         try:
             _build_zh_html(
@@ -1534,7 +1612,7 @@ def run(url_or_id: str) -> Path:
     if settings.output_markdown:
         logger.info(f"写出 Markdown 文件 ({len(body):,} 字符) ...")
         out_md.write_text(header + body, encoding="utf-8")
-        logger.info(f"翻译完成: 共 {n_translated} 块 -> {out_md}")
+        logger.info(f"{'原文输出完成' if skip else '翻译完成'}: 共 {n_translated} 块 -> {out_md}")
     else:
         logger.info(f"已跳过 Markdown 输出（output_markdown=False），仅导出: "
                     f"{(settings.export_formats or '').strip() or '(无)'}")
@@ -1543,8 +1621,8 @@ def run(url_or_id: str) -> Path:
     # 6. 导出额外格式（DOCX / PDF）—— 功能尚未开发完毕，暂时禁用
     # _export_formats(out_md, zh_html_path, settings)
 
-    # 7. Token 用量报告（可配置开启）
-    if settings.token_report:
+    # 7. Token 用量报告（可配置开启，原文模式下无翻译用量，跳过）
+    if settings.token_report and not skip:
         for line in translator.usage.report_lines(model=translator.llm.model):
             logger.info(line)
 

@@ -4,13 +4,18 @@
 https://api-docs.deepseek.com/zh-cn/quick_start/pricing 解析得到，并缓存到本地
 JSON（默认 24h 有效期），以便离线/限流时回退到最近一次成功结果。
 
-定价页为单一 <table>，价格部分以「价格(1)」为起始标记、三行价格（输入缓存命中 /
-输入缓存未命中 / 输出），每个模型一列；模型名列（官方全名，如
-DeepSeek-V4-Flash-0731）位于「模型版本」行。本模块把官方全名归一化为短名
-（如 deepseek-v4-flash）作为查询键，并保留别名映射。
+定价页为单一 <table>（2026-08 改版后）：
+  - 「模型版本」行给出各模型官方全名（如 DeepSeek-V4-Flash-0731）；
+  - 价格区块将「输入（缓存命中）/ 输入（缓存未命中）/ 输出」每类拆为
+    「空闲时段 / 高峰时段」两行，每个模型一列。
+本模块把官方全名归一化为短名（如 deepseek-v4-flash）作为查询键，并保留别名
+映射。每模型同时解析「空闲（低谷）/ 高峰」两档价格；查询时按当前北京时间自动
+选档：工作日 9:00-12:00、14:00-18:00 为高峰档，其余（含周末全天）为低谷档
+（2026-08-23 起周末不区分峰谷，统一按低谷价）。
 """
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import logging
 import re
@@ -34,7 +39,12 @@ _CACHE_TTL_SECONDS = 24 * 3600
 _ROW_INPUT_HIT = "输入（缓存命中）"
 _ROW_INPUT_MISS = "输入（缓存未命中）"
 _ROW_OUTPUT = "百万tokens输出"
-_PRICE_BLOCK_MARKER = "价格"
+# 改版后每类价格拆为「空闲时段 / 高峰时段」两行，分别对应低谷/高峰档。
+_ROW_IDLE = "空闲时段"
+_ROW_PEAK = "高峰时段"
+
+# 三类价格列名
+_COL_NAMES = ("cache_hit", "cache_miss", "output")
 
 
 def _normalize_model_name(full: str) -> str:
@@ -67,15 +77,19 @@ def _parse_price_cell(cell: str) -> Optional[float]:
     return float(m.group(1))
 
 
-def _extract_pricing(soup: BeautifulSoup) -> dict[str, dict[str, float]]:
-    """从解析后的页面提取 {短模型名: {cache_hit, cache_miss, output}}。
+def _extract_pricing(soup: BeautifulSoup) -> dict[str, dict[str, dict[str, float]]]:
+    """从解析后的页面提取模型价目表。
 
-    output 字段为「每百万 token 人民币元」。
+    返回结构：
+        {短模型名: {"idle": {"cache_hit", "cache_miss", "output"},
+                    "peak": {"cache_hit", "cache_miss", "output"}}}
 
-    解析策略不依赖行首标签的位置/列偏移（定价页用 rowspan 合并「价格(1)」
-    标题单元格，导致首列数据错位）。改为：扫描每一行，若行文本含某价格类
-    关键词（缓存命中 / 缓存未命中 / 输出），则在本行所有 cell 中提取「元」
-    数值，按出现顺序对应各模型列。
+    价格字段为「每百万 token 人民币元」；idle=空闲（低谷）档，peak=高峰档。
+
+    解析策略不依赖行首标签的位置/列偏移（定价页用 rowspan 合并「价格」标题
+    单元格，导致首列数据错位）。改为：扫描每一行，先按「空闲时段 / 高峰时段」
+    关键词确定档位，再按行文本关键词（缓存命中 / 缓存未命中 / 输出）识别类别，
+    最后在本行所有 cell 中提取「元」数值，按出现顺序对应各模型列。
     """
     table = soup.find("table")
     if table is None:
@@ -83,9 +97,15 @@ def _extract_pricing(soup: BeautifulSoup) -> dict[str, dict[str, float]]:
 
     rows = table.find_all("tr")
     model_short_names: list[str] = []
-    # 三类价格：每个模型一列的数值列表（已解析为 float）
-    price_cols: dict[str, list[float]] = {"cache_hit": [], "cache_miss": [], "output": []}
+    # 各档位各类别：每个模型一列的数值列表（已解析为 float）
+    tiers: dict[str, dict[str, list[float]]] = {
+        "idle": {k: [] for k in _COL_NAMES},
+        "peak": {k: [] for k in _COL_NAMES},
+    }
 
+    # 页面中「高峰时段」行因 rowspan 吞掉了类别标签（只含「高峰时段」+ 数值），
+    # 需继承紧随其后的「空闲时段」行识别出的类别。prev_kind 记录上一空闲行的类别。
+    prev_kind: str | None = None
     for tr in rows:
         cells = [td.get_text(strip=True) for td in tr.find_all(["td", "th"])]
         if not cells:
@@ -95,14 +115,24 @@ def _extract_pricing(soup: BeautifulSoup) -> dict[str, dict[str, float]]:
         if cells[0] == "模型版本":
             model_short_names = [_normalize_model_name(n) for n in cells[1:] if n]
             continue
-        # 价格行识别：行内出现「元」价格且含对应关键词
-        kind = None
-        if _ROW_INPUT_HIT in row_text:
-            kind = "cache_hit"
-        elif _ROW_INPUT_MISS in row_text:
-            kind = "cache_miss"
-        elif _ROW_OUTPUT in row_text and "输入" not in row_text:
-            kind = "output"
+        # 确定档位：仅处理空闲/高峰时段的价格行
+        if _ROW_IDLE in row_text:
+            tier = "idle"
+        elif _ROW_PEAK in row_text:
+            tier = "peak"
+        else:
+            continue
+        # 价格类别识别：空闲行含类别关键词并记录；高峰行继承上一空闲行的类别
+        kind = prev_kind
+        if tier == "idle":
+            if _ROW_INPUT_HIT in row_text:
+                kind = "cache_hit"
+            elif _ROW_INPUT_MISS in row_text:
+                kind = "cache_miss"
+            elif _ROW_OUTPUT in row_text:
+                kind = "output"
+            if kind is not None:
+                prev_kind = kind
         if kind is None:
             continue
         # 从本行所有 cell 抽取「元」数值（按出现顺序对应模型列）
@@ -111,27 +141,37 @@ def _extract_pricing(soup: BeautifulSoup) -> dict[str, dict[str, float]]:
         if not vals:
             _log.warning("价格行未提取到数值，跳过：%r", cells)
             continue
-        price_cols[kind] = vals
+        tiers[tier][kind] = vals
 
     if not model_short_names:
         raise ValueError("定价页未解析出模型版本行")
-    # 列数校验：各价格列表长度应与模型列数一致
-    for key, vals in price_cols.items():
-        if vals and len(vals) != len(model_short_names):
-            raise ValueError(
-                f"价格列数({len(vals)})与模型列数({len(model_short_names)})不一致：{key}"
-            )
+    # 列数校验：各档位各价格列表长度应与模型列数一致
+    for tier, cols in tiers.items():
+        for key, vals in cols.items():
+            if vals and len(vals) != len(model_short_names):
+                raise ValueError(
+                    f"{tier}/{key} 价格列数({len(vals)})与模型列数"
+                    f"({len(model_short_names)})不一致"
+                )
 
-    result: dict[str, dict[str, float]] = {}
+    result: dict[str, dict[str, dict[str, float]]] = {}
     for i, short in enumerate(model_short_names):
-        hit = price_cols["cache_hit"][i] if i < len(price_cols["cache_hit"]) else None
-        miss = price_cols["cache_miss"][i] if i < len(price_cols["cache_miss"]) else None
-        out = price_cols["output"][i] if i < len(price_cols["output"]) else None
-        if hit is None or miss is None or out is None:
-            _log.warning("模型 %s 价格解析不完整，跳过：hit=%s miss=%s out=%s",
-                         short, hit, miss, out)
+        entry: dict[str, dict[str, float]] = {}
+        ok = True
+        for tier in ("idle", "peak"):
+            cols = tiers[tier]
+            hit = cols["cache_hit"][i] if i < len(cols["cache_hit"]) else None
+            miss = cols["cache_miss"][i] if i < len(cols["cache_miss"]) else None
+            out = cols["output"][i] if i < len(cols["output"]) else None
+            if hit is None or miss is None or out is None:
+                _log.warning("模型 %s %s档价格解析不完整，跳过：hit=%s miss=%s out=%s",
+                             short, tier, hit, miss, out)
+                ok = False
+                break
+            entry[tier] = {"cache_hit": hit, "cache_miss": miss, "output": out}
+        if not ok:
             continue
-        result[short] = {"cache_hit": hit, "cache_miss": miss, "output": out}
+        result[short] = entry
 
     if not result:
         raise ValueError("未从定价页解析出任何有效价格")
@@ -197,33 +237,65 @@ def fetch_deepseek_pricing(force_refresh: bool = False) -> dict[str, dict[str, f
         ) from exc
 
 
+_BJ_OFFSET = _dt.timezone(_dt.timedelta(hours=8))  # 北京时间 UTC+8，无夏令时
+
+
+def _is_peak_hour(now: _dt.datetime) -> bool:
+    """判断给定时刻（视为北京时间）是否为高峰时段。
+
+    高峰时段为北京时间工作日（周一至周五）9:00-12:00、14:00-18:00；
+    其余为空闲（低谷）时段。2026-08-23 起周末（周六、周日）全天不区分
+    峰谷，统一按低谷价，因此周末一律视为非高峰。
+    """
+    if now.weekday() >= 5:  # 周六/周日
+        return False
+    h = now.hour + now.minute / 60.0 + now.second / 3600.0
+    return (9 <= h < 12) or (14 <= h < 18)
+
+
+def _resolve_tier(now: _dt.datetime | None = None) -> str:
+    """返回当前应采用的档位：'peak' 或 'idle'（北京时间）。"""
+    now = now or _dt.datetime.now(_BJ_OFFSET)
+    return "peak" if _is_peak_hour(now) else "idle"
+
+
 def get_model_price(model: str) -> Optional[dict[str, float]]:
-    """查询指定模型的价目（每百万 token 人民币元）。
+    """查询指定模型的当前价目（每百万 token 人民币元）。
 
     model 支持短名（deepseek-v4-flash）或官方全名（不区分大小写）。
-    返回 {'cache_hit','cache_miss','output'} 或 None（未知模型）。
+    返回按当前北京时间自动选档后的 {'cache_hit','cache_miss','output'}
+    或 None（未知模型）。兼容旧版单档缓存结构。
     """
     pricing = fetch_deepseek_pricing()
     key = model.strip().lower()
     if key in pricing:
-        return pricing[key]
-    # 尝试归一化匹配（兼容带版本号的全名）
-    normalized = _normalize_model_name(model)
-    if normalized in pricing:
-        return pricing[normalized]
-    # 前缀匹配：如 'deepseek-v4-flash-0731' 归属 'deepseek-v4-flash'
-    for k, v in pricing.items():
-        if k.startswith(normalized) or normalized.startswith(k):
-            return v
-    return None
+        entry = pricing[key]
+    elif (normalized := _normalize_model_name(model)) in pricing:
+        entry = pricing[normalized]
+    else:
+        # 前缀匹配：如 'deepseek-v4-flash-0731' 归属 'deepseek-v4-flash'
+        entry = next((v for k, v in pricing.items()
+                      if k.startswith(normalized) or normalized.startswith(k)), None)
+    if entry is None:
+        return None
+    # 新版缓存：entry 含 idle/peak 两档，按当前时段选档
+    if "idle" in entry and "peak" in entry:
+        tier = _resolve_tier()
+        return entry[tier]
+    # 旧版缓存：entry 直接是单档标量 dict，原样返回
+    return entry
 
 
 if __name__ == "__main__":
-    # 调试入口：打印当前解析到的价目表
+    # 调试入口：打印当前解析到的价目表与按当前时段的选档结果
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     try:
         p = fetch_deepseek_pricing(force_refresh=True)
         print(json.dumps(p, ensure_ascii=False, indent=2))
+        tier = _resolve_tier()
+        print(f"\n当前档位: {tier} ({_dt.datetime.now(_BJ_OFFSET):%Y-%m-%d %H:%M %Z})")
+        for short in p:
+            print(f"  {short}: {p[short][tier]}")
     except Exception as exc:  # noqa: BLE001
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)

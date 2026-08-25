@@ -84,6 +84,12 @@ class AppSettings:
     # 是否仍输出 .zh.md（markdown）。默认 True：导出 docx/pdf 时也会保留 markdown。
     # 设为 False 可只产出 docx/pdf（例如 --no-md / PAPER_TOOLS_OUTPUT_MD=false）。
     output_markdown: bool = True
+    # 跳过翻译：True 时不调用 LLM，仅解析并输出论文英文原文（用于只想要
+    # 结构化原文 markdown 的场景）。环境变量 PAPER_TOOLS_SKIP_TRANSLATE 可覆盖。
+    translate_skip: bool = False
+    # 待翻译的 arxiv 链接或 ID（也可通过 main.py 的 INPUT 常量或命令行提供）。
+    # 环境变量 PAPER_TOOLS_INPUT 可覆盖（空字符串表示未配置，回退到 INPUT 常量）。
+    arxiv_input: str = ""
     # 生成「全局立场摘要」时送入 LLM 的摘要文本字符上限。
     # 0（默认）= 不截断，使用完整论文摘要；>0 = 超过该字符数则截断（极少数学术
     # 摘要极长时可设一个上限，避免无谓的 token 消耗）。
@@ -129,6 +135,10 @@ class AppSettings:
             self.export_formats = env.strip().lower()
         if env := os.environ.get("PAPER_TOOLS_OUTPUT_MD"):
             self.output_markdown = env.strip().lower() in ("1", "true", "yes", "on")
+        if env := os.environ.get("PAPER_TOOLS_SKIP_TRANSLATE"):
+            self.translate_skip = env.strip().lower() in ("1", "true", "yes", "on")
+        if env := os.environ.get("PAPER_TOOLS_INPUT"):
+            self.arxiv_input = env.strip()
         if env := os.environ.get("PAPER_TOOLS_SUMMARY_MAX_CHARS"):
             self.summary_max_abstract_chars = int(env)
         if env := os.environ.get("PAPER_TOOLS_RESUME_MODE"):

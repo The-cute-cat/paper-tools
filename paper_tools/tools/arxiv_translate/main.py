@@ -28,7 +28,7 @@ def main() -> None:
     logger.info("arxiv 论文翻译工具启动")
 
     # ===== 在这里填写参数 =====
-    INPUT = "2604.25921"  # arxiv 链接或 ID，例如 "https://arxiv.org/abs/2605.26158v1" 或 "2605.26158v1"
+    INPUT = ""  # arxiv 链接或 ID，例如 "https://arxiv.org/abs/2605.26158v1" 或 "2605.26158v1"
     API_KEY = ""            # 留空则用 .env / 环境变量里的 DEEPSEEK_API_KEY
     MODEL = ""              # 留空则用配置里的默认模型（deepseek-v4-flash）
     OUT_DIR = ""            # 留空则用配置里的默认输出目录（项目根/output）
@@ -50,6 +50,8 @@ def main() -> None:
     EXPORT_FORMATS = ""
     # 是否仍输出 .zh.md：True 默认（始终输出 markdown）。
     OUTPUT_MARKDOWN = True
+    # 跳过翻译：True 时不调用 LLM，仅解析并输出论文英文原文（结构化原文 markdown）。
+    TRANSLATE_SKIP = False
 
     # ===== 参数生效 =====
     if API_KEY:
@@ -72,12 +74,20 @@ def main() -> None:
         settings.export_formats = EXPORT_FORMATS.strip().lower()
     if str(OUTPUT_MARKDOWN).strip().lower() in ("0", "false", "no", "off"):
         settings.output_markdown = False
+    if str(TRANSLATE_SKIP).strip().lower() in ("1", "true", "yes", "on"):
+        settings.translate_skip = True
 
-    if not settings.llm.api_key:
+    # 待翻译论文：优先用 main.py 的 INPUT 常量；若为空则回退到 .env 的 PAPER_TOOLS_INPUT
+    input_arg = INPUT if INPUT else settings.arxiv_input
+    if not input_arg:
+        logger.error("未指定待翻译论文：请在 main.py 的 INPUT 常量填写，或在 .env 设置 PAPER_TOOLS_INPUT。")
+        sys.exit(1)
+
+    if not settings.translate_skip and not settings.llm.api_key:
         logger.error("未配置 API key：请在 .env 设置 DEEPSEEK_API_KEY，或在下方 API_KEY 常量中填写。")
         sys.exit(1)
 
-    out = run(INPUT)
+    out = run(input_arg)
     logger.info(f"结果文件: {out}")
 
 
