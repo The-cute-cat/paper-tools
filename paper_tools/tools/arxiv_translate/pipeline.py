@@ -1552,7 +1552,9 @@ def run(url_or_id: str) -> Path:
     if mode == "title":
         out_stem = _safe_filename(orig_title or arxiv_id)
     elif mode == "title_zh":
-        out_stem = _safe_filename(title_text or orig_title or arxiv_id)
+        # 原文模式无"中文标题"，回退为用原文标题命名（等价于 title），
+        # 避免文件名声称中文标题但实际是英文原文。
+        out_stem = _safe_filename(title_text if not skip else orig_title or arxiv_id)
     else:  # id（默认）
         out_stem = arxiv_id
     glossary_path = workdir / f"{out_stem}.glossary.json"
@@ -1608,7 +1610,8 @@ def run(url_or_id: str) -> Path:
         logger.info("未开启导出格式（export_formats 为空），跳过 .zh.html 生成"
                     "（其依赖逐块 LLM 重翻，目前消费者 DOCX/PDF 导出尚未启用）")
 
-    out_md = workdir / f"{out_stem}.zh.md"
+    # skip 模式输出的是英文原文，文件名后缀用 .en.md；翻译模式用 .zh.md。
+    out_md = workdir / f"{out_stem}{'.en.md' if skip else '.zh.md'}"
     if settings.output_markdown:
         logger.info(f"写出 Markdown 文件 ({len(body):,} 字符) ...")
         out_md.write_text(header + body, encoding="utf-8")

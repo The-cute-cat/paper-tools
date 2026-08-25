@@ -134,6 +134,57 @@ def _as_str(v: object) -> Optional[str]:
     return None
 
 
+def _img_size(tag: "Tag", base_width: int = 600) -> Optional[tuple[int, int]]:
+    """从 img/object 标签提取 width/height，返回 (宽, 高) 像素元组；都没有时返回 None。
+
+    之所以返回像素元组而非 markdown 后缀字符串，是因为只有少数 markdown 渲染器
+    （如部分主题的 Typora）才支持 `![alt](src =WxH)` 语法，且语法细节差异大；
+    跨渲染器通用的方案是直接输出 HTML `<img width=... height=...>` 标签。
+    """
+    w = _as_str(tag.get("width"))
+    h = _as_str(tag.get("height"))
+    if not w and not h:
+        style = _as_str(tag.get("style")) or ""
+        m = re.search(r"aspect-ratio\s*:\s*(\d+)\s*/\s*(\d+)", style)
+        if m:
+            try:
+                aw, ah = int(m.group(1)), int(m.group(2))
+                if aw > 0 and ah > 0:
+                    h_i = max(1, round(base_width * ah / aw))
+                    return base_width, h_i
+            except ValueError:
+                pass
+            return None
+    if not (w and h):
+        return None
+    try:
+        w_i, h_i = int(w), int(h)
+    except (TypeError, ValueError):
+        return None
+    if w_i <= 0 or h_i <= 0:
+        return None
+    return w_i, h_i
+
+
+def _html_escape_attr(s: str) -> str:
+    """HTML 属性值转义，最小覆盖 & " < >。"""
+    return s.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _html_img(alt: str, src: str, size: Optional[tuple[int, int]]) -> str:
+    """构造 HTML <img> 标签，跨所有 markdown 渲染器（Typora、VS Code、Obsidian 等）通用。
+
+    直接用 width/height 属性约束显示尺寸，避免图片被撑满容器或被错误地按
+    ` =WxH` 标题解析为图片 caption。
+    """
+    alt_esc = _html_escape_attr(alt)
+    src_esc = _html_escape_attr(src)
+    if size:
+        w, h = size
+        return f'<img src="{src_esc}" alt="{alt_esc}" width="{w}" height="{h}">'
+    return f'<img src="{src_esc}" alt="{alt_esc}">'
+
+
 def _strip_displaystyle(tex: str) -> str:
     """去掉 LaTeXML 给每个 math 注释添加的 '\\displaystyle' 前缀。
 
@@ -142,17 +193,84 @@ def _strip_displaystyle(tex: str) -> str:
     return re.sub(r"^\s*\\displaystyle\s*", "", tex)
 
 
+def _read_balanced_group(s: str, i: int) -> tuple[str, int]:
+    """从位置 i 读取一个 {...} 平衡 group，返回 (内部文本, 结束位置)。
+
+    内部嵌套 group 保留原样。失败（未以 { 开头或不闭合）返回 ("", -1)。
+    """
+    if i >= len(s) or s[i] != "{":
+        return "", -1
+    depth = 1
+    j = i + 1
+    start = j
+    while j < len(s) and depth > 0:
+        c = s[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    if depth != 0:
+        return "", -1
+    return s[start:j], j + 1
+
+
+def _normalize_tex_for_katex(tex: str) -> str:
+    """把 LaTeXML/ar5iv 输出的 tex 后处理为 KaTeX 兼容形式。
+
+    主要修复两处常见问题：
+      - \\nicefrac{a}{b} → \\frac{a}{b}  （KaTeX 不支持 \\nicefrac，未解析时会显示
+        "Undefined control sequence" 并破坏整段正文渲染）
+      - 移除 ar5iv 在 ltx_math_unparsed 公式里注入的 \\mathopen{} / \\mathclose{}
+        空间距补丁（对原文语义无贡献，且偶与 \\left/\\right 配对时干扰渲染）
+    """
+    out: list[str] = []
+    i = 0
+    n = len(tex)
+    while i < n:
+        # 剥离 ar5iv 注入的空间距补丁 \mathopen{} / \mathclose{}
+        if tex.startswith(r"\mathopen{}", i):
+            i += len(r"\mathopen{}")   # 11 字符
+            continue
+        if tex.startswith(r"\mathclose{}", i):
+            i += len(r"\mathclose{}")   # 12 字符
+            continue
+        # \nicefrac{arg1}{arg2} → \frac{arg1}{arg2}
+        if tex.startswith(r"\nicefrac", i):
+            j = i + len(r"\nicefrac")
+            a1, j = _read_balanced_group(tex, j)
+            if j >= 0:
+                a2, j = _read_balanced_group(tex, j)
+            if j < 0:
+                # 不平衡 group：跳过本次匹配，原样复制当前字符，保持原文完整
+                out.append(tex[i])
+                i += 1
+                continue
+            out.append(r"\frac{" + a1 + "}{" + a2 + "}")
+            i = j
+            continue
+        out.append(tex[i])
+        i += 1
+    return "".join(out)
+
+
 def _tex_of(math_tag: Tag) -> str:
     """从 math 标签中提取 LaTeX 源码。
 
     LaTeXML 在每个 annotation 前面加 '\\displaystyle' 前缀。KaTeX 在行内 $..$ 中
     不支持该命令，因此默认去除；display 场景下也冗余且在 aligned 等环境中非法。
+
+    另经后处理将 \\nicefrac → \\frac（KaTeX 不支持 \\nicefrac）并剥离 ar5iv 注入
+    的 \\mathopen{} / \\mathclose{} 空间距补丁，避免在 ltx_math_unparsed 公式里
+    触发 KaTeX "Undefined control sequence" 整段报错。
     """
     ann = math_tag.find("annotation", attrs={"encoding": "application/x-tex"})
     if ann and ann.string:
-        return _strip_displaystyle(ann.string.strip())
+        return _normalize_tex_for_katex(_strip_displaystyle(ann.string.strip()))
     alt = _as_str(math_tag.get("alttext"))
-    return _strip_displaystyle(alt.strip()) if alt else ""
+    return _normalize_tex_for_katex(_strip_displaystyle(alt.strip())) if alt else ""
 
 
 def _looks_like_inline_math(tex: str) -> bool:
@@ -254,6 +372,15 @@ def _rich_text(tag: Tag) -> str:
             return
         if name == "br":
             parts.append("\n")
+            return
+        if name == "img":
+            # 单元格内嵌图片（如表格中的小图标/示意图）：直接输出 HTML <img>。
+            # src 此时已被全局归一化为本地路径或完整网络 URL（见 parse_arxiv_html）。
+            src = _as_str(node.get("src")) or _as_str(node.get("data")) or ""
+            alt = _as_str(node.get("alt")) or ""
+            if src:
+                # base_width=120 适配行内/表格小图标；若原 width 较小，函数会原样返回原尺寸。
+                parts.append(_html_img(alt, src, _img_size(node, base_width=120)))
             return
         # 块级元素边界插入换行，便于表格 cell 等"行内多段"场景保留段落结构。
         # ar5iv Table 1 等对话示例用 <span class="ltx_p"> / <p class="ltx_p">
@@ -462,17 +589,26 @@ def parse_arxiv_html(
     global _BIB_MAP
     _BIB_MAP = _build_bib_map(soup)
 
-    # 本地图片模式：把 <img src> / <object data> 改写为本地相对路径，
-    # 这样生成的 .zh.html 可被 DOCX/PDF 导出器正确内嵌图片。
-    if img_mapping:
-        for img in soup.find_all("img"):
-            src = img.get("src")
-            if isinstance(src, str) and src in img_mapping:
-                img["src"] = img_mapping[src]
-        for obj in soup.find_all("object"):
-            data = obj.get("data")
-            if isinstance(data, str) and data in img_mapping:
-                obj["data"] = img_mapping[data]
+    # 图片路径归一化（必须在 _walk_section 之前执行，使所有块——含复杂表格
+    # 走 HTML 路径直接 str(html_table) 输出——都能拿到正确的图片地址）：
+    #   - 本地图片模式：把 <img src>/<object data> 改写为本地相对路径；
+    #   - 网络模式（img_mapping 为空）：把相对路径补全为完整网络 URL。
+    # 否则表格单元格里的相对路径图片（如 2605.26158v1/x1.png）在渲染时无法加载。
+    def _norm_src(src: str) -> str:
+        if src in img_mapping:
+            return img_mapping[src]
+        if src.startswith("http"):
+            return src
+        return base_url.rstrip("/") + "/" + src.lstrip("/")
+
+    for img in soup.find_all("img"):
+        src = img.get("src")
+        if isinstance(src, str) and src:
+            img["src"] = _norm_src(src)
+    for obj in soup.find_all("object"):
+        data = obj.get("data")
+        if isinstance(data, str) and data:
+            obj["data"] = _norm_src(data)
 
     doc_title = soup.find(class_="ltx_title_document")
     if doc_title:
@@ -501,9 +637,10 @@ def parse_arxiv_html(
 
     content = soup.find("article") or soup.find(class_="ltx_page_content") or soup.body
     for sec in content.find_all(["section", "subsection", "subsubsection"],
-                                class_=re.compile(r"ltx_section"),
+                                class_=re.compile(r"ltx_section|ltx_appendix"),
                                 recursive=False):
-        title_tag = sec.find(class_=re.compile(r"ltx_title_section"))
+        # 附录标题用的是 ltx_title_appendix（非 ltx_title_section），需单独识别
+        title_tag = sec.find(class_=re.compile(r"ltx_title_section|ltx_title_appendix"))
         if title_tag:
             raw_title = _strip_tag_prefix(_plain_text(title_tag))
             blocks.append(Block(kind="heading", level=2, text=raw_title, raw=raw_title,
@@ -589,6 +726,69 @@ def _emit_text_box(span: Tag, blocks: list[Block]) -> None:
         meta={"html_id": box_id,
               "text_box_md": "\n".join(rich_parts)},
     ))
+
+    # 同一文本框内可能还包含 SVG <foreignobject> 包裹的 <span class="ltx_listing">——
+    # 也就是"带框的代码块 / Prompt 模板正文"。例如 Furina 论文 Appendix A 的
+    # "Minor / Moderate / High / Semantic Rewrite Prompt"：外层是图片化文本框
+    # （ltx_inline-block + SVG），框内第一段是标题（已作为 text_box 第一段输出），
+    # 第二段是真正的提示词代码块（带行号的 ltx_listing）。早期实现只在 ltx_paragraph
+    # 直接子节点是 ltx_listing 时才调 _append_listing，嵌在 inline-block 内的
+    # listing 被静默忽略，导致整段 prompt 文本丢失。补一次扫描：对该 span 内的
+    # 每个 ltx_listing 复用行提取逻辑，以 fenced code block 形式输出
+    # （不含行内数学，故无需 GFM 表格），标题已由 text_box 第一段承载，避免重复。
+    _emit_inline_listings(span, blocks, box_id)
+
+
+def _emit_inline_listings(span: Tag, blocks: list[Block], box_id: str) -> None:
+    """对 ltx_inline-block 内的 <span class="ltx_listing"> 逐个生成 listing 块。
+
+    与 _append_listing 的差异：本函数不重新解析 caption（标题由 text_box 承载），
+    且不调用 decompose() 破坏 soup——本函数假定 listing 在文本框中以装饰性形式
+    出现，外层仍需保留原 DOM 结构供后续 .zh.html 回填定位。
+
+    这类 listing 通常是"提示词模板 / 伪代码"等纯文本代码块，**不含行内数学**
+    （已验证 Furina 论文 5 个 Rewrite/Judge Prompt 均如此），因此直接用
+    fenced code block 输出比 GFM 表格更自然、可读性更好，也不会把代码里的
+    ``|`` 当成表格分隔符。行号以 ``N |`` 前缀形式保留，忠实反映原排版。
+    """
+    listings = span.find_all(class_="ltx_listing", recursive=True)
+    # 若一个 ltx_inline-block 嵌套包含多个 listing（如罕见的多代码块框），按文档顺序逐个输出。
+    for listing in listings:
+        code_lines: list[str] = []
+        for line_div in listing.find_all(class_="ltx_listingline", recursive=False):
+            # 行号标签文本（ltex_listingline 含 <span class="ltx_tag_listingline">N</span>）
+            tag = line_div.find(class_="ltx_tag_listingline")
+            line_no = tag.get_text().strip() if tag else ""
+            # 不 decompose：_listing_line_text 内部已对 ltx_tag_listingline 节点 return，
+            # 不会把行号泄漏到 content。
+            for br in line_div.find_all("br"):
+                br.decompose()
+            content = _listing_line_text(line_div)
+            content = content.replace("\r", "").strip("\n")
+            content = re.sub(r"[ \t]{2,}", " ", content).rstrip()
+            if not content and not line_no:
+                # 空行保留为空白行（不丢排版）
+                code_lines.append("")
+                continue
+            if line_no:
+                code_lines.append(f"{line_no} | {content}")
+            else:
+                code_lines.append(content)
+        if not code_lines:
+            continue
+        # 剥掉结尾可能出现的连续空行
+        while code_lines and code_lines[-1] == "":
+            code_lines.pop()
+        code_block = "```python\n" + "\n".join(code_lines) + "\n```"
+        blocks.append(Block(
+            kind="listing",
+            text="",
+            raw=code_block,
+            meta={"html_id": _html_id_of(listing),
+                  "listing_md": code_block,
+                  "listing_raw": code_block,
+                  "text_box_id": box_id},
+        ))
 
 
 def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
@@ -793,6 +993,114 @@ def _append_equation(eq: Tag, blocks: list[Block], html_id: Optional[str] = None
 
 def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
                    base_url: str = "") -> None:
+    # ar5iv 中"并列多图"结构：一个外层 <figure class="ltx_figure"> 包了一个
+    # ltx_flex_figure 容器，内部并排放了多个 <figure class="ltx_figure_panel">，
+    # 每个 panel 是独立的子图（含自己的 <img> + figcaption）。若直接对外层
+    # figure 解析，find("img") 只会在 panel 内查找而这里查不到，整张组合图
+    # 会被吞掉。遇到这种结构时分别处理每个 panel。
+    panels = fig.find_all("figure", class_="ltx_figure_panel", recursive=True)
+    if len(panels) > 1:
+        # 外层若有总 caption（"Figure 2: …"），以引用块 `> ...` 形式输出，
+        # 作为后续 panel 集合的总体说明，避免子 panel 全部丢失。
+        # 不使用 heading 类型，否则图注会进入 markdown 大纲、被渲染为大标题，
+        # 破坏文章结构（类似 matplotlib 的 figure caption，应保持为说明性段落）。
+        # 注意顺序：论文中图注通常在所有子图之后，因此先递归输出各 panel，
+        # 最后再追加外层总 caption（否则会出现"图注在图片之前"的错位）。
+        outer_caption = fig.find("figcaption", class_="ltx_caption", recursive=False)
+        # 注意：find("figcaption", recursive=True) 也会匹配到子 panel 的 figcaption，
+        # 因此需要用 recursive=False 限定在 fig 的直接 figcaption。
+        if outer_caption is None:
+            # 兜底：可能外层 figcaption 不是 fig 直接子节点
+            all_caps = fig.find_all("figcaption", class_="ltx_caption", recursive=False)
+            outer_caption = all_caps[-1] if all_caps else None
+        for panel in panels:
+            _append_figure(panel, blocks, img_mapping, base_url)
+        if outer_caption is not None:
+            outer_text = _rich_text(outer_caption).strip()
+            if outer_text:
+                # 引用块语法 `> ...`，多行也用 `> ` 前缀
+                cap_lines = outer_text.split("\n")
+                raw_cap = "\n".join(f"> {ln}" for ln in cap_lines if ln.strip())
+                if raw_cap:
+                    # 使用 kind="figure" 而不是 heading/text：
+                    # 1) heading 会让 caption 进入 markdown 大纲被渲染为大标题，
+                    #    破坏文章结构；2) text 会让 LLM 翻译该图注英文；
+                    #    figure 类与子 panel caption 同流，直接走 raw 输出，
+                    #    不进翻译也不进大纲，仅作为图注说明显示。
+                    blocks.append(Block(kind="figure", text=outer_text, raw=raw_cap,
+                                        meta={"caption": outer_text}))
+        return
+
+    # ar5iv 中"图网格"结构：<figure class="ltx_figure"> 直接包了一个 <table class="ltx_tabular">，
+    # 表格内每行多列图片（如 Figure 6 的 5×4 深度估计演示图网格）。若直接 fig.find("img")
+    # 只能取到第一张图，其余 19 张全部丢失。遇到这种结构时把整个表格按 markdown/HTML 输出，
+    # 保留所有图片及其相对布局，并在 caption 行加 ltx_text 文本作为列说明。
+    inner_tabular = fig.find("table", class_="ltx_tabular")
+    if inner_tabular is not None and fig.find("img") is not None:
+                # 仅在 fig 内部存在 ≥2 张图片时才走"图网格"路径，避免与单图 figure 混淆
+                img_count = len(fig.find_all("img"))
+                if img_count >= 2:
+                    table_html = _collect_table_text(inner_tabular)
+                    # 注意：parse_arxiv_html 内的 _norm_src 已经把所有 <img src>/<object data>
+                    # 归一化为本地/网络完整 URL，因此这里直接 str() 输出即可。
+                    caption = fig.find(class_="ltx_caption")
+                    cap_text = _rich_text(caption) if caption else ""
+                    cap_text = cap_text.replace("\n", " ").strip()
+                    blocks.append(Block(kind="figure",
+                                        text=_plain_text(caption) if caption else "",
+                                        raw=(table_html + "\n\n" if table_html else "")
+                                             + (f"> {cap_text}" if cap_text else ""),
+                                        meta={"caption": cap_text, "html_id": _html_id_of(fig)}))
+                    return
+
+    # ar5iv 中另一种"并列多图"结构：外层 <figure> 内是 <div class="ltx_flex_figure">，
+    # 内含多个 <div class="ltx_flex_cell">，每个 cell 直接含一张 <img>（无 ltx_figure_panel
+    # 子 figure 包裹，区别于上面的 panels 分支）。例如 Figure 10 的 42 张失败案例图网格。
+    # 若走主流程 fig.find("img") 只会取到 caption 内联的小图标 vb4.png，
+    # 真正的并列图全部丢失。遍历每个 flex_cell 输出其 img，最后追加外层总 caption。
+    flex_fig = fig.find("div", class_="ltx_flex_figure")
+    if flex_fig is not None:
+        cells = flex_fig.find_all("div", class_="ltx_flex_cell")
+        # 仅在这些 cell 内存在 ≥2 张图时才走此分支（避免与单图 figure 混淆）。
+        # 注意：ltx_flex_cell 可能包含"纯文字标签"cell（如 Figure 10 第一列是
+        # "Original Image / GT a / GT b …" 列标题，其内部 <span class="ltx_tabular">
+        # 内嵌了 vb4.png 这类行内小图标），这类内联图标不能当作独立图片输出。
+        # 因此只收集不在 ltx_tabular 祖先内的 <img>（即真正的独立图）。
+        flex_imgs: list[Tag] = []
+        for c in cells:
+            img = c.find("img")
+            if img is None:
+                continue
+            # 跳过内联在表格标签列（ltx_tabular）中的小图标
+            if img.find_parent(class_="ltx_tabular") is not None:
+                continue
+            flex_imgs.append(img)
+        if len(flex_imgs) >= 2:
+            for img in flex_imgs:
+                size = _img_size(img)
+                src = _as_str(img.get("src"))
+                if img_mapping:
+                    render_src = img_mapping.get(src, src)
+                else:
+                    render_src = src if src.startswith("http") else (base_url.rstrip("/") + "/" + src.lstrip("/"))
+                blocks.append(Block(kind="figure", text="",
+                                    raw=_html_img("figure", render_src, size),
+                                    meta={"src": src, "local_src": render_src, "html_id": _html_id_of(fig)}))
+            # 外层总 caption（"Figure 10: …"）以引用块形式追加，顺序在所有子图之后
+            outer_caption = fig.find("figcaption", class_="ltx_caption", recursive=False)
+            if outer_caption is None:
+                all_caps = fig.find_all("figcaption", class_="ltx_caption", recursive=False)
+                outer_caption = all_caps[-1] if all_caps else None
+            if outer_caption is not None:
+                outer_text = _rich_text(outer_caption).strip()
+                if outer_text:
+                    cap_lines = outer_text.split("\n")
+                    raw_cap = "\n".join(f"> {ln}" for ln in cap_lines if ln.strip())
+                    if raw_cap:
+                        blocks.append(Block(kind="figure", text=outer_text, raw=raw_cap,
+                                            meta={"caption": outer_text}))
+            return
+
     # ar5iv 对较大/矢量图（如阈值敏感性分析的 SVG）使用 <object data="*.svg"> 嵌入，
     # 而不是 <img src="*.png">。<object> 在浏览器中渲染正常但不在 fig.find("img") 范围内，
     # 必须同时兼容这两种资源嵌入方式，否则会产生"caption 在但图缺失"的现象。
@@ -821,7 +1129,8 @@ def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
     # caption 可能是多行（标签 + 描述），合并成单行引用避免 markdown 引用断裂
     cap_text = cap_text.replace("\n", " ").strip()
     blocks.append(Block(kind="figure", text=_plain_text(caption) if caption else "",
-                        raw=(f"![figure]({render_src})\n\n" if render_src else "")
+                        raw=((_html_img("figure", render_src, _img_size(img) if img is not None else None) + "\n\n")
+                             if render_src else "")
                              + (f"> {cap_text}" if cap_text else ""),
                         meta={"src": src, "local_src": render_src, "caption": cap_text,
                               "html_id": _html_id_of(fig)}))
@@ -962,8 +1271,15 @@ def _collect_table_text(tbl: Tag) -> str:
     判断走哪种 cell 翻译通道；两种路径都把字符串也用作最终的
     block.raw 直接落地（markdown 路径→ GFM；HTML 路径 → raw HTML）。
     """
-    tabular = tbl.find(class_="ltx_tabular") or tbl
-    html_table = tabular if tabular.name == "table" else tabular.find("table")
+    # 提取真正的 <table> 元素。注意：不能简单地用
+    # `tbl.find(class_="ltx_tabular")`，因为部分论文会把多行描述文本用
+    # <span class="ltx_tabular"> 内联包裹（如 Figure 12 第 9 行的 prompt 描述），
+    # 这种 span 并非真正表格，误匹配会导致 html_table 为 None、整张表被丢弃。
+    # 这里优先匹配 tbl 自身或其后裔中 name 为 "table" 的节点。
+    if tbl.name == "table":
+        html_table = tbl
+    else:
+        html_table = tbl.find("table")
     if html_table is None:
         return ""
 
@@ -991,6 +1307,55 @@ def _collect_table_text(tbl: Tag) -> str:
         # 这里调用 decode_contents 不可行：bs4 解析器会漏 cdata 与实体；
         # prefer 直接抓 outer HTML。
         # 注意：ar5iv 表格内 table 元素可能含 ltx 的子 class，需要保留。
+        #
+        # ===== 防止超宽表格溢出屏幕 =====
+        # ar5iv 对超宽表格会用嵌套装饰 + CSS transform 缩放显示：
+        #   <div class="ltx_inline-block ltx_transformed_outer" style="width:..">
+        #     <span class="ltx_transformed_inner" style="transform:translate(...) scale(0.29)">
+        #       <table>...</table>
+        #     </span>
+        #   </div>
+        # markdown 渲染器（Typora 等）会忽略 CSS transform 按原尺寸渲染，
+        # 同时外层 div 的 ltx_inline-block 会让 table 表现为 inline-block，
+        # 极易撑爆页面。本处理：
+        #   1) 先把 ltx_transformed_outer 上的 style 全部去掉（不再受其 width/vertical-align 控制）
+        #   2) 把 ltx_transformed_inner 上的 transform:... 样式也去掉（避免 Typora 二次缩放）
+        #   3) 对列数 ≥ 10 的超宽表格，外层加 <div style="overflow-x:auto"> 包裹并把
+        #      table 自身的 display 改为 block（让块级盒子撑出滚动条，避免 inline-block 拉宽）
+        for deco_cls in ("ltx_transformed_outer", "ltx_transformed_inner"):
+            for deco in html_table.find_all(class_=deco_cls):
+                if deco.has_attr("style"):
+                    cleaned = re.sub(
+                        r"transform\s*:\s*[^;\"]*;?", "", deco["style"], flags=re.IGNORECASE
+                    )
+                    cleaned = re.sub(r"\s+;", ";", cleaned).strip()
+                    if cleaned:
+                        deco["style"] = cleaned
+                    else:
+                        del deco["style"]
+        # ltx_transformed_outer 上的 style 也整体清掉（width/vertical-align 等约束对 md 渲染无意义）
+        for deco in html_table.find_all(class_="ltx_transformed_outer"):
+            if deco.has_attr("style"):
+                del deco["style"]
+        # 列数判定：扫描所有行取最大 colspan 累加（含 rowspan 的子表头也可能增加列数）。
+        # 仅看第一行不够：Table 6（Monocular depth）的第一行只有 8 列，但实际表格
+        # 后续行扩展到 12 列，整体仍会溢出视口。
+        col_count = 0
+        for tr in html_table.find_all("tr"):
+            row_cols = 0
+            for c in tr.find_all(["td", "th"]):
+                try:
+                    row_cols += int(c.get("colspan") or 1)
+                except ValueError:
+                    row_cols += 1
+            if row_cols > col_count:
+                col_count = row_cols
+        if col_count >= 10:
+            # 超宽表：把 table 自身改为 block 显示（脱离 inline-block 的拉宽行为）
+            existing_style = html_table.get("style") or ""
+            html_table["style"] = (
+                f"display:block;overflow-x:auto;max-width:100%;{existing_style}"
+            ).strip()
         html = str(html_table)
         # 防止 Typora 把独占一行的 GFM 表格分隔线误判；表格 HTML 块前后
         # 加空行并非必须（GFM 块级 HTML 由空行分隔），但 remove 掉前后
@@ -1343,6 +1708,21 @@ def _collect_table_text(tbl: Tag) -> str:
 
 
 def _append_table(tbl: Tag, blocks: list[Block]) -> None:
+    # ar5iv 中"并列多表"结构：一个外层 <figure class="ltx_table"> 包了一个
+    # ltx_flex_table 容器，内部并排放了多个 <figure class="ltx_figure_panel">，
+    # 每个 panel 都有自己独立的 <table> + figcaption，对应论文里的 Table N、M……
+    # 若直接对外层 figure 调 _collect_table_text 只会取到第一个 <table>，导致
+    # 后续多张表被吞掉。遇到这种结构时分别处理每个 panel。
+    panels = tbl.find_all("figure", class_="ltx_figure_panel", recursive=True)
+    if len(panels) > 1:
+        for panel in panels:
+            # panel 内若有真正的 <table>，当作独立表处理；否则视为空容器跳过
+            if panel.find("table") is not None:
+                _append_table(panel, blocks)
+        return
+    # 单面板：panel 本身就是 table，递归回来后 tbl 不再含 figure_panel，
+    # 正常走下面逻辑即可。
+
     caption = tbl.find(class_="ltx_caption")
     cap_text = _rich_text(caption) if caption else ""
     table_md = _collect_table_text(tbl)
@@ -1362,11 +1742,11 @@ def _append_table(tbl: Tag, blocks: list[Block]) -> None:
 
 
 def _collect_equation_tex(eq: Tag) -> str:
-    """单行 equation：直接返回去除 \\displaystyle 后的 LaTeX。"""
+    """单行 equation：直接返回去除 \\displaystyle 并经 KaTeX 归一化后的 LaTeX。"""
     parts: list[str] = []
     for ann in eq.find_all("annotation", attrs={"encoding": "application/x-tex"}):
         if ann.string:
-            parts.append(_strip_displaystyle(ann.string.strip()))
+            parts.append(_normalize_tex_for_katex(_strip_displaystyle(ann.string.strip())))
     return " ".join(parts)
 
 
@@ -1383,7 +1763,7 @@ def _collect_equationgroup_tex(eq: Tag) -> str:
             cell_tex: list[str] = []
             for ann in td.find_all("annotation", attrs={"encoding": "application/x-tex"}):
                 if ann.string:
-                    cell_tex.append(_strip_displaystyle(ann.string.strip()))
+                    cell_tex.append(_normalize_tex_for_katex(_strip_displaystyle(ann.string.strip())))
             if cell_tex:
                 cells.append(" ".join(cell_tex))
         if cells:
