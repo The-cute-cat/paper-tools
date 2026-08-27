@@ -20,10 +20,10 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import quote
 
-from bs4 import BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, Tag
+from bs4.element import NavigableString, PageElement
 
 from ...config import get_settings
-
 
 # ============ 引用搜索引擎 ============
 # 默认 Bing 国内可直连；Google/Bing/DuckDuckGo/Semantic Scholar/arXiv 全部可切换。
@@ -38,7 +38,7 @@ _CITE_SEARCH_URL_TEMPLATES: dict[str, str] = {
 }
 
 
-def _cite_search_url(query: str, engine: Optional[str] = None) -> str:
+def _cite_search_url(query: str, engine: str | None = None) -> str:
     """根据配置的搜索引擎构造引用查询 URL。"""
     if engine is None:
         engine = get_settings().cite_search_engine
@@ -112,20 +112,22 @@ def _assign_html_ids(soup: "BeautifulSoup") -> None:
         tag["data-zh-id"] = f"zh-{_counter['n']}"
 
 
-def _html_id_of(tag: "Tag") -> Optional[str]:
+def _html_id_of(tag: Optional["Tag"]) -> str | None:
     """取 tag 自身的 data-zh-id；若无则向上找最近的带 id 祖先。"""
     if tag is None:
         return None
     own = tag.get("data-zh-id")
-    if own:
+    if isinstance(own, str) and own:
         return own
     parent = tag.find_parent(attrs={"data-zh-id": True})
     if parent is not None:
-        return parent.get("data-zh-id")
+        pid = parent.get("data-zh-id")
+        if isinstance(pid, str):
+            return pid
     return None
 
 
-def _as_str(v: object) -> Optional[str]:
+def _as_str(v: object) -> str | None:
     """BeautifulSoup get() 返回值可能是 list，收窄为 str。"""
     if isinstance(v, str):
         return v
@@ -134,7 +136,7 @@ def _as_str(v: object) -> Optional[str]:
     return None
 
 
-def _img_size(tag: "Tag", base_width: int = 600) -> Optional[tuple[int, int]]:
+def _img_size(tag: "Tag", base_width: int = 600) -> tuple[int, int] | None:
     """从 img/object 标签提取 width/height，返回 (宽, 高) 像素元组；都没有时返回 None。
 
     之所以返回像素元组而非 markdown 后缀字符串，是因为只有少数 markdown 渲染器
@@ -171,7 +173,7 @@ def _html_escape_attr(s: str) -> str:
     return s.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def _html_img(alt: str, src: str, size: Optional[tuple[int, int]]) -> str:
+def _html_img(alt: str, src: str, size: tuple[int, int] | None) -> str:
     """构造 HTML <img> 标签，跨所有 markdown 渲染器（Typora、VS Code、Obsidian 等）通用。
 
     直接用 width/height 属性约束显示尺寸，避免图片被撑满容器或被错误地按
@@ -220,35 +222,75 @@ def _read_balanced_group(s: str, i: int) -> tuple[str, int]:
 def _normalize_tex_for_katex(tex: str) -> str:
     """把 LaTeXML/ar5iv 输出的 tex 后处理为 KaTeX 兼容形式。
 
-    主要修复两处常见问题：
-      - \\nicefrac{a}{b} → \\frac{a}{b}  （KaTeX 不支持 \\nicefrac，未解析时会显示
-        "Undefined control sequence" 并破坏整段正文渲染）
-      - 移除 ar5iv 在 ltx_math_unparsed 公式里注入的 \\mathopen{} / \\mathclose{}
-        空间距补丁（对原文语义无贡献，且偶与 \\left/\\right 配对时干扰渲染）
+    背景：ar5iv（LaTeXML）导出的 HTML 公式里常出现 KaTeX 不支持的控制序列。
+    只要一段公式里包含任意一个 KaTeX "Undefined control sequence"，KaTeX 就会
+    把整块公式渲染失败（而不是仅跳过该命令），在最终文档里表现为一大段红色
+    报错文本。因此这里需要在交给 KaTeX 之前，把这类命令"就地"改写或剥离。
+
+    ┌─────────────────────────────────────────────────────────────────────┐
+    │  维护者必读（防止回归）：                                              │
+    │  下面每一个分支处理一类「KaTeX 不支持、但 ar5iv 常见」的命令。          │
+    │  它们曾经因为缺乏注释而被误删，导致公式渲染再次报错——请勿随意删除！     │
+    │  若新增一种 KaTeX 不支持的命令，请在此函数追加对应分支并更新下方清单。   │
+    └─────────────────────────────────────────────────────────────────────┘
+
+    已处理命令清单（KaTeX 均不支持，需在交给 KaTeX 前改写/剥离）：
+      1. \\mathopen{} / \\mathclose{}
+            ar5iv 为修正间距注入的补丁，对原文语义无贡献；且偶尔与 \\left/
+            \\right 配对时会干扰 KaTeX 解析。→ 直接删除这两个空命令。
+      2. \\nicefrac{a}{b}
+            KaTeX 无此命令。→ 改写为 \\frac{a}{b}（语义等价，仅排版略不同）。
+      3. \\textsc{...}
+            小型大写字母（small caps）。KaTeX 不支持 \\textsc。→ 改写为 \\text{...}
+            保留括号内文字内容（语义需要，不能丢字），仅去掉"小型大写"样式。
+
+    注意：本函数只处理 KaTeX 明确不支持的「安全改写」项。遇到未知命令时一律
+    原样保留（见循环末尾的 out.append），以保证原文信息不丢失——宁可让 KaTeX
+    报单个命令的错，也不要误删内容。
     """
     out: list[str] = []
     i = 0
     n = len(tex)
     while i < n:
-        # 剥离 ar5iv 注入的空间距补丁 \mathopen{} / \mathclose{}
+        # —— 清单项 1：剥离 ar5iv 注入的间距补丁 \mathopen{} / \mathclose{} ——
+        # （对语义无贡献，且可能与 \left/\right 配对冲突，必须删除）
         if tex.startswith(r"\mathopen{}", i):
             i += len(r"\mathopen{}")   # 11 字符
             continue
         if tex.startswith(r"\mathclose{}", i):
             i += len(r"\mathclose{}")   # 12 字符
             continue
-        # \nicefrac{arg1}{arg2} → \frac{arg1}{arg2}
+        # —— 清单项 2：\nicefrac{arg1}{arg2} → \frac{arg1}{arg2} ——
+        # KaTeX 不支持 \nicefrac；改写后语义等价。
         if tex.startswith(r"\nicefrac", i):
             j = i + len(r"\nicefrac")
             a1, j = _read_balanced_group(tex, j)
             if j >= 0:
                 a2, j = _read_balanced_group(tex, j)
+            else:
+                a2 = ""
             if j < 0:
                 # 不平衡 group：跳过本次匹配，原样复制当前字符，保持原文完整
                 out.append(tex[i])
                 i += 1
                 continue
             out.append(r"\frac{" + a1 + "}{" + a2 + "}")
+            i = j
+            continue
+        # —— 清单项 3：\textsc{...} → \text{...} ——
+        # KaTeX 不支持小型大写 \textsc。保留文字内容，仅去掉样式。
+        # 注意：必须让 j 跳过 "\textsc" 全部字符后，再指向 '{' 由
+        # _read_balanced_group 读取内容；若误写成 len(r"\textsc{") 会多吞一个
+        # 字符导致读不到 '{'，从而整条规则失效（这一 bug 曾导致本问题复发）。
+        if tex.startswith(r"\textsc{", i):
+            j = i + len(r"\textsc")  # 指向紧随其后的 '{'
+            inner, j = _read_balanced_group(tex, j)
+            if j < 0:
+                # 不平衡 group：避免误吞，原样复制当前字符
+                out.append(tex[i])
+                i += 1
+                continue
+            out.append(r"\text{" + inner + "}")
             i = j
             continue
         out.append(tex[i])
@@ -262,13 +304,19 @@ def _tex_of(math_tag: Tag) -> str:
     LaTeXML 在每个 annotation 前面加 '\\displaystyle' 前缀。KaTeX 在行内 $..$ 中
     不支持该命令，因此默认去除；display 场景下也冗余且在 aligned 等环境中非法。
 
-    另经后处理将 \\nicefrac → \\frac（KaTeX 不支持 \\nicefrac）并剥离 ar5iv 注入
-    的 \\mathopen{} / \\mathclose{} 空间距补丁，避免在 ltx_math_unparsed 公式里
-    触发 KaTeX "Undefined control sequence" 整段报错。
+    随后统一交给 _normalize_tex_for_katex 做 KaTeX 兼容性后处理：
+      它将 \\nicefrac → \\frac、\\textsc → \\text，并剥离 ar5iv 注入的
+      \\mathopen{} / \\mathclose{} 空间距补丁，避免公式中触发 KaTeX
+      "Undefined control sequence" 整段报错。
+
+    ⚠️ 注意：所有「KaTeX 不支持命令」的改写逻辑都集中在 _normalize_tex_for_katex，
+    此处不做零散处理；若发现新的 KaTeX 报错命令，请去那一个函数里维护命令清单，
+    不要在这里分开处理，以免再次遗忘/回归。
     """
     ann = math_tag.find("annotation", attrs={"encoding": "application/x-tex"})
-    if ann and ann.string:
-        return _normalize_tex_for_katex(_strip_displaystyle(ann.string.strip()))
+    ann_text = ann.string if ann else None
+    if ann_text:
+        return _normalize_tex_for_katex(_strip_displaystyle(ann_text.strip()))
     alt = _as_str(math_tag.get("alttext"))
     return _normalize_tex_for_katex(_strip_displaystyle(alt.strip())) if alt else ""
 
@@ -286,24 +334,27 @@ def _looks_like_inline_math(tex: str) -> bool:
     if len(stripped) > 25:
         return False
     # 含这些命令的公式大概率是真正的行间公式
-    if re.search(
+    return not re.search(
         r"\\(?:begin|aligned|sum|int|frac|prod|lim|displaystyle|choose|binom|cases|matrix)",
         stripped,
-    ):
-        return False
-    return True
+    )
 
 
 def _rich_text(tag: Tag) -> str:
     """把含行内公式/强调/链接的片段转为保留公式的 markdown 文本。"""
     parts: list[str] = []
 
-    def walk(node):
+    def walk(node: Tag | NavigableString) -> None:
         if isinstance(node, NavigableString):
             parts.append(str(node))
             return
         if not isinstance(node, Tag):
             return
+
+        def _walk_child(child: PageElement) -> None:
+            if isinstance(child, (Tag, NavigableString)):
+                walk(child)
+
         name = node.name
         cls = node.get("class") or []
         if "ltx_note" in cls and "ltx_role_footnote" in cls:
@@ -352,7 +403,7 @@ def _rich_text(tag: Tag) -> str:
                         parts.append(str(c))
                     elif isinstance(c, Tag):
                         for cc in c.children:
-                            walk(cc)
+                            _walk_child(cc)
             return
         if "ltx_Math" in cls:
             tex = _tex_of(node)
@@ -395,38 +446,38 @@ def _rich_text(tag: Tag) -> str:
         if name in _BLOCK_NAMES:
             parts.append("\n")
             for c in node.children:
-                walk(c)
+                _walk_child(c)
             parts.append("\n")
             return
         if "ltx_emph" in cls or name in ("em", "i"):
             parts.append("*")
             for c in node.children:
-                walk(c)
+                _walk_child(c)
             parts.append("*")
             return
         if "ltx_font_bold" in cls or name in ("b", "strong"):
             parts.append("**")
             for c in node.children:
-                walk(c)
+                _walk_child(c)
             parts.append("**")
             return
         if name == "a":
             href = _as_str(node.get("href")) or ""
             parts.append("[")
             for c in node.children:
-                walk(c)
+                _walk_child(c)
             parts.append(f"]({href})" if href else "]")
             return
         for c in node.children:
-            walk(c)
+            _walk_child(c)
 
     walk(tag)
     text = "".join(parts)
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{2,}", "\n", text)
     # 公式两侧保留单个空格，避免与正文中英文字粘连（如 "parameters $\theta$ define"）
-    text = re.sub(r"\s*\$(\s|\$)", lambda m: " $" + m.group(1), text)
-    text = re.sub(r"(\$|\s)\$\s*", lambda m: m.group(1) + "$ ", text)
+    text = re.sub(r"\s*\$([\s$])", lambda m: " $" + m.group(1), text)
+    text = re.sub(r"([\s$])\$\s*", lambda m: m.group(1) + "$ ", text)
     text = re.sub(r" +", " ", text)
     # 修复：合并紧贴粗体标签的公式前缀（如 **H**$_{tok}$ → **$H_{tok}$**）
     # ar5iv 中表头常将指标名用 <strong>H</strong><sub>tok</sub> 分开渲染，
@@ -436,14 +487,14 @@ def _rich_text(tag: Tag) -> str:
     # 捕获：\1=前缀字母，\2=公式内部内容（去掉外层的 $...$）
     # 首字符须是 \ / _ / ^ / {，确保捕获的是 LaTeX（如 $_{max}$ / $^2$ / $\theta$）
     text = re.sub(
-        r"\*\*([A-Za-z0-9_]{1,3})\*\*\$([\\_{}^\{][^$\n]+?)\$",
+        r"\*\*([A-Za-z0-9_]{1,3})\*\*\$([\\_{}^][^$\n]+?)\$",
         r"**$\1\2$**",
         text,
     )
     return text.strip()
 
 
-def _plain_text(node, *, wrap_math: bool = False) -> str:
+def _plain_text(node: Tag | NavigableString, *, wrap_math: bool = False) -> str:
     """遍历节点，提取纯文本。
 
     wrap_math=False（默认）：行内公式以裸 LaTeX 源码形式返回（如 \\theta、\\mathcal{Y}），
@@ -482,14 +533,20 @@ def _plain_text(node, *, wrap_math: bool = False) -> str:
         if wrap_math:
             return f"${sym}{{{inner}}}$"
         return f"{sym}{{{inner}}}"
-    if "ltx_note" in cls and "ltx_role_footnote" in cls:
+    if "ltx_note" in cls and ("ltx_role_footnote" in cls or "ltx_role_footnotemark" in cls):
+        # footnote / footnotemark 在纯文本中只保留上标标记；忽略 ltx_note_outer 中的
+        # 完整脚注内容，避免把脚注正文泄露到标题/作者/图注等位置。
         mark = node.find(class_="ltx_note_mark")
         mtxt = (mark.get_text() or "").strip() if mark else ""
         return f"[{mtxt}]" if mtxt else ""
-    return "".join(_plain_text(c, wrap_math=wrap_math) for c in node.children)
+    return "".join(
+        _plain_text(c, wrap_math=wrap_math)
+        for c in node.children
+        if isinstance(c, (Tag, NavigableString))
+    )
 
 
-def _plain_text_for_translation(node) -> str:
+def _plain_text_for_translation(node: Tag | NavigableString) -> str:
     """翻译专用纯文本：行内/行间公式包成 $...$ / $$...$$。
 
     与 _plain_text 的差异：所有 inline 公式以 $...$ 形式保留，让
@@ -528,7 +585,7 @@ def _plain_text_for_translation(node) -> str:
     #   "l$, the hidden state $\mathbf{h}_{l}$"            → 不匹配
     #   "area$_{X}$"        → 不匹配（area 超长）
     text = re.sub(
-        r"(?<![\\])\b([A-Za-z0-9_]{1,3})\$([\\_{}^][^$\n]+?)\$",
+        r"(?<!\\)\b([A-Za-z0-9_]{1,3})\$([\\_{}^][^$\n]+?)\$",
         r"$\1\2$",
         text,
     )
@@ -594,12 +651,12 @@ def parse_arxiv_html(
     #   - 本地图片模式：把 <img src>/<object data> 改写为本地相对路径；
     #   - 网络模式（img_mapping 为空）：把相对路径补全为完整网络 URL。
     # 否则表格单元格里的相对路径图片（如 2605.26158v1/x1.png）在渲染时无法加载。
-    def _norm_src(src: str) -> str:
-        if src in img_mapping:
-            return img_mapping[src]
-        if src.startswith("http"):
-            return src
-        return base_url.rstrip("/") + "/" + src.lstrip("/")
+    def _norm_src(url: str) -> str:
+        if img_mapping and url in img_mapping:
+            return img_mapping[url]
+        if url.startswith("http"):
+            return url
+        return base_url.rstrip("/") + "/" + url.lstrip("/")
 
     for img in soup.find_all("img"):
         src = img.get("src")
@@ -616,6 +673,72 @@ def parse_arxiv_html(
                             text=_plain_text(doc_title).strip(),
                             raw=_plain_text(doc_title).strip(),
                             meta={"html_id": _html_id_of(doc_title)}))
+
+    # 提取作者与机构信息。ar5iv 把作者列表放在 <div class="ltx_authors"> 中，
+    # 每位作者是 <span class="ltx_creator ltx_role_author">，内含 .ltx_personname
+    #（姓名，姓名后可能带 <sup> 脚注上标）和 .ltx_contact.ltx_role_affiliation
+    #（机构）；通讯作者 / 共同一作则通过 .ltx_contact.ltx_role_thanks 标出。
+    # 该节点位于标题与摘要之间，之前未提取导致输出 markdown 丢失全部作者信息。
+    # 注意：不输出"第几作者"序号——原始 HTML 不含此项，作者顺序由出现顺序体现，
+    # 姓名后的 <sup> 上标（脚注标记）则原样保留以贴近原文排版。
+    authors_div = soup.find(class_="ltx_authors")
+    if authors_div:
+        author_entries: list[str] = []
+        for creator in authors_div.find_all(class_="ltx_creator ltx_role_author"):
+            name_tag = creator.find(class_="ltx_personname")
+            name = _plain_text(name_tag).strip() if name_tag else ""
+            # _plain_text 会把脚注 mark 转成 [mark]（如 "Pengyuan Liu[2]"），
+            # 这里还原为 HTML 上标 <sup>mark</sup>，保留原始排版中的上标语义。
+            name = re.sub(r"\[([^\]]+)\]", r"<sup>\1</sup>", name)
+            if not name:
+                continue
+            aff = ""
+            roles: list[str] = []
+            # 一位作者可能同时带有 affiliation、thanks（通讯/共同一作）和 email。
+            # 这里逐条解析 ltx_contact，避免只识别 affiliation 而漏掉共同一作等信息。
+            for contact in creator.find_all(class_="ltx_contact"):
+                cls = " ".join(contact.get("class") or [])
+                contact_text = _plain_text(contact).strip()
+                # 去掉 ar5iv 加的前缀标签
+                contact_text = re.sub(
+                    r"^(Affiliation|Email|Thanks):\s*", "", contact_text, flags=re.IGNORECASE
+                )
+                if not contact_text:
+                    continue
+                if "ltx_role_affiliation" in cls:
+                    aff = contact_text
+                elif "ltx_role_thanks" in cls:
+                    # 通讯作者 / 共同一作 等身份说明通常放在 thanks 里。
+                    # 将长句压缩为简短角色标签，便于在同一行显示且不破坏 markdown。
+                    lowered = contact_text.lower()
+                    if re.search(r"corresponding", lowered):
+                        roles.append("Corresponding author")
+                    elif re.search(r"equal(ly)?|co[-\s]?first", lowered):
+                        roles.append("Equal contribution")
+                    else:
+                        roles.append(contact_text)
+                elif "ltx_role_email" in cls:
+                    roles.append(f"Email: {contact_text}")
+            # 组装：机构放最前，身份说明随后，姓名后的上标保留。例如：
+            #   Changliang Li (Beijing Language and Culture University, Corresponding author)
+            #   Pengyuan Liu<sup>2</sup> (MIT)
+            #   Alice Foo (MIT, Equal contribution)
+            parts: list[str] = []
+            if aff:
+                parts.append(aff)
+            parts.extend(roles)
+            suffix = f" ({', '.join(parts)})" if parts else ""
+            entry = f"{name}{suffix}"
+            author_entries.append(entry)
+        if author_entries:
+            # text 为兼容旧调用方的单行形式；meta["lines"] 为结构化列表，
+            # 供 pipeline 渲染为每行一个作者的格式。
+            authors_text = "; ".join(author_entries)
+            blocks.append(Block(kind="authors",
+                                text=authors_text,
+                                raw=authors_text,
+                                meta={"html_id": _html_id_of(authors_div),
+                                      "lines": author_entries}))
 
     abstract = soup.find(class_="ltx_abstract")
     if abstract:
@@ -636,6 +759,8 @@ def parse_arxiv_html(
                                 meta={"html_id": _html_id_of(keywords)}))
 
     content = soup.find("article") or soup.find(class_="ltx_page_content") or soup.body
+    if content is None:
+        return blocks, soup
     for sec in content.find_all(["section", "subsection", "subsubsection"],
                                 class_=re.compile(r"ltx_section|ltx_appendix"),
                                 recursive=False):
@@ -863,38 +988,38 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
             # figure、table、listing 通常直接挂在 ltx_paragraph 下。
             # 行为约束：paragraph / equation 必须保持文档顺序；
             # figure / table / listing 是块级结构元素也参与顺序维护。
-            TAG_KINDS = ("h4", "div", "p", "table", "figure")
+            tag_kinds = ("h4", "div", "p", "table", "figure")
 
-            def _emit(sub):
-                sub_cls = sub.get("class") or []
-                sub_cls_set = set(sub_cls)
-                if "ltx_p" in sub_cls_set:
-                    rich = _rich_text(sub)
-                    if rich:
+            def _emit(el):
+                el_cls = el.get("class") or []
+                el_cls_set = set(el_cls)
+                if "ltx_p" in el_cls_set:
+                    para_text = _rich_text(el)
+                    if para_text:
                         blocks.append(Block(
                             kind="paragraph",
-                            text=_plain_text_for_translation(sub),
-                            raw=rich,
-                            meta={"html_id": _html_id_of(sub)},
+                            text=_plain_text_for_translation(el),
+                            raw=para_text,
+                            meta={"html_id": _html_id_of(el)},
                         ))
                     return
-                if "ltx_title_paragraph" in sub_cls_set:
+                if "ltx_title_paragraph" in el_cls_set:
                     # 已在上方统一处理；此处忽略，避免重复。
                     return
-                if "ltx_equation" in sub_cls_set or "ltx_equationgroup" in sub_cls_set:
-                    _append_equation(sub, blocks)
+                if "ltx_equation" in el_cls_set or "ltx_equationgroup" in el_cls_set:
+                    _append_equation(el, blocks)
                     return
-                if "ltx_figure" in sub_cls_set:
-                    _append_figure(sub, blocks, img_mapping, base_url)
+                if "ltx_figure" in el_cls_set:
+                    _append_figure(el, blocks, img_mapping, base_url)
                     return
-                if "ltx_table" in sub_cls_set:
-                    _append_table(sub, blocks)
+                if "ltx_table" in el_cls_set:
+                    _append_table(el, blocks)
                     return
-                if "ltx_algorithm" in sub_cls_set or "ltx_listing" in sub_cls_set:
-                    _append_listing(sub, blocks)
+                if "ltx_algorithm" in el_cls_set or "ltx_listing" in el_cls_set:
+                    _append_listing(el, blocks)
                     return
-                if sub.name == "div" and ("ltx_logical-block" in sub_cls_set
-                                           or "ltx_para" in sub_cls_set):
+                if el.name == "div" and ("ltx_logical-block" in el_cls_set
+                                           or "ltx_para" in el_cls_set):
                     # 嵌套段落容器：把它的 paragraph / equation / figure / table
                     # 子元素按文档顺序追加到外层 block 列表（递归传递 transparent
                     # 包装容器 ltx_logical_block 与 ltx_para，使整张示意图保留）。
@@ -943,11 +1068,11 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
                                 if isinstance(c, Tag):
                                     _walk_transparent(c, depth + 1)
 
-                    _walk_transparent(sub, 0)
+                    _walk_transparent(el, 0)
                     return
                 # 其他标签（maketitle 残余等）：不展开，避免污染。
 
-            for sub in child.find_all(TAG_KINDS, recursive=False):
+            for sub in child.find_all(tag_kinds, recursive=False):
                 _emit(sub)
             continue
 
@@ -975,7 +1100,7 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
             continue
 
 
-def _append_equation(eq: Tag, blocks: list[Block], html_id: Optional[str] = None) -> None:
+def _append_equation(eq: Tag, blocks: list[Block], html_id: str | None = None) -> None:
     is_group = "ltx_equationgroup" in (eq.get("class") or [])
     tex = _collect_equationgroup_tex(eq) if is_group else _collect_equation_tex(eq)
     if not tex:
@@ -993,6 +1118,31 @@ def _append_equation(eq: Tag, blocks: list[Block], html_id: Optional[str] = None
 
 def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
                    base_url: str = "") -> None:
+    def _append_figure_caption_block(figure: Tag, out_blocks: list[Block]) -> None:
+        """查找 fig 的总 caption 并以 figure 块追加到 blocks（不进入翻译/大纲）。"""
+        outer_caption = figure.find("figcaption", class_="ltx_caption", recursive=False)
+        # 注意：find("figcaption", recursive=True) 也会匹配到子 panel 的 figcaption，
+        # 因此需要用 recursive=False 限定在 fig 的直接 figcaption。
+        if outer_caption is None:
+            # 兜底：可能外层 figcaption 不是 fig 直接子节点
+            all_caps = figure.find_all("figcaption", class_="ltx_caption", recursive=False)
+            outer_caption = all_caps[-1] if all_caps else None
+        if outer_caption is not None:
+            outer_text = _rich_text(outer_caption).strip()
+            if outer_text:
+                # 引用块语法 `> ...`，多行也用 `> ` 前缀
+                raw_cap = "\n".join(
+                    f"> {ln}" for ln in outer_text.split("\n") if ln.strip()
+                )
+                if raw_cap:
+                    # 使用 kind="figure" 而不是 heading/text：
+                    # 1) heading 会让 caption 进入 markdown 大纲被渲染为大标题，
+                    #    破坏文章结构；2) text 会让 LLM 翻译该图注英文；
+                    #    figure 类与子 panel caption 同流，直接走 raw 输出，
+                    #    不进翻译也不进大纲，仅作为图注说明显示。
+                    out_blocks.append(Block(kind="figure", text=outer_text, raw=raw_cap,
+                                            meta={"caption": outer_text}))
+
     # ar5iv 中"并列多图"结构：一个外层 <figure class="ltx_figure"> 包了一个
     # ltx_flex_figure 容器，内部并排放了多个 <figure class="ltx_figure_panel">，
     # 每个 panel 是独立的子图（含自己的 <img> + figcaption）。若直接对外层
@@ -1006,29 +1156,9 @@ def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
         # 破坏文章结构（类似 matplotlib 的 figure caption，应保持为说明性段落）。
         # 注意顺序：论文中图注通常在所有子图之后，因此先递归输出各 panel，
         # 最后再追加外层总 caption（否则会出现"图注在图片之前"的错位）。
-        outer_caption = fig.find("figcaption", class_="ltx_caption", recursive=False)
-        # 注意：find("figcaption", recursive=True) 也会匹配到子 panel 的 figcaption，
-        # 因此需要用 recursive=False 限定在 fig 的直接 figcaption。
-        if outer_caption is None:
-            # 兜底：可能外层 figcaption 不是 fig 直接子节点
-            all_caps = fig.find_all("figcaption", class_="ltx_caption", recursive=False)
-            outer_caption = all_caps[-1] if all_caps else None
         for panel in panels:
             _append_figure(panel, blocks, img_mapping, base_url)
-        if outer_caption is not None:
-            outer_text = _rich_text(outer_caption).strip()
-            if outer_text:
-                # 引用块语法 `> ...`，多行也用 `> ` 前缀
-                cap_lines = outer_text.split("\n")
-                raw_cap = "\n".join(f"> {ln}" for ln in cap_lines if ln.strip())
-                if raw_cap:
-                    # 使用 kind="figure" 而不是 heading/text：
-                    # 1) heading 会让 caption 进入 markdown 大纲被渲染为大标题，
-                    #    破坏文章结构；2) text 会让 LLM 翻译该图注英文；
-                    #    figure 类与子 panel caption 同流，直接走 raw 输出，
-                    #    不进翻译也不进大纲，仅作为图注说明显示。
-                    blocks.append(Block(kind="figure", text=outer_text, raw=raw_cap,
-                                        meta={"caption": outer_text}))
+        _append_figure_caption_block(fig, blocks)
         return
 
     # ar5iv 中"图网格"结构：<figure class="ltx_figure"> 直接包了一个 <table class="ltx_tabular">，
@@ -1079,6 +1209,8 @@ def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
             for img in flex_imgs:
                 size = _img_size(img)
                 src = _as_str(img.get("src"))
+                if not src:
+                    continue
                 if img_mapping:
                     render_src = img_mapping.get(src, src)
                 else:
@@ -1087,24 +1219,13 @@ def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
                                     raw=_html_img("figure", render_src, size),
                                     meta={"src": src, "local_src": render_src, "html_id": _html_id_of(fig)}))
             # 外层总 caption（"Figure 10: …"）以引用块形式追加，顺序在所有子图之后
-            outer_caption = fig.find("figcaption", class_="ltx_caption", recursive=False)
-            if outer_caption is None:
-                all_caps = fig.find_all("figcaption", class_="ltx_caption", recursive=False)
-                outer_caption = all_caps[-1] if all_caps else None
-            if outer_caption is not None:
-                outer_text = _rich_text(outer_caption).strip()
-                if outer_text:
-                    cap_lines = outer_text.split("\n")
-                    raw_cap = "\n".join(f"> {ln}" for ln in cap_lines if ln.strip())
-                    if raw_cap:
-                        blocks.append(Block(kind="figure", text=outer_text, raw=raw_cap,
-                                            meta={"caption": outer_text}))
+            _append_figure_caption_block(fig, blocks)
             return
 
     # ar5iv 对较大/矢量图（如阈值敏感性分析的 SVG）使用 <object data="*.svg"> 嵌入，
     # 而不是 <img src="*.png">。<object> 在浏览器中渲染正常但不在 fig.find("img") 范围内，
     # 必须同时兼容这两种资源嵌入方式，否则会产生"caption 在但图缺失"的现象。
-    src: Optional[str] = None
+    src: str | None = None
     img = fig.find("img")
     if img is not None:
         s = _as_str(img.get("src"))
@@ -1210,7 +1331,6 @@ def _append_listing(fig: Tag, blocks: list[Block]) -> None:
         raw_parts.append(f"> {cap_text_clean}")
     raw = "\n\n".join(raw_parts) if raw_parts else "(伪代码)"
 
-    caption_tag = fig.find("figcaption") or fig.find(class_="ltx_caption")
     blocks.append(Block(
         kind="listing",  # 独立类型，与 figure/table 区分
         text=cap_plain,
@@ -1224,7 +1344,7 @@ def _listing_line_text(tag: Tag) -> str:
     """将 listing 行内容转为保留 inline 数学公式的纯文本（不用 _rich_text 以避免 ** 等标记）。"""
     parts: list[str] = []
 
-    def walk(node):
+    def walk(node: Tag | NavigableString) -> None:
         if isinstance(node, NavigableString):
             parts.append(str(node))
             return
@@ -1247,7 +1367,8 @@ def _listing_line_text(tag: Tag) -> str:
         if "ltx_tag_listingline" in cls or node.name == "br":
             return
         for c in node.children:
-            walk(c)
+            if isinstance(c, (Tag, NavigableString)):
+                walk(c)
 
     walk(tag)
     text = "".join(parts)
@@ -1287,12 +1408,12 @@ def _collect_table_text(tbl: Tag) -> str:
     has_complex = False
     for cell in html_table.find_all(["td", "th"]):
         try:
-            cs = int(cell.get("colspan") or 1)
-        except ValueError:
+            cs = int(_as_str(cell.get("colspan")) or 1)
+        except (ValueError, TypeError):
             cs = 1
         try:
-            rs = int(cell.get("rowspan") or 1)
-        except ValueError:
+            rs = int(_as_str(cell.get("rowspan")) or 1)
+        except (ValueError, TypeError):
             rs = 1
         if cs > 1 or rs > 1:
             has_complex = True
@@ -1325,8 +1446,9 @@ def _collect_table_text(tbl: Tag) -> str:
         for deco_cls in ("ltx_transformed_outer", "ltx_transformed_inner"):
             for deco in html_table.find_all(class_=deco_cls):
                 if deco.has_attr("style"):
+                    style_val = _as_str(deco["style"]) or ""
                     cleaned = re.sub(
-                        r"transform\s*:\s*[^;\"]*;?", "", deco["style"], flags=re.IGNORECASE
+                        r"transform\s*:\s*[^;\"]*;?", "", style_val, flags=re.IGNORECASE
                     )
                     cleaned = re.sub(r"\s+;", ";", cleaned).strip()
                     if cleaned:
@@ -1345,11 +1467,10 @@ def _collect_table_text(tbl: Tag) -> str:
             row_cols = 0
             for c in tr.find_all(["td", "th"]):
                 try:
-                    row_cols += int(c.get("colspan") or 1)
-                except ValueError:
+                    row_cols += int(_as_str(c.get("colspan")) or 1)
+                except (ValueError, TypeError):
                     row_cols += 1
-            if row_cols > col_count:
-                col_count = row_cols
+            col_count = max(col_count, row_cols)
         if col_count >= 10:
             # 超宽表：把 table 自身改为 block 显示（脱离 inline-block 的拉宽行为）
             existing_style = html_table.get("style") or ""
@@ -1364,30 +1485,30 @@ def _collect_table_text(tbl: Tag) -> str:
 
     # ===== 后续是简单表格 markdown 路径（保持原行为）=====
 
-    def _cell_text(td: Tag) -> str:
-        rich = _rich_text(td)
+    def _cell_text(cell_node: Tag) -> str:
+        rich = _rich_text(cell_node)
         # 把行内换行折叠成单个 "\n"（_rich_text 已把相邻 \n 压成单个），
         # 然后再按行去除首尾空白后用 "<br>" 拼接 —— 这样表格 cell 里的
         # 多段对话（ar5iv 常用 <span class="ltx_p"> 模拟多行）能保留可读
         # 结构，不会被压成一行。原实现直接 replace("\n"," ") 会把同一
         # 个 cell 的所有对话挤成一段乱序文本，对 LLM 输入和最终渲染都不利。
-        lines = [ln.strip().replace("\xa0", " ") for ln in rich.split("\n")]
+        cell_lines = [ln.strip().replace("\xa0", " ") for ln in rich.split("\n")]
         # 过滤纯空行（不影响相邻 <br>）
-        text = "<br>".join(ln for ln in lines if ln)
-        text = text.replace("|", "\\|")
+        cell_text = "<br>".join(ln for ln in cell_lines if ln)
+        cell_text = cell_text.replace("|", "\\|")
         # 规范化：$...$ 与 **..** 之间必须有空格分隔，否则部分渲染器
         # （如 Typora / 部分 markdown → HTML 转换器）会把紧贴的 ** 误判为
-        # 数学公式内部符号（特别是 KaTeX/MathJax 的“^”或“…”)，导致列被吞掉。
+        # 数学公式内部符号（特别是 KaTeX/MathJax 的"^"或"…")，导致列被吞掉。
         # 同时压缩内部多余空格。
-        text = re.sub(r"\$([^$\n|]+?)\$\*\*", r"$ \1$ **", text)
-        text = re.sub(r"\*\*\$([^$\n|]+?)\$", r"** $ \1$", text)
-        text = re.sub(r"[ \t]{2,}", " ", text)
+        cell_text = re.sub(r"\$([^$\n|]+?)\$\*\*", r"$ \1$ **", cell_text)
+        cell_text = re.sub(r"\*\*\$([^$\n|]+?)\$", r"** $ \1$", cell_text)
+        cell_text = re.sub(r"[ \t]{2,}", " ", cell_text)
         # 把已配对的 **...** 转成 <strong>...</strong>（HTML bold）。
         # 这样在双层 header 用 <br> 拼接 cell 时，markdown ** 不会跨 <br>
         # 错误配对（GFM 表格 cell 完全支持 HTML 标签，且 KaTeX auto-render
         # 会扫描 <strong> 内部文本识别 $...$ 数学）。
-        text = re.sub(r"\*\*([^*\n|]+?)\*\*", r"<strong>\1</strong>", text)
-        return text
+        cell_text = re.sub(r"\*\*([^*\n|]+?)\*\*", r"<strong>\1</strong>", cell_text)
+        return cell_text
 
     # 第一遍：解析每行 cells + 标记表头 + 统计 max_cols（取所有非分组行中 colspan=1 cell 数最大值）
     raw_rows: list[tuple[list[tuple[str, int, int]], bool]] = []
@@ -1398,8 +1519,8 @@ def _collect_table_text(tbl: Tag) -> str:
         row: list[tuple[str, int, int]] = []
         for td in tr.find_all(["td", "th"]):
             text = _cell_text(td)
-            cs = max(int(td.get("colspan") or 1), 1)
-            rs = max(int(td.get("rowspan") or 1), 1)
+            cs = max(int(_as_str(td.get("colspan")) or 1), 1)
+            rs = max(int(_as_str(td.get("rowspan")) or 1), 1)
             row.append((text, cs, rs))
         if row:
             # 分组行识别：单 cell 且 colspan >= 2 （或者单 cell + 整组后续行用）
@@ -1421,7 +1542,6 @@ def _collect_table_text(tbl: Tag) -> str:
     #   3. 不含 `<td rowspan=大型>` 的长并行 cell。
     # 数据特征 = 短全大写字母缩写 + 数字 + '-' + 中等长度单 cell（method）
     _SHORT_ABBR = re.compile(r"^[A-Z]{2,5}$")
-    _SHORT_NUM_DASH = re.compile(r"^[0-9. -]+$")
 
     # ar5iv 大量表格根本没有 ltx_thead / ltx_row_header class，需要根据内容
     # 启发识别：若首行包含 "Dataset" / "Method" 这种常见表头标签，则视为 header。
@@ -1457,7 +1577,6 @@ def _collect_table_text(tbl: Tag) -> str:
             r0 = raw_rows[0][0]
             raw_rows[0] = (r0, True)
 
-    last_header_row = -1
     if raw_rows and raw_rows[0][1]:
         last_header_row = 0
         for ri in range(1, len(raw_rows)):
@@ -1472,15 +1591,13 @@ def _collect_table_text(tbl: Tag) -> str:
             # 单位（"s" "ms" 等除外）和时间戳/括号比例。
             def _is_metric_data(t: str) -> bool:
                 # 含时间后缀（"45.5s"）、括号比例（"(+16.3%)"）或纯数字主导 cell → 数据。
-                text = t.strip()
-                if not text:
+                s = t.strip()
+                if not s:
                     return False
                 # 纯数字 / 数字+括号比例 → 数据（如 "1.0" "45.5s" "52.9s (+16.3%)"）
-                if re.match(r"^\d[\d.,()+\-*\s]*$", text):
+                if re.match(r"^\d[\d.,()+\-*\s]*$", s):
                     return True
-                if re.search(r"\(\+\d", text):
-                    return True
-                return False
+                return bool(re.search(r"\(\+\d", s))
 
             looks_like_header = (
                 max_cols >= 4                     # 表格至少 4 列（避免窄表误识）
@@ -1653,9 +1770,9 @@ def _collect_table_text(tbl: Tag) -> str:
         for c in range(ncols):
             pieces = []
             for r in header_rows:
-                row = grid[r]
-                if c < len(row) and row[c].strip():
-                    pieces.append(row[c].strip())
+                hrow = grid[r]
+                if c < len(hrow) and hrow[c].strip():
+                    pieces.append(hrow[c].strip())
             # 拼接方式：如果只有一个非空，直接用；否则 <br> 堆叠
             if not pieces:
                 merged_header.append("")
@@ -1686,11 +1803,11 @@ def _collect_table_text(tbl: Tag) -> str:
     # 多余且对渲染毫无意义。这里智能剔除，最右优先（PDF 装饰 td 在尾）。
     # 安全：只在至少保留 2 列时剔除（避免单/双列表被删光，破坏数据）。
     if max_cols >= 3:
-        def _col_is_all_empty(c: int) -> bool:
-            if c < len(header_row) and header_row[c].strip():
+        def _col_is_all_empty(col_idx: int) -> bool:
+            if col_idx < len(header_row) and header_row[col_idx].strip():
                 return False
             for r in body_rows:
-                if c < len(r) and r[c].strip():
+                if col_idx < len(r) and r[col_idx].strip():
                     return False
             return True
 
@@ -1745,8 +1862,9 @@ def _collect_equation_tex(eq: Tag) -> str:
     """单行 equation：直接返回去除 \\displaystyle 并经 KaTeX 归一化后的 LaTeX。"""
     parts: list[str] = []
     for ann in eq.find_all("annotation", attrs={"encoding": "application/x-tex"}):
-        if ann.string:
-            parts.append(_normalize_tex_for_katex(_strip_displaystyle(ann.string.strip())))
+        ann_text = ann.string
+        if ann_text:
+            parts.append(_normalize_tex_for_katex(_strip_displaystyle(ann_text.strip())))
     return " ".join(parts)
 
 
@@ -1762,8 +1880,9 @@ def _collect_equationgroup_tex(eq: Tag) -> str:
                 continue
             cell_tex: list[str] = []
             for ann in td.find_all("annotation", attrs={"encoding": "application/x-tex"}):
-                if ann.string:
-                    cell_tex.append(_normalize_tex_for_katex(_strip_displaystyle(ann.string.strip())))
+                ann_text = ann.string
+                if ann_text:
+                    cell_tex.append(_normalize_tex_for_katex(_strip_displaystyle(ann_text.strip())))
             if cell_tex:
                 cells.append(" ".join(cell_tex))
         if cells:

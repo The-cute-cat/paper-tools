@@ -331,6 +331,20 @@ def _block_to_md(block: Block, translation: str, img_mapping: dict[str, str],
         # 标题强制换行，不需要 ⟦NEWPAR⟧ 标记，统一剥离以防模型误带（兼容半角 [NEWPAR]）。
         text = block.text if use_original else translation
         return f"# {_strip_trailing_punct(_NEWPAR_RE.sub('', text).strip())}\n"
+    if block.kind == "authors":
+        # 作者与机构：逐行列出，保留一作/二作的顺序与通讯作者标识（*）。
+        # 每行已含 "序号. 姓名 (机构) *" 结构，直接逐行输出即可。
+        lines = (block.meta or {}).get("lines")
+        if lines:
+            cleaned_lines = [_NEWPAR_RE.sub("", ln).strip() for ln in lines]
+            body = "\n".join(f"> {ln}" for ln in cleaned_lines if ln)
+            return f"> **Authors:**\n{body}\n"
+        # 兼容：无结构化行时退回单行形式
+        text = block.text if use_original else translation
+        cleaned = _NEWPAR_RE.sub("", text).strip()
+        if not cleaned:
+            return ""
+        return f"> **Authors:** {cleaned}\n"
     if block.kind == "heading":
         if use_original:
             trans = block.text
@@ -1505,6 +1519,9 @@ def run(url_or_id: str) -> Path:
             title_text = _NEWPAR_RE.sub("", trans or block.text).strip()
             # 标题已在文件头部统一输出，避免正文中重复出现
             continue
+        if block.kind == "authors":
+            # 作者信息已在 header 中统一输出，正文不再重复。
+            continue
         if block.kind in ("figure", "table", "listing"):
             if skip:
                 # 原文模式：直接输出 parser 解析好的原始结构（含原文 caption），
@@ -1568,9 +1585,29 @@ def run(url_or_id: str) -> Path:
         glossary.save(glossary_path)
         logger.info(f"术语表已保存: {glossary_path}（共 {len(glossary.terms)} 条）")
 
+    # 从 block 中拿作者信息，放在标题下方、原文链接之前。
+    # 使用 meta["lines"] 逐行输出，保留一作/二作顺序与通讯作者标记（*）。
+    authors_md = ""
+    for i, blk in enumerate(blocks):
+        if blk.kind == "authors":
+            lines = (blk.meta or {}).get("lines")
+            if lines:
+                trans_lines = []
+                for ln in lines:
+                    raw_or_trans = ln if skip else (translations.get(i) or ln)
+                    trans_lines.append(_NEWPAR_RE.sub("", raw_or_trans).strip())
+                body_lines = "\n".join(f"> {ln}" for ln in trans_lines if ln)
+                authors_md = f"> **Authors:**\n{body_lines}\n"
+            else:
+                raw_or_trans = blk.text if skip else (translations.get(i) or blk.text)
+                cleaned = _NEWPAR_RE.sub("", raw_or_trans).strip()
+                authors_md = f"> **Authors:** {cleaned}\n" if cleaned else ""
+            break
+
     header = (
         f"# {title_text}\n\n"
-        f"> 原文: https://arxiv.org/abs/{arxiv_id}\n"
+        + authors_md
+        + f"> 原文: https://arxiv.org/abs/{arxiv_id}\n"
         + (
             f"> 本文件为解析后的论文原文（translate_skip：未翻译），公式与结构保留。\n\n---\n\n"
             if skip else
