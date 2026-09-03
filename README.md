@@ -15,10 +15,14 @@
 
 ## 特性
 
-- **公式完整保护**：LaTeX 公式自动识别并用占位符保护，翻译后精确还原，不会出现公式被篡改或丢失
+- **公式完整保护**：LaTeX 公式自动识别并用占位符保护，翻译后精确还原，不会被篡改或丢失；同时公式原文作为「公式表」上下文随翻译单元一并发给 LLM，帮助模型理解公式语义、提升译文准确性（模型只回抄占位符，不回写 LaTeX）
 - **术语一致性**：自动构建术语表（Glossary），锁定全篇专有名词和自创方法名译法，消除前后不一致
 - **引用智能处理**：自动识别论文引用，生成可跳转的搜索引擎链接（支持 Google / Bing / DuckDuckGo / Semantic Scholar / arXiv）
 - **图表保留**：图片和表格结构完整保留，表格内容按单元格翻译
+- **文本框/提示框保留**：定理、备注、Prompt 示例等带边框文本框以引用块（`> `）形式保留，强调标记不丢失
+- **原文模式**：可跳过 LLM，仅解析并导出结构化英文原文（无需 API Key）
+- **断点续译**：异常退出后检测到翻译缓存可自动/手动恢复，避免从头重翻
+- **网络代理**：支持标准 CONNECT 代理与轻量 CORS 文本转发代理，适配受限网络访问 arxiv
 - **并发翻译**：支持多线程并发翻译，大幅提升速度
 - **一致性检查与返修**：翻译完成后自动检查译文质量，对违和词、术语不一致等自动返修
 - **中英排版优化**：自动在中英文、数字之间插入空格（pangu 风格），提升阅读体验
@@ -46,7 +50,7 @@
     │
     ▼
 并发翻译各内容块（按翻译单元调度，多线程）
-  ├─ 公式 → 占位符保护
+  ├─ 公式 → 占位符保护（原文作上下文发给 LLM 助其理解语义，仅回抄占位符）
   ├─ 文本 → 术语约束 + 立场锚定
   ├─ 表格 → 异步批量翻译
   └─ 短块合并 → JSON 分块翻译（合并组各子块独立回收）
@@ -129,7 +133,7 @@ python main.py arxiv-translate 2605.26158v1 --out ./my-output
 # 指定模型 / API Key（覆盖配置）
 python main.py arxiv-translate 2605.26158v1 --model deepseek-chat --api-key sk-xxx
 
-# 额外导出 docx / pdf（开发中，暂未启用）；--no-md 可只产出导出格式
+# 额外导出 docx / pdf（实验中 experimental）；--no-md 可只产出导出格式
 python main.py arxiv-translate 2605.26158v1 --export docx,pdf --no-md
 ```
 
@@ -137,7 +141,7 @@ python main.py arxiv-translate 2605.26158v1 --export docx,pdf --no-md
 - `<arxiv_id>.zh.md` — 中文翻译 Markdown
 - `<arxiv_id>.glossary.json` — 术语表（JSON 格式，可人工校对复用）
 - `<arxiv_id>.html` — 原始 HTML 备份
-- `<arxiv_id>.zh.html` / `<arxiv_id>.zh.docx` / `<arxiv_id>.zh.pdf` — 中文 HTML 及额外导出格式（受 `PAPER_TOOLS_EXPORT_FORMATS` 控制，开发中暂未启用）
+- `<arxiv_id>.zh.html` / `<arxiv_id>.zh.docx` / `<arxiv_id>.zh.pdf` — 中文 HTML 及额外导出格式（受 `PAPER_TOOLS_EXPORT_FORMATS` 控制，实验中 experimental）
 - `images/` — 图片目录（仅当 `PAPER_TOOLS_IMG_LOCAL=true`）
 
 ## 配置
@@ -154,14 +158,20 @@ python main.py arxiv-translate 2605.26158v1 --export docx,pdf --no-md
 | `PAPER_TOOLS_CONCURRENCY` | 并发翻译线程数（0/1=单线程） | `8` |
 | `PAPER_TOOLS_IMG_LOCAL` | 是否下载图片到本地 | `false` |
 | `PAPER_TOOLS_DL_RETRIES` | 图片等二进制下载失败时的重试次数 | `3` |
+| `PAPER_TOOLS_PROXY` | 下载代理（标准 CONNECT 隧道，支持图片等二进制下载），如 `http://127.0.0.1:7890`；留空直连 | 空 |
+| `PAPER_TOOLS_CORS_PROXY` | 轻量 CORS 文本转发代理（仅文本/HTML 下载，不支持二进制），如 `https://worker.dev/?url=` | 空 |
 | `PAPER_TOOLS_MERGE_MIN` | 翻译单元目标长度下限（字符，0=关闭合并） | `1000` |
 | `PAPER_TOOLS_MERGE_MAX` | 翻译单元目标长度上限（字符，0=不限制） | `1500` |
 | `PAPER_TOOLS_CITE_SEARCH` | 引用搜索引擎（google/bing/duckduckgo/semantic_scholar/arxiv） | `bing` |
 | `PAPER_TOOLS_CITE_DISPLAY` | 引用显示模式（short/title） | `short` |
 | `PAPER_TOOLS_NAME_MODE` | 输出文件命名方式（id/title/title_zh） | `id` |
 | `PAPER_TOOLS_TOKEN_REPORT` | 翻译结束后在日志输出 token 用量与费用估算（1/true 开启） | `false` |
-| `PAPER_TOOLS_EXPORT_FORMATS` | 额外导出格式（docx/pdf/docx_pdf/all，逗号分隔；开发中暂未启用） | 空 |
+| `PAPER_TOOLS_EXPORT_FORMATS` | 额外导出格式（docx/pdf/docx_pdf/all，逗号分隔；实验中 experimental） | 空 |
 | `PAPER_TOOLS_OUTPUT_MD` | 导出额外格式时是否仍输出 `.zh.md`（1/true 默认） | `true` |
+| `PAPER_TOOLS_SKIP_TRANSLATE` | 跳过翻译，仅解析并输出论文英文原文（1/true；开启后无需 API Key） | `false` |
+| `PAPER_TOOLS_INPUT` | 待翻译的 arxiv 链接或 ID（命令行/INPUT 常量未提供时的回退） | 空 |
+| `PAPER_TOOLS_SUMMARY_MAX_CHARS` | 立场摘要截断上限（字符，0=不截断） | `0` |
+| `PAPER_TOOLS_RESUME_MODE` | 断点续译模式：`ask`(终端询问) / `auto`(自动恢复) / `never`(从头重翻) | `ask` |
 
 > **价目表缓存**：Token 费用估算依赖 DeepSeek 官方定价。价目表不会写死在代码中，而是在首次使用时从官方定价页实时抓取，并缓存到 `paper_tools/core/pricing_cache.json`（默认 24 小时有效）。抓取失败时自动回退到最近一次成功缓存；若缓存与实时抓取均失败则报错提示。如需强制刷新价目表，删除该缓存文件后重新运行即可。
 
@@ -177,7 +187,10 @@ paper-tools/
 │   ├── logging_setup.py                 # 统一日志
 │   ├── core/                            # 可复用的核心模块
 │   │   ├── translator.py                #   LLM 翻译器（公式保护、术语约束、JSON 输出、token 统计）
-│   │   ├── downloader.py                #   通用下载（文本/二进制，带重试）
+│   │   ├── translator_prompts.yaml      #   翻译/检查 prompt 模板
+│   │   ├── downloader.py                #   通用下载（文本/二进制，带浏览器伪装头与代理）
+│   │   ├── exporter.py                  #   DOCX / PDF 导出（实验性）
+│   │   ├── math_render.py               #   公式渲染辅助
 │   │   ├── glossary.py                  #   术语表（翻译记忆）
 │   │   └── pricing.py                   #   DeepSeek 价目表动态获取与本地缓存
 │   └── tools/                           # 工具目录（每个子目录是一个独立工具）

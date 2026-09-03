@@ -19,6 +19,29 @@ from dotenv import load_dotenv
 # 项目根目录（pyproject.toml 所在目录）
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# 浏览器伪装请求头：arxiv 等站点会对明显的 bot UA（如 paper-tools/1.0）在 TLS
+# 握手阶段直接重置连接（WinError 10054）。使用真实浏览器的 UA 与配套头字段，
+# 让下载请求看起来像普通浏览器访问，避免被识别为爬虫而断连。
+BROWSER_HEADERS: dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,*/*;q=0.8"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+    # 只声明 gzip/deflate，避免服务器返回 brotli 时本机未装 brotli 解码库而报错
+    "Accept-Encoding": "gzip, deflate",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+}
+
 
 def _load_env() -> None:
     """加载 .env（若存在）。仅在首次调用时执行。"""
@@ -48,7 +71,21 @@ class AppSettings:
     # 下载相关
     download_timeout: int = 60
     download_max_retries: int = 3      # 二进制下载（图片等）失败重试次数
-    download_headers: dict = field(default_factory=lambda: {"User-Agent": "paper-tools/1.0"})
+    download_headers: dict = field(default_factory=lambda: dict(BROWSER_HEADERS))
+    # 下载代理（HTTP/HTTPS）：如 "http://127.0.0.1:7890"。
+    # 留空表示直连。部分网络对 arxiv.org 等域名在 TLS 握手阶段直接 RST（WinError 10054），
+    # 此时伪装请求头无法绕过，必须走代理/VPN 才能下载。requests 也兼容
+    # HTTP_PROXY/HTTPS_PROXY 环境变量，此处为显式可配置项。
+    download_proxy: str = ""
+    # 轻量 CORS 转发代理（?url= 改写模式），如
+    # "https://your-worker.workers.dev/?url="。仅用于**文本/HTML 下载**（abs 页 + 全文）。
+    # 该模式把目标 URL 拼到 ?url= 后直接请求代理域名，由代理服务端代为 fetch
+    # （部署在 Cloudflare 等可直连 arxiv 的网络侧），不经过 requests 的 CONNECT 隧道，
+    # 因此适用于不支持 CONNECT 隧道、但有服务侧出网能力的轻量代理。
+    # 注意：此类轻量代理通常只支持文本转发、**不支持二进制（图片）下载**，
+    # 因此图片等二进制下载仍走 download_proxy（标准 CONNECT 代理）。
+    # 留空表示文本下载也走 download_proxy / 直连。
+    cors_proxy: str = ""
     # 图片：False = 引用保持原网络 URL（不下载）；True = 下载到本地并改为本地相对路径
     image_local: bool = False
     # 翻译相关
@@ -119,6 +156,10 @@ class AppSettings:
             self.image_local = env.strip().lower() in ("1", "true", "yes", "on")
         if env := os.environ.get("PAPER_TOOLS_DL_RETRIES"):
             self.download_max_retries = int(env)
+        if env := os.environ.get("PAPER_TOOLS_PROXY"):
+            self.download_proxy = env.strip()
+        if env := os.environ.get("PAPER_TOOLS_CORS_PROXY"):
+            self.cors_proxy = env.strip()
         if env := os.environ.get("PAPER_TOOLS_CITE_SEARCH"):
             self.cite_search_engine = env.strip().lower()
         if env := os.environ.get("PAPER_TOOLS_CITE_DISPLAY"):

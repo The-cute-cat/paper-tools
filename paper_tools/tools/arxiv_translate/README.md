@@ -7,11 +7,15 @@
 ## 功能概览
 
 - 输入 arxiv 链接或 ID，自动下载 HTML 预览版
-- 解析论文结构：标题、章节、段落、公式、图表、列表、表格
-- 公式完整保护（LaTeX 占位符机制），翻译后精确还原
+- 解析论文结构：标题、章节、段落、公式、图表、列表、表格、引用、文本框/提示框
+- 公式完整保护（LaTeX 占位符机制）：翻译时公式以占位符保护不被改写，同时公式原文作为上下文发给 LLM 以理解语义、提升翻译准确性
 - 自动构建术语表，全文术语锁定，消除前后译法不一致
-- 引用智能处理：论文引用转为搜索引擎链接，方便查阅
+- 引用智能处理：论文引用转为搜索引擎链接（论文名作 hover 提示），方便查阅
+- 文本框/提示框保留：定理、备注、Prompt 示例等带边框文本框以引用块（`> `）形式保留，强调标记不丢失
 - 图表结构保留：表格按单元格翻译，图片可选本地下载
+- 原文模式：可跳过 LLM，仅解析并导出结构化英文原文（无需 API Key）
+- 断点续译：异常退出后自动/手动恢复已翻译内容，避免从头重翻
+- 网络代理：支持标准代理与轻量 CORS 文本转发代理，适配受限网络
 - 多线程并发翻译，默认 8 线程
 - 翻译后一致性检查与自动返修
 - 中英文排版自动修复（pangu spacing）
@@ -48,8 +52,9 @@ MERGE_MIN_CHARS = 1000    # 翻译单元目标长度下限（字符）：相邻�
                             # 以 JSON 分块翻译；设为 0 关闭合并。
 MERGE_TARGET_MAX = 1500    # 翻译单元目标长度上限（字符）：凑单元时累计达此值即关闭
                             # 当前单元；单块 ≥ 此值则独立成单元（不强行拆分）；设为 0 不限制。
-EXPORT_FORMATS = ""        # 额外导出格式（DOCX / PDF，开发中暂未启用），逗号分隔如 "docx,pdf"
+EXPORT_FORMATS = ""        # 额外导出格式（DOCX / PDF，实验中），逗号分隔如 "docx,pdf"
 OUTPUT_MARKDOWN = True     # 是否仍输出 .zh.md；导出额外格式时设为 False 可只产出导出格式
+TRANSLATE_SKIP = False     # 跳过翻译：True 时不调用 LLM，仅解析并输出论文英文原文（结构化原文 markdown）
 ```
 
 ## 工作流程
@@ -109,6 +114,8 @@ OUTPUT_MARKDOWN = True     # 是否仍输出 .zh.md；导出额外格式时设�
 ### 公式保护
 
 所有 LaTeX 公式（行内 `$...$` 和行间 `$$...$$`）在送入 LLM 前被替换为 `⟦MATH_n⟧` 占位符，翻译完成后再精确还原。同时兜底保护裸 LaTeX 命令（如 `\theta`, `\mathcal{Y}`）和指标变化表达式（如 `ASR↑`, `HDmax↓`），防止模型改写或注入乱码。
+
+**公式原文也作为上下文发给 LLM**：翻译单元会附带一张「公式表」（每项含 `id` / `latex` / `display`），仅作为输入上下文提供给模型，帮助它结合公式语义理解变量名、区分"上升/最大/最小化"等含义，从而让译文更符合数学本意。该表**仅用于辅助判断、不要求模型回写**——模型只需在译文中照抄对应的 `⟦MATH_<id>⟧` 占位符，最终由 `restore_math` 用公式表精确还原。这样既保住了公式不被篡改，又借助公式语义提升了翻译准确性。
 
 ### 术语表（Glossary）
 
@@ -173,6 +180,27 @@ OUTPUT_MARKDOWN = True     # 是否仍输出 .zh.md；导出额外格式时设�
 
 费用按 `缓存命中输入/1e6 × 命中单价 + 未命中输入/1e6 × 未命中单价 + 输出/1e6 × 输出单价` 计算。价目表不写死在代码里，由 `paper_tools/core/pricing.py` 在运行时从官方定价页动态抓取并本地缓存（`pricing_cache.json`，默认 24h 有效）；抓取失败时回退到最近一次缓存。
 
+### 原文模式（仅解析不翻译）
+
+开启 `PAPER_TOOLS_SKIP_TRANSLATE=1`（或 IDE 常量 `TRANSLATE_SKIP=True`）后，工具不调用 LLM，仅把 ar5iv HTML 解析为结构化 Markdown 并输出论文英文原文（文件名后缀 `.en.md`）。适用于只想拿到带公式/图表/引用链接的结构化原文、或排查解析问题的场景；此模式下无需配置 `DEEPSEEK_API_KEY`，也不生成术语表与 `.zh.html`。
+
+### 断点续译
+
+翻译过程中若异常退出，下次运行会检测到上次残留的翻译缓存。行为由 `PAPER_TOOLS_RESUME_MODE` 控制：
+
+- `ask`（默认）：在交互终端询问 恢复(r) / 重新翻译(n) / 退出(q)；
+- `auto`：自动恢复，跳过已翻译的块（适合 CI / 无交互环境）；
+- `never`：总是从头翻译（忽略缓存，启动即删除）。
+
+非交互终端（CI、重定向）下若设为 `ask` 会自动退化为 `auto`，避免卡死。
+
+### 网络代理
+
+部分网络对 arxiv.org 在 TLS 握手阶段直接 RST（伪装请求头无法绕过），需走代理：
+
+- `PAPER_TOOLS_PROXY`：标准 CONNECT 隧道代理（如 `http://127.0.0.1:7890`），文本与图片二进制下载都经它；也兼容 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量。
+- `PAPER_TOOLS_CORS_PROXY`：轻量 CORS 文本转发代理（如 `https://your-worker.dev/?url=`）。仅用于文本/HTML 下载（abs 页 + 全文），不支持二进制；图片下载仍走 `PAPER_TOOLS_PROXY`。适用于不支持 CONNECT 隧道但有服务侧出网能力的场景。
+
 ## 输出说明
 
 翻译完成后在 `output/<arxiv_id>/` 下生成：
@@ -233,14 +261,21 @@ Markdown 文件顶部包含论文标题、原文链接和翻译说明：
 |------|------|
 | `PAPER_TOOLS_CONCURRENCY` | 并发线程数，影响翻译速度 |
 | `PAPER_TOOLS_IMG_LOCAL` | 是否下载图片到本地 |
+| `PAPER_TOOLS_DL_RETRIES` | 图片等二进制下载失败时的重试次数 |
+| `PAPER_TOOLS_PROXY` | 下载代理（标准 CONNECT 隧道，支持二进制），如 `http://127.0.0.1:7890` |
+| `PAPER_TOOLS_CORS_PROXY` | 轻量 CORS 文本转发代理（仅文本/HTML 下载），如 `https://worker.dev/?url=` |
 | `PAPER_TOOLS_MERGE_MIN` | 翻译单元目标长度下限（字符，0=关闭） |
 | `PAPER_TOOLS_MERGE_MAX` | 翻译单元目标长度上限（字符，0=不限制） |
 | `PAPER_TOOLS_CITE_SEARCH` | 引用搜索引擎 |
 | `PAPER_TOOLS_CITE_DISPLAY` | 引用显示模式 |
 | `PAPER_TOOLS_NAME_MODE` | 输出文件命名方式（id/title/title_zh） |
 | `PAPER_TOOLS_TOKEN_REPORT` | 翻译后输出 token 用量与费用估算（1/true 开启） |
-| `PAPER_TOOLS_EXPORT_FORMATS` | 额外导出格式（docx/pdf/docx_pdf/all，开发中暂未启用） |
+| `PAPER_TOOLS_EXPORT_FORMATS` | 额外导出格式（docx/pdf/docx_pdf/all，实验中） |
 | `PAPER_TOOLS_OUTPUT_MD` | 导出额外格式时是否仍输出 `.zh.md` |
+| `PAPER_TOOLS_SKIP_TRANSLATE` | 跳过翻译，仅输出英文原文（1/true；开启后无需 API Key） |
+| `PAPER_TOOLS_INPUT` | 待翻译的 arxiv 链接或 ID（命令行/INPUT 未提供时回退） |
+| `PAPER_TOOLS_SUMMARY_MAX_CHARS` | 立场摘要截断上限（字符，0=不截断） |
+| `PAPER_TOOLS_RESUME_MODE` | 断点续译模式：ask / auto / never |
 
 完整配置列表见 [项目 README](../../../README.md#配置)。
 

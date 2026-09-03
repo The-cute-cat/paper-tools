@@ -207,8 +207,11 @@ def _resolve_html_url(arxiv_id: str) -> tuple[str, str]:
     base_id = re.sub(r"v\d+$", "", arxiv_id, flags=re.IGNORECASE)
     abs_url = f"https://arxiv.org/abs/{base_id}"
     try:
-        resp = requests.get(abs_url, timeout=get_settings().download_timeout,
-                            headers=get_settings().download_headers)
+        from ...core.downloader import _text_request
+        fetch_url, proxies = _text_request(abs_url)
+        resp = requests.get(fetch_url, timeout=get_settings().download_timeout,
+                            headers=get_settings().download_headers,
+                            proxies=proxies)
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         # abs 页 ACCESS PAPER 区域通常有 "HTML (experimental)" 链接指向 /html/<id>vN
@@ -320,6 +323,21 @@ def _strip_trailing_punct(text: str) -> str:
     return text.rstrip(".。")
 
 
+def _escape_md_atx_headings(md: str) -> str:
+    """转义 markdown 行首的 ATX 标题标记（# ~ ######），避免正文 / 提示词模板里
+    字面以 "#..." 开头的行（如附录 A 的 "## Given Question"）被误渲染成标题。
+
+    真正的章节标题由 heading/title 分支生成（其 # 前缀是程序加的，不经过此函数）。
+    已带反斜杠转义的（"\\#\\# ..."）不会重复转义。
+    """
+    out: list[str] = []
+    for ln in md.split("\n"):
+        if re.match(r"^#{1,6}(\s|$)", ln):
+            ln = "\\" + ln
+        out.append(ln)
+    return "\n".join(out)
+
+
 def _block_to_md(block: Block, translation: str, img_mapping: dict[str, str],
                  use_original: bool = False) -> str:
     """把单个块渲染为 markdown。
@@ -364,41 +382,56 @@ def _block_to_md(block: Block, translation: str, img_mapping: dict[str, str],
         # ar5iv 把带边框的"图片化文本框"（如 Prompt 示例框）渲染成 SVG，
         # 但 svg 内嵌的 <span class="ltx_p"> 仍保留真实文本。parser 阶段
         # 把所有段落合并成 kind=text_box 的 Block，原文 raw 已是 "> ..." 引用块
-        # 模板。这里把译文按行拆分，逐行加 "> " 前缀（仅 1 层），最终 markdown
+        # 模板（保留 **粗体** 等强调）。
+        # 原文模式(use_original)直接输出 rich 引用块 block.raw，不再从纯文本
+        # block.text 重新拼装，避免提示词框内的强调（如 MUST/Do NOT）丢失。
+        if use_original and block.raw and block.raw.strip():
+            return _escape_md_atx_headings(block.raw + "\n")
+        # 译文模式：把译文按行拆分，逐行加 "> " 前缀（仅 1 层），最终 markdown
         # 渲染是一个引用块；多余空行也保留 "> " 占位，避免破坏块结构。
         # 同时清除可能混入的 ⟦NEWPAR⟧ 标记（text_box 已按原文固定段落拆分渲染）。
-        text = block.text if use_original else translation
+        text = translation
         lines = _split_text_box_lines(_NEWPAR_RE.sub("", text).strip())
-        return "\n".join(f"> {ln}" if ln else "> " for ln in lines) + "\n"
+        return _escape_md_atx_headings("\n".join(f"> {ln}" if ln else "> " for ln in lines) + "\n")
     if block.kind == "list_item":
         # 列表项严格保持单段渲染：一个块 = 一条 list_item，
         # 即便译文里残留了 ⟦NEWPAR⟧ 标记（不该出现，兜底清洗），也不应拆段。
         # 强制 strip 防止模型混入标记破坏 markdown 列表结构。
-        text = block.text if use_original else translation
+        # 原文模式(use_original)用富文本 block.raw（保留 **粗体**/链接），
+        # 并去掉 parser 加的 "- " 前缀以维持既有的"非项目符号"渲染（避免改坏已审结构）。
+        if use_original:
+            raw = block.raw or ""
+            text = raw[2:].lstrip() if raw.startswith("- ") else raw
+        else:
+            text = translation
         cleaned = _NEWPAR_RE.sub("", text).strip()
-        return f"{cleaned}\n"
+        return _escape_md_atx_headings(f"{cleaned}\n")
     if block.kind == "paragraph":
         # LLM 段尾标记 ⟦NEWPAR⟧：一个翻译单元可能含多块，模型把"段尾"
         # 加标记、"段内连续"不加。我们按标记拆分，每段独立成段；
         # 拆出 1 段时与原行为兼容（仍是单段 + 末尾换行）。
-        text = block.text if use_original else translation
+        # 原文模式(use_original)直接输出富文本 block.raw（保留 **粗体**/*斜体*/[链接]/$公式$），
+        # 而非翻译器专用纯文本 block.text，避免正文强调与超链接在原文中丢失。
+        text = block.raw if use_original else translation
         pieces = [p for p in _split_at_newpar(text) if p.strip()]
         if not pieces:
             # 兜底：translation 为空（罕见：模型偶发返回空）→ 用原文块内容，
             # 至少保留段落存在、不至于让该段在 markdown 中消失。
+            if use_original and (block.raw or "").strip():
+                return _escape_md_atx_headings(f"{block.raw.strip()}\n")
             if block.text and block.text.strip():
-                return f"{block.text.strip()}\n"
-            return f"{text.strip()}\n"
+                return _escape_md_atx_headings(f"{block.text.strip()}\n")
+            return _escape_md_atx_headings(f"{text.strip()}\n")
         if len(pieces) == 1:
-            return f"{pieces[0]}\n"
+            return _escape_md_atx_headings(f"{pieces[0]}\n")
         # 多段：段之间用空行分隔，末尾单换行（避免与下一块产生双空行）
-        return "\n\n".join(pieces) + "\n"
+        return _escape_md_atx_headings("\n\n".join(pieces) + "\n")
     if block.kind in ("equation", "figure", "table", "listing"):
         raw = block.raw
         for orig, local in img_mapping.items():
             raw = raw.replace(orig, local)
-        return f"{raw}\n"
-    return f"{block.text if use_original else translation}\n"
+        return _escape_md_atx_headings(f"{raw}\n")
+    return _escape_md_atx_headings(f"{block.text if use_original else translation}\n")
 
 
 # 标题翻译合理性判定：返回 True 表示当前 translation 适合作为标题。

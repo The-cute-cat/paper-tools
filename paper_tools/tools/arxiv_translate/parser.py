@@ -449,7 +449,7 @@ def _rich_text(tag: Tag) -> str:
                 _walk_child(c)
             parts.append("\n")
             return
-        if "ltx_emph" in cls or name in ("em", "i"):
+        if "ltx_emph" in cls or "ltx_font_italic" in cls or name in ("em", "i"):
             parts.append("*")
             for c in node.children:
                 _walk_child(c)
@@ -490,6 +490,15 @@ def _rich_text(tag: Tag) -> str:
         r"\*\*([A-Za-z0-9_]{1,3})\*\*\$([\\_{}^][^$\n]+?)\$",
         r"**$\1\2$**",
         text,
+    )
+    # 转义行首的 Markdown ATX 标题标记（# ~ ######），避免正文 / 提示词模板里
+    # 字面以 "#..." 开头的行（如附录 A 的 "## Given Question"）被误渲染成标题。
+    # 实际章节标题由 heading 分支手动加 # 生成，不经过 _rich_text，因此此处
+    # 转义不会影响真正的标题。
+    text = "\n".join(
+        re.sub(r"^(#{1,6})(\s|$)", r"\\\1\2", ln) if re.match(r"^#{1,6}(\s|$)", ln)
+        else ln
+        for ln in text.split("\n")
     )
     return text.strip()
 
@@ -1116,6 +1125,67 @@ def _append_equation(eq: Tag, blocks: list[Block], html_id: str | None = None) -
                         meta={"label": lbl, "html_id": html_id} if html_id else {"label": lbl}))
 
 
+def _figure_body_to_markdown(fig: Tag) -> str:
+    """把不含 img/object 的纯文本 figure 主体（不含 figcaption）转成 markdown。
+
+    ar5iv 中常见「文本框」figure，例如 JSP prompt（Figure 2）：整个图是一个带边框的
+    段落 + 枚举列表，没有图片资源。如果按普通 figure 处理，只会留下 caption，导致
+    主体内容完全丢失。该函数把内部 ltx_p/ltx_enumerate 转成 markdown 段落/列表，
+    保留其可读文本。
+    """
+    parts: list[str] = []
+
+    def _is_block(tag: Tag) -> bool:
+        cls = tag.get("class") or []
+        return "ltx_p" in cls or tag.name == "p" or "ltx_enumerate" in cls
+
+    def _emit_paragraph(tag: Tag) -> None:
+        text = _rich_text(tag).strip()
+        if text:
+            parts.append(text)
+
+    def _emit_enumerate(enum: Tag) -> None:
+        for sub in enum.children:
+            if not isinstance(sub, Tag) or "ltx_item" not in (sub.get("class") or []):
+                continue
+            tag_el = sub.find(class_="ltx_tag_item", recursive=False)
+            marker = _rich_text(tag_el).strip() if tag_el else "-"
+            para = sub.find(class_="ltx_p", recursive=True)
+            content = _rich_text(para).strip() if para else _rich_text(sub).strip()
+            if content.startswith(marker):
+                content = content[len(marker):].strip()
+            parts.append(f"{marker} {content}")
+
+    def walk(node: Tag) -> None:
+        cls = node.get("class") or []
+        if "ltx_caption" in cls:
+            return
+        if "ltx_enumerate" in cls:
+            _emit_enumerate(node)
+            return
+        if "ltx_p" in cls or node.name == "p":
+            # 段落节点若内部还嵌套段落/列表，则继续递归到最内层块，避免把整段
+            # 文字和列表拼成一锅粥。
+            for desc in node.descendants:
+                if isinstance(desc, Tag) and _is_block(desc) and desc is not node:
+                    for child in node.children:
+                        if isinstance(child, Tag):
+                            walk(child)
+                    return
+            _emit_paragraph(node)
+            return
+        # 其它容器继续递归
+        for child in node.children:
+            if isinstance(child, Tag):
+                walk(child)
+
+    for child in fig.children:
+        if isinstance(child, Tag):
+            walk(child)
+
+    return "\n\n".join(parts).strip()
+
+
 def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
                    base_url: str = "") -> None:
     def _append_figure_caption_block(figure: Tag, out_blocks: list[Block]) -> None:
@@ -1238,6 +1308,24 @@ def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
             if s:
                 src = s
     if not src:
+        # 不是图片/OBJECT 资源，可能是「纯文本 figure」（如带边框的提示词模板、
+        # 算法伪代码文字框）。此时把主体文本转成 markdown，避免只剩 caption。
+        body_md = _figure_body_to_markdown(fig)
+        if body_md.strip():
+            raw = body_md
+            if cap_text := fig.find(class_="ltx_caption"):
+                cap_text = _rich_text(cap_text).replace("\n", " ").strip()
+            else:
+                cap_text = ""
+            if cap_text:
+                raw += f"\n\n> {cap_text}"
+            # text 字段包含 body + caption，便于若该 figure 参与翻译时也能被处理
+            text = _plain_text(fig)
+            blocks.append(Block(kind="figure", text=text,
+                                raw=raw,
+                                meta={"src": None, "local_src": None, "caption": cap_text,
+                                      "html_id": _html_id_of(fig)}))
+            return
         render_src = None
     elif img_mapping:
         # 本地模式：优先用已下载的本地相对路径
