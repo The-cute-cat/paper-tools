@@ -28,63 +28,63 @@ def main() -> None:
     logger.info("arxiv 论文翻译工具启动")
 
     # ===== 在这里填写参数 =====
-    INPUT = ""  # arxiv 链接或 ID，例如 "https://arxiv.org/abs/2605.26158v1" 或 "2605.26158v1"
-    API_KEY = ""            # 留空则用 .env / 环境变量里的 DEEPSEEK_API_KEY
-    MODEL = ""              # 留空则用配置里的默认模型（deepseek-v4-flash）
-    OUT_DIR = ""            # 留空则用配置里的默认输出目录（项目根/output）
+    input_ = ""  # arxiv 链接或 ID，例如 "https://arxiv.org/abs/2605.26158v1" 或 "2605.26158v1"
+    api_key = ""            # 留空则用 .env / 环境变量里的 DEEPSEEK_API_KEY
+    model = ""              # 留空则用配置里的默认模型（deepseek-v4-flash）
+    out_dir = ""            # 留空则用配置里的默认输出目录（项目根/output）
     # 引用搜索引擎：google | bing | duckduckgo | semantic_scholar | arxiv（默认 bing，国内可访问）
-    CITE_SEARCH = "bing"
+    cite_search = "bing"
     # 引用显示模式：short = 只显示作者年份（论文名靠 hover 提示，短链不占行宽）
     #              title = 显示作者年份 + 完整论文名（信息全但占行宽）
-    CITE_DISPLAY = "short"
+    cite_display = "short"
     # 图片本地模式：True = 下载图片到本地并改用本地相对路径；False = 引用保持原网络 URL（不下载）
-    IMAGE_LOCAL = False
+    image_local = False
     # 翻译单元目标长度下限（按纯文本字符数）：相邻同类文本块（段落/列表项/文本框）
-    # 会被贪心凑成长度在 [MERGE_MIN_CHARS, MERGE_TARGET_MAX] 区间的翻译单元，一起
+    # 会被贪心凑成长度在 [merge_min_chars, merge_target_max] 区间的翻译单元，一起
     # 以 JSON 分块翻译，减少碎片、保持上下文连贯。设为 0 关闭合并。
-    MERGE_MIN_CHARS = 1000
+    merge_min_chars = 1000
     # 翻译单元目标长度上限（字符）：凑单元时累计长度达到该值即关闭当前单元；
     # 单块长度 ≥ 该值时独立成单元（不强行拆分）。设为 0 表示不限制上限。
-    MERGE_TARGET_MAX = 1500
+    merge_target_max = 1500
     # 额外导出格式：DOCX / PDF 导出功能尚未开发完毕，暂时禁用，固定为空。
-    EXPORT_FORMATS = ""
+    export_formats = ""
     # 是否仍输出 .zh.md：True 默认（始终输出 markdown）。
-    OUTPUT_MARKDOWN = True
+    output_markdown = True
     # 跳过翻译：True 时不调用 LLM，仅解析并输出论文英文原文（结构化原文 markdown）。
-    TRANSLATE_SKIP = False
+    translate_skip = False
 
     # ===== 参数生效 =====
-    if API_KEY:
-        settings.llm.api_key = API_KEY
-    if MODEL:
-        settings.llm.model = MODEL
-    if OUT_DIR:
-        settings.output_dir = Path(OUT_DIR)
-    if CITE_SEARCH:
-        settings.cite_search_engine = CITE_SEARCH.lower()
-    if CITE_DISPLAY:
-        settings.cite_display_mode = CITE_DISPLAY.lower()
-    if str(IMAGE_LOCAL).strip().lower() in ("1", "true", "yes", "on"):
+    if api_key:
+        settings.llm.api_key = api_key
+    if model:
+        settings.llm.model = model
+    if out_dir:
+        settings.output_dir = Path(out_dir)
+    if cite_search:
+        settings.cite_search_engine = cite_search.lower()
+    if cite_display:
+        settings.cite_display_mode = cite_display.lower()
+    if str(image_local).strip().lower() in ("1", "true", "yes", "on"):
         settings.image_local = True
-    if MERGE_MIN_CHARS:
-        settings.merge_min_chars = int(MERGE_MIN_CHARS)
-    if MERGE_TARGET_MAX:
-        settings.merge_target_max = int(MERGE_TARGET_MAX)
-    if EXPORT_FORMATS:
-        settings.export_formats = EXPORT_FORMATS.strip().lower()
-    if str(OUTPUT_MARKDOWN).strip().lower() in ("0", "false", "no", "off"):
+    if merge_min_chars:
+        settings.merge_min_chars = int(merge_min_chars)
+    if merge_target_max:
+        settings.merge_target_max = int(merge_target_max)
+    if export_formats:
+        settings.export_formats = export_formats.strip().lower()
+    if str(output_markdown).strip().lower() in ("0", "false", "no", "off"):
         settings.output_markdown = False
-    if str(TRANSLATE_SKIP).strip().lower() in ("1", "true", "yes", "on"):
+    if str(translate_skip).strip().lower() in ("1", "true", "yes", "on"):
         settings.translate_skip = True
 
     # 待翻译论文：优先用 main.py 的 INPUT 常量；若为空则回退到 .env 的 PAPER_TOOLS_INPUT
-    input_arg = INPUT if INPUT else settings.arxiv_input
+    input_arg = input_ if input_ else settings.arxiv_input
     if not input_arg:
         logger.error("未指定待翻译论文：请在 main.py 的 INPUT 常量填写，或在 .env 设置 PAPER_TOOLS_INPUT。")
         sys.exit(1)
 
     if not settings.translate_skip and not settings.llm.api_key:
-        logger.error("未配置 API key：请在 .env 设置 DEEPSEEK_API_KEY，或在下方 API_KEY 常量中填写。")
+        logger.error("未配置 API key：请在 .env 设置 DEEPSEEK_API_KEY，或在下方 api_key 常量中填写。")
         sys.exit(1)
 
     out = run(input_arg)

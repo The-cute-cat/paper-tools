@@ -17,6 +17,7 @@ uv.toml
 temp/
 output/
 .pytest_cache/
+tests/
 
 # 本地配置（含密钥，勿提交）
 .env

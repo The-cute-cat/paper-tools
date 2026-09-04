@@ -513,6 +513,8 @@ class LLMTranslator:
         if getattr(resp, "usage", None) is not None:
             self.usage.add(TokenUsage.from_response(resp.usage))
         raw = (resp.choices[0].message.content or "").strip()
+        if resp.choices[0].finish_reason != "stop":
+            raise ValueError(f"翻译响应未完整结束: {resp.choices[0].finish_reason}")
         translation, terms = self._parse_json(raw)
         # 还原公式 + 后处理：修复 LLM 自行生成的裸 LaTeX 残骸
         translation = self.restore_math(translation, formula_table, references)

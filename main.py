@@ -6,6 +6,7 @@
 
 可用工具：
     arxiv-translate   下载 arxiv HTML 论文并翻译为中文 markdown
+    pdf-translate     本地 PDF 逐页视觉提取并翻译为中文 markdown
 
 环境变量（在 .env 或系统中配置，详见 README）：
     DEEPSEEK_API_KEY      必填，DeepSeek API key
@@ -42,6 +43,15 @@ def build_parser() -> argparse.ArgumentParser:
                    help="额外导出格式：docx、pdf、docx_pdf、all（逗号分隔，如 --export docx,pdf）")
     p.add_argument("--no-md", action="store_true",
                    help="不输出 .zh.md，仅导出 docx/pdf（默认两种都输出）")
+    p = sub.add_parser("pdf-translate", help="逐页识别本地 PDF 论文并翻译为中文 Markdown")
+    p.add_argument("input", help="本地 PDF 文件路径")
+    p.add_argument("--out", default=None, help="输出根目录")
+    p.add_argument("--model", default=None, help="翻译模型")
+    p.add_argument("--vision-model", default=None, help="识图模型")
+    p.add_argument("--api-key", default=None, help="DeepSeek API key")
+    p.add_argument("--dpi", type=int, default=None, help="页面渲染 DPI（72-300）")
+    p.add_argument("--extract-only", action="store_true", help="仅执行识图提取（仍调用 API）")
+    p.add_argument("--no-resume", action="store_true", help="不复用逐页识别缓存")
     return parser
 
 
@@ -65,6 +75,24 @@ def main(argv: list[str] | None = None) -> None:
     logger = setup_logging(settings.log_level)
 
     try:
+        if args.command == "pdf-translate":
+            from pathlib import Path
+            from paper_tools.tools.pdf_translate import run
+
+            if args.out:
+                settings.output_dir = Path(args.out)
+            if args.model:
+                settings.llm.model = args.model
+            if args.api_key:
+                settings.llm.api_key = args.api_key
+            if args.vision_model:
+                settings.pdf_vision_model = args.vision_model
+            if args.dpi is not None:
+                settings.pdf_dpi = args.dpi
+            out = run(args.input, settings=settings,
+                      extract_only=args.extract_only or settings.translate_skip,
+                      resume=not args.no_resume)
+            logger.info(f"结果文件: {out}")
         if args.command == "arxiv-translate":
             out = arxiv_translate.run(args.input)
             logger.info(f"结果文件: {out}")

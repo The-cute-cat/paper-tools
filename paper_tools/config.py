@@ -136,6 +136,8 @@ class AppSettings:
     #   auto  = 自动恢复（无交互环境或 CI 下默认沿用缓存，跳过已翻译块）
     #   never = 总是从头翻译（忽略缓存，启动即删除）
     resume_mode: str = "ask"
+    pdf_vision_model: str = "deepseek-v4-flash-vision-exp"
+    pdf_dpi: int = 160
 
     def resolve(self) -> "AppSettings":
         """用环境变量/默认值补全缺失字段。"""
@@ -146,6 +148,10 @@ class AppSettings:
             self.llm.model = env
         if env := os.environ.get("DEEPSEEK_BASE_URL"):
             self.llm.base_url = env
+        if env := os.environ.get("DEEPSEEK_VISION_MODEL"):
+            self.pdf_vision_model = env.strip()
+        if env := os.environ.get("PAPER_TOOLS_PDF_DPI"):
+            self.pdf_dpi = int(env)
         if env := os.environ.get("PAPER_TOOLS_OUTPUT"):
             self.output_dir = Path(env)
         if env := os.environ.get("PAPER_TOOLS_LOG_LEVEL"):

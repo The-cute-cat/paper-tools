@@ -10,6 +10,7 @@
 | 工具 | 说明 |
 |------|------|
 | [arxiv-translate](./paper_tools/tools/arxiv_translate/README.md) | 下载 arxiv HTML 论文，解析公式/图表/引用，调用 DeepSeek 翻译为中文 Markdown |
+| [pdf-translate](./paper_tools/tools/pdf_translate/README.md) | 本地 PDF 逐页视觉提取、跨页续接，再翻译为中文 Markdown |
 
 > 更多工具正在规划中，欢迎 [贡献](#贡献) 或提交 issue。
 
@@ -228,3 +229,16 @@ p.add_argument("input")
 ## License
 
 MIT
+## 本地 PDF 论文翻译
+
+新增 `pdf-translate`：先逐页识图生成原文 Markdown，再复用现有翻译器生成中文 Markdown。
+
+```bash
+uv sync
+uv run python main.py pdf-translate "D:/papers/paper.pdf"
+uv run python main.py pdf-translate "D:/papers/paper.pdf" --extract-only
+```
+
+需要配置 `DEEPSEEK_API_KEY`，**仅提取也会调用收费视觉 API**，页面及插图将发送至配置的 DeepSeek 服务。
+支持 `--out`、`--model`、`--vision-model`、`--dpi` 和 `--no-resume`。
+详见 [PDF 工具说明](paper_tools/tools/pdf_translate/README.md)。

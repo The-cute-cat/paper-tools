@@ -243,6 +243,9 @@ def _normalize_tex_for_katex(tex: str) -> str:
       3. \\textsc{...}
             小型大写字母（small caps）。KaTeX 不支持 \\textsc。→ 改写为 \\text{...}
             保留括号内文字内容（语义需要，不能丢字），仅去掉"小型大写"样式。
+      4. \\vskip<dimen>
+            ar5iv 在 aligned/math 环境中插入的垂直间距（如 \\vskip-5.69054pt）。
+            KaTeX 不支持该 TeX 原语。→ 直接删除，不影响公式语义。
 
     注意：本函数只处理 KaTeX 明确不支持的「安全改写」项。遇到未知命令时一律
     原样保留（见循环末尾的 out.append），以保证原文信息不丢失——宁可让 KaTeX
@@ -282,6 +285,13 @@ def _normalize_tex_for_katex(tex: str) -> str:
         # 注意：必须让 j 跳过 "\textsc" 全部字符后，再指向 '{' 由
         # _read_balanced_group 读取内容；若误写成 len(r"\textsc{") 会多吞一个
         # 字符导致读不到 '{'，从而整条规则失效（这一 bug 曾导致本问题复发）。
+        # —— 清单项 4：剥离 aligned/math 中的 \vskip<dimen> ——
+        # ar5iv 会在公式行内注入垂直间距（如 \vskip-5.69054pt），KaTeX 不支持。
+        if tex.startswith(r"\vskip", i):
+            m = re.match(r"\\vskip\s*[-+]?\d+(?:\.\d+)?[a-zA-Z]{1,3}\b", tex[i:])
+            if m:
+                i += len(m.group(0))
+                continue
         if tex.startswith(r"\textsc{", i):
             j = i + len(r"\textsc")  # 指向紧随其后的 '{'
             inner, j = _read_balanced_group(tex, j)
@@ -1024,7 +1034,7 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
                 if "ltx_table" in el_cls_set:
                     _append_table(el, blocks)
                     return
-                if "ltx_algorithm" in el_cls_set or "ltx_listing" in el_cls_set:
+                if any(c in el_cls_set for c in ("ltx_algorithm", "ltx_listing", "ltx_float_algorithm")):
                     _append_listing(el, blocks)
                     return
                 if el.name == "div" and ("ltx_logical-block" in el_cls_set
@@ -1103,8 +1113,8 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
             _append_table(child, blocks)
             continue
 
-        # 伪代码 / 算法块（ltx_algorithm + ltx_listing）
-        if "ltx_algorithm" in cls or "ltx_listing" in cls:
+        # 伪代码 / 算法块（ltx_algorithm + ltx_listing + ltx_float_algorithm）
+        if "ltx_algorithm" in cls or "ltx_listing" in cls or "ltx_float_algorithm" in cls:
             _append_listing(child, blocks)
             continue
 
@@ -1125,6 +1135,43 @@ def _append_equation(eq: Tag, blocks: list[Block], html_id: str | None = None) -
                         meta={"label": lbl, "html_id": html_id} if html_id else {"label": lbl}))
 
 
+def _unescape_verbatim(text: str) -> str:
+    """还原 ar5iv <pre class="ltx_verbatim"> 中的反斜杠转义。
+
+    LaTeXML 会把 verbatim 中的换行/引号/反斜杠输出为 \\n、\\"、\\\\ 等。
+    这里只处理常见安全转义，避免误伤原始反斜杠或触发 codecs 的二次编码问题。
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt == "n":
+                out.append("\n")
+                i += 2
+                continue
+            if nxt == "t":
+                out.append("\t")
+                i += 2
+                continue
+            if nxt == '"':
+                out.append('"')
+                i += 2
+                continue
+            if nxt == "'":
+                out.append("'")
+                i += 2
+                continue
+            if nxt == "\\":
+                out.append("\\")
+                i += 2
+                continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
 def _figure_body_to_markdown(fig: Tag) -> str:
     """把不含 img/object 的纯文本 figure 主体（不含 figcaption）转成 markdown。
 
@@ -1137,7 +1184,8 @@ def _figure_body_to_markdown(fig: Tag) -> str:
 
     def _is_block(tag: Tag) -> bool:
         cls = tag.get("class") or []
-        return "ltx_p" in cls or tag.name == "p" or "ltx_enumerate" in cls
+        return ("ltx_p" in cls or tag.name == "p" or "ltx_enumerate" in cls
+                or "ltx_verbatim" in cls or tag.name == "pre")
 
     def _emit_paragraph(tag: Tag) -> None:
         text = _rich_text(tag).strip()
@@ -1156,6 +1204,23 @@ def _figure_body_to_markdown(fig: Tag) -> str:
                 content = content[len(marker):].strip()
             parts.append(f"{marker} {content}")
 
+    def _emit_verbatim(tag: Tag) -> None:
+        # ar5iv 会把 tcolorbox/verbatim 环境渲染成 <pre class="ltx_verbatim">，
+        # 其中保留了原始文本（含 LaTeXML 转义的 \" \\n 等）。提取并做最小化
+        # 反斜杠转义还原，使 Prompt/Response 示例可读。
+        # 注意：不能直接用 codecs.decode(..., "unicode_escape")，Python 会先把 str
+        # 编码成 UTF-8 bytes 再解码，导致非 ASCII 字符（如 ’）出现二次 mojibake。
+        text = tag.get_text()
+        text = _unescape_verbatim(text)
+        text = text.strip("\n")
+        if not text:
+            return
+        # 避免文本内部出现与围栏相同的反引号序列
+        fence = "```"
+        while fence in text:
+            fence += "`"
+        parts.append(f"{fence}\n{text}\n{fence}")
+
     def walk(node: Tag) -> None:
         cls = node.get("class") or []
         if "ltx_caption" in cls:
@@ -1163,8 +1228,11 @@ def _figure_body_to_markdown(fig: Tag) -> str:
         if "ltx_enumerate" in cls:
             _emit_enumerate(node)
             return
+        if "ltx_verbatim" in cls or node.name == "pre":
+            _emit_verbatim(node)
+            return
         if "ltx_p" in cls or node.name == "p":
-            # 段落节点若内部还嵌套段落/列表，则继续递归到最内层块，避免把整段
+            # 段落节点若内部还嵌套段落/列表/代码块，则继续递归到最内层块，避免把整段
             # 文字和列表拼成一锅粥。
             for desc in node.descendants:
                 if isinstance(desc, Tag) and _is_block(desc) and desc is not node:
@@ -1465,6 +1533,106 @@ def _listing_line_text(tag: Tag) -> str:
     return text.strip()
 
 
+def _is_rule_row(tr: Tag) -> bool:
+    """识别 LaTeX 表格的横线装饰行（\\toprule / \\midrule / \\bottomrule）。
+
+    ar5iv 会把这些横线渲染成仅含 <span class="ltx_rule"> 的全宽 cell 行，
+    文本为空或只有不间断空格。若保留，markdown/HTML 表格都会多出一行。
+    """
+    cells = tr.find_all(["td", "th"])
+    if not cells:
+        return False
+    for cell in cells:
+        text = cell.get_text(" ", strip=True).replace("\u00a0", "").strip()
+        if text:
+            return False
+    for cell in cells:
+        if cell.find(class_="ltx_rule"):
+            return True
+        try:
+            cs = int(_as_str(cell.get("colspan")) or 1)
+        except (ValueError, TypeError):
+            cs = 1
+        if cs > 1:
+            return True
+    return False
+
+
+def _span_tabular_to_markdown(tab: Tag) -> str:
+    """把 span 版表格（<span class="ltx_tabular"> + ltx_tr / ltx_td）转为 GFM markdown。
+
+    LaTeXML 新版本偶尔不生成真 <table>，而是用 <span> + class 复刻表格结构
+    （ltx_thead / ltx_tbody 包 ltx_tr，行内是 ltx_td 单元格）。GFM 不支持
+    colspan/rowspan，这里把 rowspan（ltx_rowspan_N class）在后续行补占位单元格，
+    保证各行列数对齐；colspan 直接原样保留第一个单元格、其余列留空。
+    """
+    rows = tab.find_all(class_="ltx_tr", recursive=True)
+    if not rows:
+        return ""
+    grid: list[dict[int, str]] = []
+    pending: dict[int, list] = {}  # col -> [剩余行数, 占位文本]
+    for tr in rows:
+        row: dict[int, str] = {}
+        col = 0
+        empty = True
+        created_now: set[int] = set()  # 本行新建的 rowspan 占位（不当行递减）
+        for cell in tr.find_all(class_="ltx_td", recursive=False):
+            # 先补上被上方 rowspan 占据的列
+            while col in pending:
+                row[col] = pending[col][1]
+                col += 1
+            text = _rich_text(cell).replace("\n", " ").strip()
+            if text:
+                empty = False
+            try:
+                colspan = int(_as_str(cell.get("colspan")) or 1)
+            except (ValueError, TypeError):
+                colspan = 1
+            rowspan = 0
+            for c in cell.get("class") or []:
+                m = re.match(r"ltx_rowspan_(\d+)$", c)
+                if m:
+                    rowspan = int(m.group(1))
+                    break
+            if not rowspan:
+                try:
+                    rowspan = int(_as_str(cell.get("rowspan")) or 1)
+                except (ValueError, TypeError):
+                    rowspan = 1
+            row[col] = text
+            if rowspan > 1:
+                pending[col] = [rowspan - 1, text]
+                created_now.add(col)
+            col += colspan
+        while col in pending:
+            row[col] = pending[col][1]
+            col += 1
+        # 该行结束后递减 pending 计数（跳过本行新建的项：它们的行数从下一行起算）
+        for c in list(pending):
+            if c in created_now:
+                continue
+            pending[c][0] -= 1
+            if pending[c][0] <= 0:
+                del pending[c]
+        if not empty:
+            grid.append(row)
+    if not grid:
+        return ""
+    max_cols = max(max(r) + 1 for r in grid if r)
+
+    def fmt(r: dict[int, str]) -> str:
+        cells_out = []
+        for i in range(max_cols):
+            t = r.get(i, "").replace("|", "\\|")
+            cells_out.append(t)
+        return "| " + " | ".join(cells_out) + " |"
+
+    lines = [fmt(grid[0]), "| " + " | ".join(["---"] * max_cols) + " |"]
+    for r in grid[1:]:
+        lines.append(fmt(r))
+    return "\n".join(lines)
+
+
 def _collect_table_text(tbl: Tag) -> str:
     """将 ar5iv 表格转为 markdown 或 HTML 字符串。
 
@@ -1490,7 +1658,26 @@ def _collect_table_text(tbl: Tag) -> str:
     else:
         html_table = tbl.find("table")
     if html_table is None:
+        # span 版表格：部分论文（LaTeXML 新版本）把整张表渲染成
+        # <span class="ltx_tabular"> + <span class="ltx_tr">/ltx_td，
+        # 没有任何真 <table> 节点（如 2507.11878 Table 3）。此时若该
+        # ltx_tabular 内含 ltx_tr 行，则按 span 表格转 GFM markdown，
+        # 否则维持原行为（视为行内包裹、丢弃）。
+        span_tab = (tbl if "ltx_tabular" in (tbl.get("class") or [])
+                    else tbl.find(class_="ltx_tabular"))
+        if span_tab is not None and span_tab.find(class_="ltx_tr") is not None:
+            return _span_tabular_to_markdown(span_tab)
         return ""
+
+    # 剔除 LaTeX 横线装饰行（\toprule / \midrule / \bottomrule），避免表格首尾/中间
+    # 出现空白行；剔除后再重新判定复杂度，可能让更多简单表格走 markdown 路径。
+    for tr in list(html_table.find_all("tr")):
+        if _is_rule_row(tr):
+            tr.decompose()
+    # 横线行被移除后可能留下空的 <thead>/<tfoot>，一并清理避免渲染器产生空行。
+    for tag in list(html_table.find_all(["thead", "tfoot"])):
+        if not tag.get_text(strip=True):
+            tag.decompose()
 
     # 复杂度先判定：任一 cell 含 colspan>1 或 rowspan>1 → HTML 路径。
     has_complex = False
