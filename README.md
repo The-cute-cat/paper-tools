@@ -16,85 +16,23 @@
 
 ## 特性
 
-- **公式完整保护**：LaTeX 公式自动识别并用占位符保护，翻译后精确还原，不会被篡改或丢失；同时公式原文作为「公式表」上下文随翻译单元一并发给 LLM，帮助模型理解公式语义、提升译文准确性（模型只回抄占位符，不回写 LaTeX）
-- **术语一致性**：自动构建术语表（Glossary），锁定全篇专有名词和自创方法名译法，消除前后不一致
-- **引用智能处理**：自动识别论文引用，生成可跳转的搜索引擎链接（支持 Google / Bing / DuckDuckGo / Semantic Scholar / arXiv）
-- **图表保留**：图片和表格结构完整保留，表格内容按单元格翻译
-- **文本框/提示框保留**：定理、备注、Prompt 示例等带边框文本框以引用块（`> `）形式保留，强调标记不丢失
+- **公式完整保护**：LaTeX 公式以占位符保护，翻译后精确还原，不会被篡改或丢失
+- **术语一致性**：自动构建术语表，锁定全篇专有名词与自创方法名译法
+- **结构保留**：章节、段落、列表、图片、表格、文本框/提示框均按原结构落地
+- **引用可跳转**：论文引用自动生成搜索引擎链接（Google / Bing / DuckDuckGo / Semantic Scholar / arXiv）
+- **翻译质量保障**：论文立场锚定 + 翻译后一致性检查与自动返修
+- **高并发**：多线程并发翻译，默认 8 线程
 - **原文模式**：可跳过 LLM，仅解析并导出结构化英文原文（无需 API Key）
-- **断点续译**：异常退出后检测到翻译缓存可自动/手动恢复，避免从头重翻
-- **网络代理**：支持标准 CONNECT 代理与轻量 CORS 文本转发代理，适配受限网络访问 arxiv
-- **并发翻译**：支持多线程并发翻译，大幅提升速度
-- **一致性检查与返修**：翻译完成后自动检查译文质量，对违和词、术语不一致等自动返修
-- **中英排版优化**：自动在中英文、数字之间插入空格（pangu 风格），提升阅读体验
-- **Token 用量与费用估算**：开启后在日志输出总 token 消耗、缓存命中/未命中占比，并依据官方价目表估算费用（价目表运行时动态获取并本地缓存，不写死在代码中）
-- **统一配置**：所有工具共享配置体系，通过 `.env` 文件或环境变量管理
+- **断点续译**：异常退出后可自动/手动恢复，避免从头重翻
+- **受限网络可用**：支持标准 CONNECT 代理与轻量 CORS 文本转发代理
+- **统一配置**：所有工具共享配置体系，通过 `.env` 或环境变量管理
 
-## 翻译工作流程
+## 工作原理
 
-以 `arxiv-translate` 为例，单篇论文的处理流程如下：
+一句话概括：**下载 → 解析 → 术语/立场准备 → 并发翻译 → 一致性返修 → 输出**。
 
-```
-下载 arxiv HTML（ar5iv）
-    │
-    ▼
-解析（parser.py）：抽取标题/摘要/章节/段落/列表/公式/图表/表格/引用
-    │
-    ▼
-构建初始术语表（单线程，基于标题+前几段）
-    │
-    ▼
-生成论文立场摘要（锚定翻译基调，零成本拼接，无额外 LLM 调用）
-    │
-    ▼
-缩写定义预热（扫描 ABBR=英文 入库，优先翻译图注/定义句以锁定缩写译法）
-    │
-    ▼
-并发翻译各内容块（按翻译单元调度，多线程）
-  ├─ 公式 → 占位符保护（原文作上下文发给 LLM 助其理解语义，仅回抄占位符）
-  ├─ 文本 → 术语约束 + 立场锚定
-  ├─ 表格 → 异步批量翻译
-  └─ 短块合并 → JSON 分块翻译（合并组各子块独立回收）
-    │
-    ▼
-一致性检查与返修（按翻译单元判定，合并组任一子块不通过则整组重翻）
-    │
-    ▼
-写出 Markdown / 额外格式（docx/pdf）
-```
-
-## 核心机制
-
-### 术语表与缩写预热
-
-术语表（Glossary）由论文自身文本驱动，分三阶段构建：
-
-1. **建表阶段**：注入领域默认术语种子后，取"标题 + 摘要及前几段（至多 4 段）"发一次翻译，让模型补充自创词/易错词译法；自创方法/框架名标记为 `<KEEP>`（保留英文，如 `Furina`）。
-2. **缩写定义预热**：扫描英文原文中的 `ABBR = English` 缩写定义入库；再单线程优先翻译含缩写定义的块——图注/表注/伪代码注及出现 `ABBR = English` 的段落——将其译法 `ingest` 进术语表。这些块在并发阶段直接复用、不再重翻，从而保证表格表头与图注里的同一缩写译法一致。
-3. **并发合并阶段**：翻译每块后，模型返回本块确定的新术语自动合并进共享术语表；缩写预热锁定的译法全程优先。
-
-最终术语表保存为 JSON，可人工校对复用。
-
-### 论文立场摘要
-
-为抑制模型幻觉、保证全文立场一致，向 prompt 注入一句论文全局立场摘要。该摘要为**零成本**实现：直接用"标题 + 摘要前几段（至多 3 段，超 600 字截断）"拼接，要求模型据此判断核心任务/方法/立场并保持；缺失时回退到标题，再缺失时仅提示"保持立场一致"。摘要仅作为内部 prompt 上下文，不向用户控制台输出全文。
-
-### 短块合并
-
-相邻同类文本块（段落 / 列表项 / 章节标题）贪心合并为"翻译单元"，目标落入 `[PAPER_TOOLS_MERGE_MIN, PAPER_TOOLS_MERGE_MAX]`（默认 `1000` / `1500`，`MERGE_MIN=0` 关闭）字符区间：
-
-- 仅同类型块可并入同一单元，标题/公式/图表/表格等结构块作为天然分隔符不被合并；
-- 单块已达上限不强行拆分，独立成单元；
-- 合并组以 JSON 数组分块发送给模型，各块译文独立回收（互不拼接）；
-- 翻译与返修按翻译单元调度，合并组任一子块需返修则整组重翻。
-
-### 一致性检查与返修
-
-翻译完成后逐块检查译文质量（违和词、术语不一致等），不通过则把整组合并组重新发送给模型翻译，直到整组通过或达到最大尝试次数（由 `PAPER_TOOLS_TRANSLATE_REPAIR` 开关控制）。
-
-### Token 用量与费用估算
-
-翻译器在 `TokenUsage` 中线程安全地累计每次调用的 token（输入/输出/缓存命中/未命中/请求数）。开启 `PAPER_TOOLS_TOKEN_REPORT` 后，翻译结束输出总消耗、缓存命中占比，并依据官方价目表估算费用。价目表由 `core/pricing.py` 运行时从 DeepSeek 官方定价页动态抓取并本地缓存（`pricing_cache.json`，默认 24h 有效），不写死在代码中。
+各步骤的实现细节（公式占位符保护、术语表与缩写预热、论文立场摘要、短块合并、一致性检查与返修、Token 用量统计等）见
+[arxiv-translate 文档 · 翻译策略详解](./paper_tools/tools/arxiv_translate/README.md#翻译策略详解)。
 
 ## 快速开始
 
@@ -128,22 +66,20 @@ python main.py arxiv-translate https://arxiv.org/abs/2605.26158
 # 或直接使用 arxiv ID
 python main.py arxiv-translate 2605.26158v1
 
-# 指定输出目录
-python main.py arxiv-translate 2605.26158v1 --out ./my-output
-
-# 指定模型 / API Key（覆盖配置）
-python main.py arxiv-translate 2605.26158v1 --model deepseek-chat --api-key sk-xxx
+# 指定输出目录 / 模型 / API Key（覆盖配置）
+python main.py arxiv-translate 2605.26158v1 --out ./my-output --model deepseek-chat
 
 # 额外导出 docx / pdf（实验中 experimental）；--no-md 可只产出导出格式
 python main.py arxiv-translate 2605.26158v1 --export docx,pdf --no-md
+
+# 翻译本地 PDF（逐页视觉识别 → 翻译）
+python main.py pdf-translate "D:/papers/paper.pdf"
+python main.py pdf-translate "D:/papers/paper.pdf" --dpi 180 --extract-only
 ```
 
-运行后将在 `output/<arxiv_id>/` 下生成：
-- `<arxiv_id>.zh.md` — 中文翻译 Markdown
-- `<arxiv_id>.glossary.json` — 术语表（JSON 格式，可人工校对复用）
-- `<arxiv_id>.html` — 原始 HTML 备份
-- `<arxiv_id>.zh.html` / `<arxiv_id>.zh.docx` / `<arxiv_id>.zh.pdf` — 中文 HTML 及额外导出格式（受 `PAPER_TOOLS_EXPORT_FORMATS` 控制，实验中 experimental）
-- `images/` — 图片目录（仅当 `PAPER_TOOLS_IMG_LOCAL=true`）
+各工具的输出文件、目录结构与进阶用法见对应工具文档：
+[arxiv-translate](./paper_tools/tools/arxiv_translate/README.md#输出说明) ·
+[pdf-translate](./paper_tools/tools/pdf_translate/README.md#输出)。
 
 ## 配置
 
@@ -195,12 +131,16 @@ paper-tools/
 │   │   ├── glossary.py                  #   术语表（翻译记忆）
 │   │   └── pricing.py                   #   DeepSeek 价目表动态获取与本地缓存
 │   └── tools/                           # 工具目录（每个子目录是一个独立工具）
-│       └── arxiv_translate/             #   工具：arxiv 论文翻译
+│       ├── arxiv_translate/             #   工具：arxiv 论文翻译
+│       │   ├── README.md                #     工具详细文档
+│       │   ├── main.py                  #     独立入口（可直接 IDE 运行）
+│       │   ├── pipeline.py              #     翻译流水线（下载→解析→翻译→写出）
+│       │   └── parser.py                #     ar5iv HTML 解析器
+│       └── pdf_translate/               #   工具：本地 PDF 论文翻译
 │           ├── README.md                #     工具详细文档
-│           ├── __init__.py
 │           ├── main.py                  #     独立入口（可直接 IDE 运行）
-│           ├── pipeline.py              #     翻译流水线（下载→解析→翻译→写出）
-│           └── parser.py                #     ar5iv HTML 解析器
+│           ├── pipeline.py              #     提取 + 翻译流水线
+│           └── extractor.py             #     逐页渲染与视觉提取
 └── output/                              # 默认输出目录（gitignore）
 ```
 
@@ -229,16 +169,3 @@ p.add_argument("input")
 ## License
 
 MIT
-## 本地 PDF 论文翻译
-
-新增 `pdf-translate`：先逐页识图生成原文 Markdown，再复用现有翻译器生成中文 Markdown。
-
-```bash
-uv sync
-uv run python main.py pdf-translate "D:/papers/paper.pdf"
-uv run python main.py pdf-translate "D:/papers/paper.pdf" --extract-only
-```
-
-需要配置 `DEEPSEEK_API_KEY`，**仅提取也会调用收费视觉 API**，页面及插图将发送至配置的 DeepSeek 服务。
-支持 `--out`、`--model`、`--vision-model`、`--dpi` 和 `--no-resume`。
-详见 [PDF 工具说明](paper_tools/tools/pdf_translate/README.md)。

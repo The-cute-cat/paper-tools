@@ -50,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--vision-model", default=None, help="识图模型")
     p.add_argument("--api-key", default=None, help="DeepSeek API key")
     p.add_argument("--dpi", type=int, default=None, help="页面渲染 DPI（72-300）")
+    p.add_argument("--max-output-tokens", type=int, default=None,
+                   help="视觉模型单页识别最大输出 token（密集页截断时调大）")
     p.add_argument("--extract-only", action="store_true", help="仅执行识图提取（仍调用 API）")
     p.add_argument("--no-resume", action="store_true", help="不复用逐页识别缓存")
     return parser
@@ -89,11 +91,13 @@ def main(argv: list[str] | None = None) -> None:
                 settings.pdf_vision_model = args.vision_model
             if args.dpi is not None:
                 settings.pdf_dpi = args.dpi
+            if args.max_output_tokens is not None:
+                settings.pdf_max_output_tokens = args.max_output_tokens
             out = run(args.input, settings=settings,
                       extract_only=args.extract_only or settings.translate_skip,
                       resume=not args.no_resume)
             logger.info(f"结果文件: {out}")
-        if args.command == "arxiv-translate":
+        elif args.command == "arxiv-translate":
             out = arxiv_translate.run(args.input)
             logger.info(f"结果文件: {out}")
     except Exception as e:  # noqa: BLE001

@@ -138,6 +138,12 @@ class AppSettings:
     resume_mode: str = "ask"
     pdf_vision_model: str = "deepseek-v4-flash-vision-exp"
     pdf_dpi: int = 160
+    # 视觉模型单页识别的最大输出 token 数。
+    # 内容密集的页面（多公式/长表格）可能超出默认上限导致输出被截断，
+    # 此时响应 finish_reason=length，校验失败并重试——但重试不会改变上限，
+    # 必然再次失败。遇到这种情况请调大本值（受模型上下文上限约束）；
+    # 降低 DPI 无法解决，因为它不减少输出 token。
+    pdf_max_output_tokens: int = 16384
 
     def resolve(self) -> "AppSettings":
         """用环境变量/默认值补全缺失字段。"""
@@ -152,6 +158,8 @@ class AppSettings:
             self.pdf_vision_model = env.strip()
         if env := os.environ.get("PAPER_TOOLS_PDF_DPI"):
             self.pdf_dpi = int(env)
+        if env := os.environ.get("PAPER_TOOLS_PDF_MAX_TOKENS"):
+            self.pdf_max_output_tokens = int(env)
         if env := os.environ.get("PAPER_TOOLS_OUTPUT"):
             self.output_dir = Path(env)
         if env := os.environ.get("PAPER_TOOLS_LOG_LEVEL"):

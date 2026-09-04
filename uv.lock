@@ -714,7 +714,6 @@ dependencies = [
     { name = "matplotlib" },
     { name = "openai" },
     { name = "pymupdf" },
-    { name = "pyrefly" },
     { name = "python-docx" },
     { name = "python-dotenv" },
     { name = "pyyaml" },
@@ -722,22 +721,28 @@ dependencies = [
     { name = "tqdm" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pyrefly" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "beautifulsoup4", specifier = ">=4.12.0" },
-    { name = "fpdf2", specifier = ">=2.8.0" },
     { name = "fpdf2", specifier = ">=2.8.8" },
     { name = "lxml", specifier = ">=5.0.0" },
     { name = "matplotlib", specifier = ">=3.11.1" },
     { name = "openai", specifier = ">=1.40.0" },
     { name = "pymupdf", specifier = ">=1.26.0" },
-    { name = "pyrefly", specifier = ">=0.60.0" },
     { name = "python-docx", specifier = ">=1.1.0" },
     { name = "python-dotenv", specifier = ">=1.0.0" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "requests", specifier = ">=2.31.0" },
     { name = "tqdm", specifier = ">=4.66.0" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "pyrefly", specifier = ">=0.60.0" }]
 
 [[package]]
 name = "pillow"

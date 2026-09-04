@@ -12,12 +12,15 @@ dependencies = [
     "requests>=2.31.0",
     "python-dotenv>=1.0.0",
     "pyyaml>=6.0",
-    "pyrefly>=0.60.0",
     "python-docx>=1.1.0",
-    "fpdf2>=2.8.0",
-    "lxml>=5.0.0",
     "fpdf2>=2.8.8",
+    "lxml>=5.0.0",
     "matplotlib>=3.11.1",
+]
+
+[dependency-groups]
+dev = [
+    "pyrefly>=0.60.0",
 ]
 
 [tool.setuptools.packages.find]

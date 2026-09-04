@@ -245,6 +245,14 @@ class LLMTranslator:
         # token 用量累计（线程安全，并发翻译共享该实例时累加）
         self.usage = TokenUsage()
 
+    def close(self) -> None:
+        """释放底层 OpenAI HTTP 客户端连接池。
+
+        工具在翻译结束后应显式调用，避免进程退出前遗留未关闭的连接。
+        重复调用是安全的（close 幂等）。
+        """
+        self._client.close()
+
     # ---------- 公式/引用占位符保护 ----------
     @staticmethod
     def protect_math(text: str) -> tuple[str, list[dict], dict[int, str]]:
@@ -437,11 +445,13 @@ class LLMTranslator:
         """从 YAML 模板构建系统提示词。编号按有/无 summary+glossary 自动递增。"""
         prompts = _load_prompts()
         rule_num = len(prompts["rules"])
-        parts = [prompts["intro"], *(prompts["rules"]), ""]
+        parts = [prompts["intro"], *(
+            rule.replace("{keep_as_is}", KEEP_AS_IS) for rule in prompts["rules"]
+        )]
         if summary:
             rule_num += 1
             parts.append(prompts["summary_rule"].format(n=rule_num, summary=summary))
-        gl_text = glossary.to_prompt_lines() if glossary else ""
+        gl_text = glossary.to_prompt_lines(strict=False) if glossary else ""
         if gl_text:
             rule_num += 1
             parts.append(prompts["glossary_rule"].format(n=rule_num, glossary=gl_text))
@@ -454,12 +464,8 @@ class LLMTranslator:
         # 输出格式
         key = "output_multi" if multi_block else "output_single"
         out = prompts[key].replace("{keep_as_is}", KEEP_AS_IS)
-        if cell_mode:
-            # 单元格场景下补充说明：无内容可译时返回固定标记而非硬翻。
-            out = (out + f"\n  · 本单元格无自然语言可译（空/纯符号/乱码）时，"
-                          f"translation 字段直接填 {TABLE_UNTRANSLATABLE_MARKER}（前后无空格）。")
         parts.append(out)
-        return "\n\n".join(parts)
+        return "\n\n".join(part.strip() for part in parts)
 
     @staticmethod
     def _normalize_author_marks(text: str) -> str:
@@ -562,7 +568,7 @@ class LLMTranslator:
         if getattr(resp, "usage", None) is not None:
             self.usage.add(TokenUsage.from_response(resp.usage))
         raw = (resp.choices[0].message.content or "").strip()
-        # summary_gen 模板要求纯文本输出，但部分模型仍可能包成 JSON；做一层容错解析。
+        # summary_gen 返回 JSON summary 字段；兼容旧版纯文本与其他包装形式。
         summary = self._extract_summary_text(raw)
         return summary
 
@@ -570,8 +576,8 @@ class LLMTranslator:
     def _extract_summary_text(raw: str) -> str:
         """从模型返回中稳妥提取摘要纯文本。
 
-        模板要求纯文本，但部分提供方在 json_object 模式下会把内容包成
-        {"summary": "..."} 或 {"translation": "..."}。这里做最小容错：
+        模板要求 {"summary": "..."}；兼容旧版纯文本或其他字段包装。
+        这里做最小容错：
         能解析出单值字符串就取之，否则原样返回（保留换行结构）。
         """
         if not raw:

@@ -1,6 +1,7 @@
 """PDF -> 原文 Markdown -> 中文 Markdown。与 arxiv 共用翻译器和术语表。"""
 
 from collections import Counter
+import hashlib
 from pathlib import Path
 import re
 
@@ -8,7 +9,7 @@ from ...config import AppSettings, get_settings
 from ...core.glossary import Glossary
 from ...core.translator import LLMTranslator
 from ...logging_setup import get_logger
-from .extractor import atomic_text, extract_pdf
+from .extractor import atomic_text, extract_pdf, file_digest
 
 # 整个图片标签/代码必须原样保留，不让模型修改路径或可执行示例。
 PROTECTED = re.compile(
@@ -112,12 +113,11 @@ def run(pdf_path: str | Path, *, settings: AppSettings | None = None,
     if not settings.llm.api_key:
         raise ValueError("请配置 DEEPSEEK_API_KEY，PDF 提取阶段也需要调用视觉模型")
     # 用内容哈希隔离同名论文；相同论文重复运行时复用逐页缓存。
-    import hashlib
-    with source.open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()[:12]
+    # 哈希只算一次，传给 extract_pdf 复用（避免大 PDF 全文件读两遍）。
+    digest = file_digest(source, length=12)
     root = settings.output_dir / f"{source.stem}-{digest}"
     root.mkdir(parents=True, exist_ok=True)
-    extracted = extract_pdf(source, root, settings, resume=resume)
+    extracted = extract_pdf(source, root, settings, resume=resume, digest=digest)
     if extract_only:
         return extracted
     translator = LLMTranslator(settings.llm)
@@ -133,4 +133,4 @@ def run(pdf_path: str | Path, *, settings: AppSettings | None = None,
                 get_logger().info(line)
         return target
     finally:
-        translator._client.close()
+        translator.close()
