@@ -109,6 +109,9 @@ python main.py pdf-translate "D:/papers/paper.pdf" --dpi 180 --extract-only
 | `PAPER_TOOLS_INPUT` | 待翻译的 arxiv 链接或 ID（命令行/INPUT 常量未提供时的回退） | 空 |
 | `PAPER_TOOLS_SUMMARY_MAX_CHARS` | 立场摘要截断上限（字符，0=不截断） | `0` |
 | `PAPER_TOOLS_RESUME_MODE` | 断点续译模式：`ask`(终端询问) / `auto`(自动恢复) / `never`(从头重翻) | `ask` |
+| `PAPER_TOOLS_PDF_INPUT` | 待翻译的本地 PDF 文件路径（仅 pdf-translate；不支持下载 URL） | 空 |
+| `PAPER_TOOLS_PDF_EXTRACT_ONLY` | 仅提取：只做第一阶段逐页识别，不翻译（1/true 开启） | `false` |
+| `PAPER_TOOLS_PDF_MAX_TOKENS` | 视觉模型单页识别最大输出 token（密集页截断时调大） | `16384` |
 
 > **价目表缓存**：Token 费用估算依赖 DeepSeek 官方定价。价目表不会写死在代码中，而是在首次使用时从官方定价页实时抓取，并缓存到 `paper_tools/core/pricing_cache.json`（默认 24 小时有效）。抓取失败时自动回退到最近一次成功缓存；若缓存与实时抓取均失败则报错提示。如需强制刷新价目表，删除该缓存文件后重新运行即可。
 

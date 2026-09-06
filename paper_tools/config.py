@@ -50,6 +50,24 @@ def _load_env() -> None:
         load_dotenv(env_path)
 
 
+# python-dotenv 会解码双引号值中的转义序列，Windows 反斜杠路径会被破坏：
+# "D:\...\tests\x.pdf" 中的 \t 变成真实 TAB。此处把这些控制字符还原为
+# 两字面转义形式，使路径恢复原义（Path 不解释转义，还原后可直接使用）。
+_MANGLED_PATH_ESCAPES = {
+    "\t": r"\t", "\n": r"\n", "\r": r"\r",
+    "\f": r"\f", "\v": r"\v", "\b": r"\b", "\a": r"\a",
+}
+
+
+def _repair_mangled_path(value: str) -> str:
+    """还原被 dotenv 双引号转义破坏的路径中的控制字符。"""
+    if not value or not any(c in value for c in _MANGLED_PATH_ESCAPES):
+        return value
+    for ctrl, esc in _MANGLED_PATH_ESCAPES.items():
+        value = value.replace(ctrl, esc)
+    return value
+
+
 @dataclass
 class LLMSettings:
     """大模型（翻译）相关配置。"""
@@ -138,10 +156,16 @@ class AppSettings:
     resume_mode: str = "ask"
     pdf_vision_model: str = "deepseek-v4-flash-vision-exp"
     pdf_dpi: int = 160
+    # 待翻译的本地 PDF 文件路径（PDF 工具专用，不支持下载 URL）。
+    # 环境变量 PAPER_TOOLS_PDF_INPUT 可覆盖；为空时回退到 main.py 的 pdf_path 常量。
+    pdf_input: str = ""
+    # 仅提取：True 时 PDF 工具只做第一阶段逐页识别（.extracted.md），不翻译。
+    # 注意第一阶段仍需调用视觉模型，并非离线模式。环境变量 PAPER_TOOLS_PDF_EXTRACT_ONLY 可覆盖。
+    pdf_extract_only: bool = False
     # 视觉模型单页识别的最大输出 token 数。
     # 内容密集的页面（多公式/长表格）可能超出默认上限导致输出被截断，
-    # 此时响应 finish_reason=length，校验失败并重试——但重试不会改变上限，
-    # 必然再次失败。遇到这种情况请调大本值（受模型上下文上限约束）；
+    # 此时响应 finish_reason=length。程序会立即停止，不对同一上限做无效重试。
+    # 可先重跑该页，若仍发生再调大本值（受模型上下文上限约束）；
     # 降低 DPI 无法解决，因为它不减少输出 token。
     pdf_max_output_tokens: int = 16384
 
@@ -160,8 +184,12 @@ class AppSettings:
             self.pdf_dpi = int(env)
         if env := os.environ.get("PAPER_TOOLS_PDF_MAX_TOKENS"):
             self.pdf_max_output_tokens = int(env)
+        if env := os.environ.get("PAPER_TOOLS_PDF_INPUT"):
+            self.pdf_input = _repair_mangled_path(env.strip())
+        if env := os.environ.get("PAPER_TOOLS_PDF_EXTRACT_ONLY"):
+            self.pdf_extract_only = env.strip().lower() in ("1", "true", "yes", "on")
         if env := os.environ.get("PAPER_TOOLS_OUTPUT"):
-            self.output_dir = Path(env)
+            self.output_dir = Path(_repair_mangled_path(env))
         if env := os.environ.get("PAPER_TOOLS_LOG_LEVEL"):
             self.log_level = env
         if env := os.environ.get("PAPER_TOOLS_CONCURRENCY"):

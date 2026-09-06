@@ -44,7 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-md", action="store_true",
                    help="不输出 .zh.md，仅导出 docx/pdf（默认两种都输出）")
     p = sub.add_parser("pdf-translate", help="逐页识别本地 PDF 论文并翻译为中文 Markdown")
-    p.add_argument("input", help="本地 PDF 文件路径")
+    p.add_argument("input", nargs="?", default=None,
+                   help="本地 PDF 文件路径（留空则用 .env 的 PAPER_TOOLS_PDF_INPUT）")
     p.add_argument("--out", default=None, help="输出根目录")
     p.add_argument("--model", default=None, help="翻译模型")
     p.add_argument("--vision-model", default=None, help="识图模型")
@@ -93,8 +94,15 @@ def main(argv: list[str] | None = None) -> None:
                 settings.pdf_dpi = args.dpi
             if args.max_output_tokens is not None:
                 settings.pdf_max_output_tokens = args.max_output_tokens
-            out = run(args.input, settings=settings,
-                      extract_only=args.extract_only or settings.translate_skip,
+            # 输入：CLI 位置参数 > .env 的 PAPER_TOOLS_PDF_INPUT
+            input_arg = args.input or settings.pdf_input
+            if not input_arg:
+                logger.error("未指定待翻译 PDF：请传入本地 PDF 路径，"
+                             "或在 .env 设置 PAPER_TOOLS_PDF_INPUT。")
+                sys.exit(1)
+            out = run(input_arg, settings=settings,
+                      extract_only=args.extract_only or settings.pdf_extract_only
+                      or settings.translate_skip,
                       resume=not args.no_resume)
             logger.info(f"结果文件: {out}")
         elif args.command == "arxiv-translate":

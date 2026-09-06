@@ -628,7 +628,55 @@ def _plain_text_for_translation(node: Tag | NavigableString) -> str:
 
 def _strip_tag_prefix(text: str) -> str:
     """保留标题原始文本（编号是学术论文有意义的章节引用，如 '3.4. Application'）。"""
-    return text.strip()
+    return _simplify_tex_plain(text)
+
+
+# 标题类纯文本中可安全解包的 LaTeX 命令：这些命令只改变字形/装饰（上划线、
+# 粗体、花体等），解包后保留花括号内文字即可还原可读语义。不含 \sqrt、\frac
+# 等改变数学含义的命令。
+_TEX_TEXTUAL_CMDS = re.compile(
+    r"\\(?:overline|underline|bar|hat|check|breve|vec|tilde|widetilde|widehat|widecheck"
+    r"|mathbf|boldsymbol|mathrm|mathit|mathsf|mathtt|mathbb|mathfrak|mathcal|mathscr"
+    r"|hbox|mbox|text|textbf|textit|textsc|textsl|texttt|textrm|textup|textmd"
+    r"|emph|operatorname)\s*\{"
+)
+
+
+def _simplify_tex_plain(text: str) -> str:
+    """把标题类纯文本中「纯装饰性」的 LaTeX 命令解包为可读文本。
+
+    背景：部分论文标题含装饰性公式，如 StrongREJECT 论文标题实际是
+    ``A \\overline{\\hbox{{StrongREJECT}}} for Empty Jailbreaks``（红色上划线装饰）。
+    _plain_text 会把公式源码原样带入标题，轻则显示为乱码命令，重则污染输出文件名
+    （name_mode=title 时文件名变成 "A ＼overline{＼hbox{...}}"）。
+
+    用平衡花括号读取参数（命令参数可能嵌套，如 \\overline{\\hbox{{X}}}），
+    解包后从原位置重新扫描以处理嵌套命令。\\theta 这类无参数符号命令原样保留；
+    解包残留的裸花括号组 {X} 亦展开（LaTeX 分组不产生可见字符）。
+    """
+    i = 0
+    while i < len(text):
+        m = _TEX_TEXTUAL_CMDS.match(text, i)
+        if m:
+            inner, j = _read_balanced_group(text, m.end() - 1)
+            if j > 0:
+                # 用参数内容替换整个命令，并从替换处重新扫描（处理嵌套）
+                text = text[:i] + inner + text[j:]
+                continue
+        i += 1
+    # 孤立花括号分组展开（解包残留的 {StrongREJECT} 之类）。
+    # 不展开紧跟 \命令、字母数字、_ / ^ 的参数组：\sqrt{2}、\frac{a}{b}、
+    # L_{atk} 这类数学参数括号保持原样。
+    i = 0
+    while i < len(text):
+        if text[i] == "{" and (i == 0 or not (
+                text[i - 1].isalnum() or text[i - 1] in "\\_^}")):
+            inner, j = _read_balanced_group(text, i)
+            if j > 0:
+                text = text[:i] + inner + text[j:]
+                continue
+        i += 1
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def parse_arxiv_html(
@@ -688,9 +736,12 @@ def parse_arxiv_html(
 
     doc_title = soup.find(class_="ltx_title_document")
     if doc_title:
+        # 标题需「可读化」：装饰性公式解包（如 \overline{\hbox{StrongREJECT}} →
+        # StrongREJECT），否则公式源码会进入 markdown 首行与输出文件名。
+        title_plain = _simplify_tex_plain(_plain_text(doc_title))
         blocks.append(Block(kind="title", level=1,
-                            text=_plain_text(doc_title).strip(),
-                            raw=_plain_text(doc_title).strip(),
+                            text=title_plain,
+                            raw=title_plain,
                             meta={"html_id": _html_id_of(doc_title)}))
 
     # 提取作者与机构信息。ar5iv 把作者列表放在 <div class="ltx_authors"> 中，
@@ -706,9 +757,13 @@ def parse_arxiv_html(
         for creator in authors_div.find_all(class_="ltx_creator ltx_role_author"):
             name_tag = creator.find(class_="ltx_personname")
             name = _plain_text(name_tag).strip() if name_tag else ""
-            # _plain_text 会把脚注 mark 转成 [mark]（如 "Pengyuan Liu[2]"），
-            # 这里还原为 HTML 上标 <sup>mark</sup>，保留原始排版中的上标语义。
+            # 上标语义还原（裸 ^{...} 在 Markdown 中不会被渲染，会原样显示）：
+            # · 脚注 mark：_plain_text 转成 [mark]（如 "Pengyuan Liu[2]"）→ <sup>
+            # · 普通上标：sub/sup 元素产出 ^{∗}（共同一作 ∗、通讯 †、‡ 等）→ <sup>
+            # · 下标（罕见）_{...} → <sub>
             name = re.sub(r"\[([^\]]+)\]", r"<sup>\1</sup>", name)
+            name = re.sub(r"\^\{([^{}]*)\}", r"<sup>\1</sup>", name)
+            name = re.sub(r"_\{([^{}]*)\}", r"<sub>\1</sub>", name)
             if not name:
                 continue
             aff = ""
