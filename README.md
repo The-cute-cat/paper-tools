@@ -3,7 +3,7 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-学术论文相关实用工具集合。基于大语言模型（LLM），提供论文翻译、解析、下载等一站式工具链。
+学术论文与文档处理实用工具集合：基于大语言模型（LLM）的论文翻译，以及离线的通用 Markdown → Word / PDF 转换。
 
 ## 已支持工具
 
@@ -11,6 +11,7 @@
 |------|------|
 | [arxiv-translate](./paper_tools/tools/arxiv_translate/README.md) | 下载 arxiv HTML 论文，解析公式/图表/引用，调用 DeepSeek 翻译为中文 Markdown |
 | [pdf-translate](./paper_tools/tools/pdf_translate/README.md) | 本地 PDF 逐页视觉提取、跨页续接，再翻译为中文 Markdown |
+| [md-export](./paper_tools/tools/md_export/README.md) | 通用 Markdown → Word / PDF 转换：网络图片内嵌、公式渲染、表格/任务列表/代码块完整支持 |
 
 > 更多工具正在规划中，欢迎 [贡献](#贡献) 或提交 issue。
 
@@ -75,11 +76,16 @@ python main.py arxiv-translate 2605.26158v1 --export docx,pdf --no-md
 # 翻译本地 PDF（逐页视觉识别 → 翻译）
 python main.py pdf-translate "D:/papers/paper.pdf"
 python main.py pdf-translate "D:/papers/paper.pdf" --dpi 180 --extract-only
+
+# 把 markdown 转为 Word / PDF（网络图片自动下载内嵌、公式渲染为图片）
+python main.py md-export "D:/papers/paper.zh.md"
+python main.py md-export "D:/papers/paper.zh.md" --format docx --out ./exports
 ```
 
 各工具的输出文件、目录结构与进阶用法见对应工具文档：
 [arxiv-translate](./paper_tools/tools/arxiv_translate/README.md#输出说明) ·
-[pdf-translate](./paper_tools/tools/pdf_translate/README.md#输出)。
+[pdf-translate](./paper_tools/tools/pdf_translate/README.md#输出) ·
+[md-export](./paper_tools/tools/md_export/README.md#输出)。
 
 ## 配置
 
@@ -110,8 +116,12 @@ python main.py pdf-translate "D:/papers/paper.pdf" --dpi 180 --extract-only
 | `PAPER_TOOLS_SUMMARY_MAX_CHARS` | 立场摘要截断上限（字符，0=不截断） | `0` |
 | `PAPER_TOOLS_RESUME_MODE` | 断点续译模式：`ask`(终端询问) / `auto`(自动恢复) / `never`(从头重翻) | `ask` |
 | `PAPER_TOOLS_PDF_INPUT` | 待翻译的本地 PDF 文件路径（仅 pdf-translate；不支持下载 URL） | 空 |
+| `PAPER_TOOLS_PDF_DPI` | 页面渲染 DPI（72-300） | `160` |
 | `PAPER_TOOLS_PDF_EXTRACT_ONLY` | 仅提取：只做第一阶段逐页识别，不翻译（1/true 开启） | `false` |
 | `PAPER_TOOLS_PDF_MAX_TOKENS` | 视觉模型单页识别最大输出 token（密集页截断时调大） | `16384` |
+| `PAPER_TOOLS_MD_INPUT` | 待转换的本地 Markdown 文件路径（仅 md-export） | 空 |
+| `PAPER_TOOLS_MD_EXPORT_FORMATS` | md-export 导出格式（docx/pdf/docx_pdf/all） | `docx_pdf` |
+| `PAPER_TOOLS_MD_FONT` | md-export 中文正文字体（宋体/微软雅黑/黑体/楷体等） | `宋体` |
 
 > **价目表缓存**：Token 费用估算依赖 DeepSeek 官方定价。价目表不会写死在代码中，而是在首次使用时从官方定价页实时抓取，并缓存到 `paper_tools/core/pricing_cache.json`（默认 24 小时有效）。抓取失败时自动回退到最近一次成功缓存；若缓存与实时抓取均失败则报错提示。如需强制刷新价目表，删除该缓存文件后重新运行即可。
 
@@ -139,11 +149,15 @@ paper-tools/
 │       │   ├── main.py                  #     独立入口（可直接 IDE 运行）
 │       │   ├── pipeline.py              #     翻译流水线（下载→解析→翻译→写出）
 │       │   └── parser.py                #     ar5iv HTML 解析器
-│       └── pdf_translate/               #   工具：本地 PDF 论文翻译
+│       ├── pdf_translate/               #   工具：本地 PDF 论文翻译
+│       │   ├── README.md                #     工具详细文档
+│       │   ├── main.py                  #     独立入口（可直接 IDE 运行）
+│       │   ├── pipeline.py              #     提取 + 翻译流水线
+│       │   └── extractor.py             #     逐页渲染与视觉提取
+│       └── md_export/                   #   工具：Markdown → Word / PDF
 │           ├── README.md                #     工具详细文档
 │           ├── main.py                  #     独立入口（可直接 IDE 运行）
-│           ├── pipeline.py              #     提取 + 翻译流水线
-│           └── extractor.py             #     逐页渲染与视觉提取
+│           └── converter.py             #     Markdown 解析 + docx/pdf 渲染
 └── output/                              # 默认输出目录（gitignore）
 ```
 

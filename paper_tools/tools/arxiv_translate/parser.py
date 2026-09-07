@@ -246,6 +246,10 @@ def _normalize_tex_for_katex(tex: str) -> str:
       4. \\vskip<dimen>
             ar5iv 在 aligned/math 环境中插入的垂直间距（如 \\vskip-5.69054pt）。
             KaTeX 不支持该 TeX 原语。→ 直接删除，不影响公式语义。
+      5. \\mathbbm{X} / \\mathbbm X
+            bbm 宏包的黑板粗体（常见于指示函数 \\mathbbm{1}）。KaTeX 只支持
+            \\mathbb。→ 改写为 \\mathbb{X}（需保证 \\mathbbm 后不是字母，
+            避免误伤 \\mathbbmtt 等同包变体）。
 
     注意：本函数只处理 KaTeX 明确不支持的「安全改写」项。遇到未知命令时一律
     原样保留（见循环末尾的 out.append），以保证原文信息不丢失——宁可让 KaTeX
@@ -285,6 +289,26 @@ def _normalize_tex_for_katex(tex: str) -> str:
         # 注意：必须让 j 跳过 "\textsc" 全部字符后，再指向 '{' 由
         # _read_balanced_group 读取内容；若误写成 len(r"\textsc{") 会多吞一个
         # 字符导致读不到 '{'，从而整条规则失效（这一 bug 曾导致本问题复发）。
+        # —— 清单项 5：\mathbbm{X} → \mathbb{X} ——
+        # bbm 宏包的黑板粗体（常见于指示函数 𝟙，如 \mathbbm{1}），KaTeX 只支持
+        # \mathbb。注意 \mathbbmtt 等变体也存在于 bbm 包，需保证 \mathbbm 后
+        # 不是字母才应用本规则，避免误匹配。
+        if tex.startswith(r"\mathbbm", i):
+            j = i + len(r"\mathbbm")
+            if j >= n or not tex[j].isalpha():
+                while j < n and tex[j] == " ":
+                    j += 1
+                if j < n and tex[j] == "{":
+                    inner, k = _read_balanced_group(tex, j)
+                    if k > 0:
+                        out.append(r"\mathbb{" + inner + "}")
+                        i = k
+                        continue
+                elif j < n:
+                    # 无花括号的裸参数形式（\mathbbm 1）
+                    out.append(r"\mathbb{" + tex[j] + "}")
+                    i = j + 1
+                    continue
         # —— 清单项 4：剥离 aligned/math 中的 \vskip<dimen> ——
         # ar5iv 会在公式行内注入垂直间距（如 \vskip-5.69054pt），KaTeX 不支持。
         if tex.startswith(r"\vskip", i):
@@ -367,6 +391,9 @@ def _rich_text(tag: Tag) -> str:
 
         name = node.name
         cls = node.get("class") or []
+        if "ltx_ERROR" in cls:
+            # LaTeXML 环境转换错误标记（如损坏的 {wrapfigure}）——不是论文内容
+            return
         if "ltx_note" in cls and "ltx_role_footnote" in cls:
             # 脚注：只保留上标标记 [n]，不把脚注正文插入段落内部（避免重复数字与错位）
             mark = node.find(class_="ltx_note_mark")
@@ -529,6 +556,9 @@ def _plain_text(node: Tag | NavigableString, *, wrap_math: bool = False) -> str:
         return ""
     cls = node.get("class") or []
     name = node.name
+    if "ltx_ERROR" in cls:
+        # LaTeXML 环境转换错误标记（如损坏的 {wrapfigure}）——不是论文内容
+        return ""
     if "ltx_Math" in cls:
         tex = _tex_of(node)
         if not tex:
@@ -704,6 +734,53 @@ def parse_arxiv_html(
     # ar5iv 的 <img src> 形如 "2605.26158v1/x1.png"（相对 HTML 文档根）。
 
     blocks: list[Block] = []
+
+    # 清理 LaTeXML 环境转换错误残留（必须在 _assign_html_ids 之前，避免给垃圾
+    # 节点打上回写 id）。部分论文 LaTeX 源码损坏（如把 \begin{wrapfigure} 写错），
+    # LaTeXML 无法识别环境，会把错误标记 {wrapfigure} 与参数残骸 r0.53 一起当
+    # 正文吐进 HTML（<span class="ltx_ERROR undefined">{wrapfigure}</span>r0.53）。
+    # 这些不是论文内容：删除错误标记本身，并清理紧随其后（同层文本节点或紧随
+    # <p> 开头，中间可能隔着纯空白文本节点）形如 "r0.53" 的位置/宽度参数残骸。
+    _ENV_NAME_RE = re.compile("[{][a-zA-Z*]+[}]")
+    _ENV_ARG_JUNK_RE = re.compile(r"^\s*[lcr]?[0-9][0-9.]*")
+    for err in soup.find_all(class_="ltx_ERROR"):
+        if not _ENV_NAME_RE.fullmatch(err.get_text(strip=True)):
+            continue  # 其它类型的 ltx_ERROR 保留原样，不静默丢弃
+        nxt = err.next_sibling
+        while nxt is not None:
+            if isinstance(nxt, NavigableString):
+                if nxt.strip():
+                    nxt.replace_with(_ENV_ARG_JUNK_RE.sub("", str(nxt), count=1))
+                    break
+                nxt = nxt.next_sibling  # 纯空白分隔：继续看下一个节点
+                continue
+            if isinstance(nxt, Tag):
+                if nxt.name == "p":
+                    # 残骸可能被 LaTeXML 挪进紧随的段落开头（换行分隔时）
+                    for text_node in nxt.descendants:
+                        if isinstance(text_node, NavigableString) and text_node.strip():
+                            text_node.replace_with(
+                                _ENV_ARG_JUNK_RE.sub("", str(text_node), count=1))
+                            break
+                break
+            nxt = nxt.next_sibling
+        err.decompose()
+
+    # 把嵌在 <p class="ltx_p"> 内部的展示型插图（ltx_graphics）提升为其父容器的
+    # 直接子节点。LaTeXML 对损坏的 wrapfigure 环境会生成
+    # <div class="ltx_para"><p class="ltx_p">r0.5 <object class="ltx_graphics">…
+    # 而解析器只按 ltx_para 的直接子节点分发（p/textable/…），嵌在 p 里的插图
+    # 会被静默丢弃；提升后即可被 ltx_para 分支提取为图片块。
+    for p_el in soup.find_all("p", class_="ltx_p"):
+        graphics = [g for g in p_el.find_all(["img", "object"], recursive=False)
+                    if "ltx_graphics" in (g.get("class") or [])]
+        if not graphics:
+            continue
+        anchor: PageElement = p_el
+        for g in graphics:
+            g.extract()
+            anchor.insert_after(g)
+            anchor = g
 
     # 给每个"可翻译文本容器"打一个稳定的 data-zh-id，供翻译后回写 HTML
     # （生成 .zh.html，保留原 HTML 的表格合并/颜色/图片结构）。
@@ -1018,8 +1095,24 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
             #       P1, P2, P4, Eq1, Eq2, Eq3, Eq4）。
             # 修复：按子节点文档顺序遍历，逐节点分发到 paragraph / equation append，
             #       保留原始位置关系。
-            for sub in child.find_all(["p", "table", "ul", "ol", "span"], recursive=False):
+            for sub in child.find_all(["p", "table", "ul", "ol", "span", "img", "object"],
+                                      recursive=False):
                 sub_cls = sub.get("class") or []
+                if sub.name in ("img", "object") and "ltx_graphics" in sub_cls:
+                    # 损坏的 wrapfigure 等浮动环境会让 LaTeXML 把插图直接挂在
+                    # ltx_para 下（不经 <figure> 包裹、常无图注）。提取为图片块，
+                    # 避免整张图丢失。
+                    src = _as_str(sub.get("src")) or _as_str(sub.get("data"))
+                    if src:
+                        render_src = src if src.startswith("http") else (
+                            base_url.rstrip("/") + "/" + src.lstrip("/"))
+                        size = _img_size(sub) if sub.name == "img" else None
+                        blocks.append(Block(
+                            kind="figure", text="",
+                            raw=_html_img("figure", render_src, size),
+                            meta={"src": src, "local_src": render_src,
+                                  "html_id": _html_id_of(sub)}))
+                    continue
                 if "ltx_p" in sub_cls:
                     rich = _rich_text(sub)
                     if rich:
@@ -1181,11 +1274,15 @@ def _append_equation(eq: Tag, blocks: list[Block], html_id: str | None = None) -
         return
     label = eq.find(class_=re.compile(r"ltx_tag_equation"))
     lbl = _plain_text(label).strip() if label else ""
-    # 公式标签 (1)/(2) 紧跟在 $$ 块后（同一"段落"，不插入空行），
-    # 否则标记会被 KaTeX/浏览器隔断渲染成独立行
+    # 公式编号用 KaTeX 的 \tag 放进公式内：渲染时编号出现在公式同一行右侧
+    # （LaTeX 排版习惯）。若把 (1) 作为 $$ 块外的普通文本，Markdown 会把它
+    # 排到公式下一行，编号与公式分离。
+    # aligned 等多行环境的 \tag 会落在最后一行右侧，与 LaTeX 的整组编号一致。
     md = f"$$\n{tex}\n$$\n"
     if lbl:
-        md += f"{lbl}\n"
+        m = re.fullmatch(r"\((.+)\)", lbl)
+        tag = m.group(1) if m else lbl
+        md = f"$$\n{tex}\n\\tag{{{tag}}}\n$$\n"
     blocks.append(Block(kind="equation", text="", raw=md,
                         meta={"label": lbl, "html_id": html_id} if html_id else {"label": lbl}))
 

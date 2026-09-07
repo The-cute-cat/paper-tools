@@ -7,6 +7,8 @@
 可用工具：
     arxiv-translate   下载 arxiv HTML 论文并翻译为中文 markdown
     pdf-translate     本地 PDF 逐页视觉提取并翻译为中文 markdown
+    md-export         把本地 markdown 转换为 Word / PDF（处理网络图片与公式）
+                      例：python main.py md-export paper.zh.md [--format docx|pdf|all]
 
 环境变量（在 .env 或系统中配置，详见 README）：
     DEEPSEEK_API_KEY      必填，DeepSeek API key
@@ -55,6 +57,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="视觉模型单页识别最大输出 token（密集页截断时调大）")
     p.add_argument("--extract-only", action="store_true", help="仅执行识图提取（仍调用 API）")
     p.add_argument("--no-resume", action="store_true", help="不复用逐页识别缓存")
+    p = sub.add_parser("md-export", help="把本地 Markdown 转换为 Word / PDF（处理网络图片与公式）")
+    p.add_argument("input", nargs="?", default=None,
+                   help="Markdown 文件路径（留空则用 .env 的 PAPER_TOOLS_MD_INPUT）")
+    p.add_argument("--format", dest="fmt", default=None,
+                   help="输出格式：docx、pdf、docx_pdf / all（留空用配置，默认 docx_pdf）")
+    p.add_argument("--out", default=None, help="输出目录（默认与源文件同目录）")
     return parser
 
 
@@ -108,6 +116,19 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "arxiv-translate":
             out = arxiv_translate.run(args.input)
             logger.info(f"结果文件: {out}")
+        elif args.command == "md-export":
+            from paper_tools.tools.md_export import run as md_run
+
+            # 输入：CLI 位置参数 > .env 的 PAPER_TOOLS_MD_INPUT
+            input_arg = args.input or settings.md_input
+            if not input_arg:
+                logger.error("未指定 Markdown 文件：请传入 .md 路径，"
+                             "或在 .env 设置 PAPER_TOOLS_MD_INPUT。")
+                sys.exit(1)
+            outs = md_run(input_arg, fmt=args.fmt, out_dir=args.out,
+                          settings=settings)
+            for f in outs:
+                logger.info(f"结果文件: {f}")
     except Exception as e:  # noqa: BLE001
         logger.exception(f"执行失败: {e}")
         sys.exit(1)

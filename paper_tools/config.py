@@ -168,6 +168,16 @@ class AppSettings:
     # 可先重跑该页，若仍发生再调大本值（受模型上下文上限约束）；
     # 降低 DPI 无法解决，因为它不减少输出 token。
     pdf_max_output_tokens: int = 16384
+    # 待转换的本地 Markdown 文件路径（md-export 工具专用）。
+    # 环境变量 PAPER_TOOLS_MD_INPUT 可覆盖；为空时需在命令行/IDE 入口传入。
+    md_input: str = ""
+    # md-export 默认导出格式：docx、pdf、docx_pdf（等同同时导出两者）、all。
+    # 环境变量 PAPER_TOOLS_MD_EXPORT_FORMATS 可覆盖。
+    md_export_formats: str = "docx_pdf"
+    # md-export 中文正文字体（DOCX 写入 eastAsia 字体；PDF 按名称查找系统字体）。
+    # 常见可选：宋体（默认）、微软雅黑、黑体、楷体、仿宋、等线。
+    # 环境变量 PAPER_TOOLS_MD_FONT 可覆盖。
+    md_export_font: str = "宋体"
 
     def resolve(self) -> "AppSettings":
         """用环境变量/默认值补全缺失字段。"""
@@ -226,6 +236,12 @@ class AppSettings:
             self.summary_max_abstract_chars = int(env)
         if env := os.environ.get("PAPER_TOOLS_RESUME_MODE"):
             self.resume_mode = env.strip().lower()
+        if env := os.environ.get("PAPER_TOOLS_MD_INPUT"):
+            self.md_input = _repair_mangled_path(env.strip())
+        if env := os.environ.get("PAPER_TOOLS_MD_EXPORT_FORMATS"):
+            self.md_export_formats = env.strip().lower()
+        if env := os.environ.get("PAPER_TOOLS_MD_FONT"):
+            self.md_export_font = env.strip()
         return self
 
 
