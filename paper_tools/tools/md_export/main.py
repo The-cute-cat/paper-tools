@@ -38,10 +38,14 @@ def main() -> None:
     fmt = ""        # 输出格式：docx / pdf / docx_pdf / all
                     # 留空则用 .env 的 PAPER_TOOLS_MD_EXPORT_FORMATS（默认 docx_pdf）
     out_dir = ""    # 输出目录；留空则与源文件同目录
+    overwrite = ""  # 输出文件覆盖策略：ask（询问，默认）/ always / never
+                    # 留空则用 .env 的 PAPER_TOOLS_OVERWRITE 或默认 ask
 
     # ===== 参数生效 =====
     if out_dir:
         settings.output_dir = Path(out_dir)
+    if overwrite:
+        settings.overwrite_mode = overwrite
 
     # 待转换 Markdown：优先本文件的 md_path 常量，留空回退到 .env 的 PAPER_TOOLS_MD_INPUT。
     # 注意：刻意不回退到 PAPER_TOOLS_INPUT/PAPER_TOOLS_PDF_INPUT——分别是

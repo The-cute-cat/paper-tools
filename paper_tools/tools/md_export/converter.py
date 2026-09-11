@@ -39,6 +39,7 @@ from ...core.exporter import (
     _split_gfm_cells,
     _strip_inline,
 )
+from ...core.user_io import confirm_overwrite
 from ...core.math_render import render_math_to_png
 from ...logging_setup import get_logger
 
@@ -1293,6 +1294,10 @@ def run(md_path: str | Path | None = None, *, fmt: str | None = None,
     out_dir = Path(out_dir) if out_dir else md_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # 文件名长度保护：源文件名来自用户，超长 stem 会使输出路径超出
+    # Windows MAX_PATH（260）。截断到 120（与 arxiv 的 _safe_filename 一致）。
+    stem = md_path.stem[:120].rstrip(". ") or "document"
+
     # 缓存目录：网络图片下载 + 公式渲染 PNG，均放在源文件旁，便于复用
     cache_root = md_path.parent / f"{md_path.stem}.md_export"
     ctx = ConvertCtx(
@@ -1304,7 +1309,11 @@ def run(md_path: str | Path | None = None, *, fmt: str | None = None,
 
     results: list[Path] = []
     if want_docx:
-        results.append(blocks_to_docx(blocks, out_dir / f"{md_path.stem}.docx", ctx))
+        docx_out = out_dir / f"{stem}.docx"
+        if confirm_overwrite(docx_out, settings=settings):
+            results.append(blocks_to_docx(blocks, docx_out, ctx))
     if want_pdf:
-        results.append(blocks_to_pdf(blocks, out_dir / f"{md_path.stem}.pdf", ctx))
+        pdf_out = out_dir / f"{stem}.pdf"
+        if confirm_overwrite(pdf_out, settings=settings):
+            results.append(blocks_to_pdf(blocks, pdf_out, ctx))
     return results

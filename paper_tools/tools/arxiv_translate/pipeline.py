@@ -1,7 +1,6 @@
 """arxiv 论文翻译流水线：解析链接 -> 下载 -> 解析 -> 翻译 -> 写出 markdown。"""
 
 import re
-import sys
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -16,6 +15,7 @@ from ...core.downloader import download_binary, download_text
 from ...core.exporter import html_to_docx, html_to_pdf
 from ...core.glossary import Glossary, KEEP_AS_IS, Term, WRONG_VARIANT_MAP
 from ...core.translator import LLMTranslator, TABLE_UNTRANSLATABLE_MARKER
+from ...core.user_io import confirm_overwrite
 from ...logging_setup import get_logger
 from .parser import Block, parse_arxiv_html
 
@@ -110,19 +110,16 @@ class _TranslateCache:
 def _ask_resume(cache: _TranslateCache) -> str:
     """向用户询问断点恢复方式。返回 'resume' / 'new' / 'quit'。
 
-    * resume_mode=ask 且标准输入是 tty：打印选项并用 input() 读取单字符。
-    * 非 tty（CI / 重定向）或 resume_mode=auto：返回 'resume'。
+    * resume_mode=ask：打印选项并用 input() 读取。注意不用 isatty() 预判——
+      PyCharm 等 IDE 运行终端 isatty()=False 但允许输入；直接尝试读取，
+      真正读不到（CI 管道 / stdin 关闭，EOFError 等）时退化为 auto 恢复。
+    * resume_mode=auto：返回 'resume'。
     * resume_mode=never：返回 'new'。
     """
     mode = (get_settings().resume_mode or "ask").strip().lower()
     if mode == "never":
         return "new"
     if mode == "auto":
-        return "resume"
-
-    # ask 模式但无交互终端：退化为 auto，避免卡死
-    if not sys.stdin or not hasattr(sys.stdin, "isatty") or not sys.stdin.isatty():
-        logger.warning("检测到断点缓存但当前非交互终端，按 resume_mode=auto 自动恢复。")
         return "resume"
 
     prompt = (
@@ -135,7 +132,10 @@ def _ask_resume(cache: _TranslateCache) -> str:
     while True:
         try:
             ans = input(prompt).strip().lower()
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, OSError, RuntimeError):
+            logger.warning("无法从终端读取输入（无交互终端），按 resume_mode=auto 自动恢复。")
+            return "resume"
+        except KeyboardInterrupt:
             logger.warning("读取用户输入中断，按 resume_mode=auto 自动恢复。")
             return "resume"
         if ans in ("r", "resume"):
@@ -1429,6 +1429,21 @@ def run(url_or_id: str) -> Path:
         if b.kind == "title" and b.text:
             orig_title = b.text
             break
+
+    # 3.0 覆盖提醒：目标 markdown 已存在时按 overwrite_mode 询问。放在翻译等
+    # 耗时阶段之前，用户选择跳过即可原样保留现有文件，不浪费 LLM Token。
+    # title_zh 翻译模式的最终文件名依赖译文标题（此时未知），先按 ID 探测；
+    # 命名不一致的残留旧文件由写入阶段兜底（此类场景较少见）。
+    _name_mode = (settings.output_name_mode or "id").strip().lower()
+    if _name_mode == "title" or (_name_mode == "title_zh" and settings.translate_skip):
+        _probe_stem = _safe_filename(orig_title or arxiv_id)
+    else:
+        _probe_stem = arxiv_id
+    _probe_out = workdir / f"{_probe_stem}{'.en.md' if settings.translate_skip else '.zh.md'}"
+    if not confirm_overwrite(_probe_out, settings=settings, logger=logger):
+        existing = _probe_out if _probe_out.exists() else None
+        logger.info(f"已取消覆盖，保留现有文件: {existing or _probe_out}")
+        return existing or _probe_out
 
     # 3.1 短块合并：过短的相邻文本块组成翻译单元一起请求（JSON 分块翻译，但各块内容保持独立）
     blocks, units = _merge_short_blocks(

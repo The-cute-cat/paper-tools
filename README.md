@@ -115,6 +115,7 @@ python main.py md-export "D:/papers/paper.zh.md" --format docx --out ./exports
 | `PAPER_TOOLS_INPUT` | 待翻译的 arxiv 链接或 ID（命令行/INPUT 常量未提供时的回退） | 空 |
 | `PAPER_TOOLS_SUMMARY_MAX_CHARS` | 立场摘要截断上限（字符，0=不截断） | `0` |
 | `PAPER_TOOLS_RESUME_MODE` | 断点续译模式：`ask`(终端询问) / `auto`(自动恢复) / `never`(从头重翻) | `ask` |
+| `PAPER_TOOLS_OVERWRITE` | 输出文件覆盖策略：`ask`(终端询问) / `always`(直接覆盖) / `never`(跳过写入)；CLI 可用 `--overwrite`/`--no-overwrite` | `ask` |
 | `PAPER_TOOLS_PDF_INPUT` | 待翻译的本地 PDF 文件路径（仅 pdf-translate；不支持下载 URL） | 空 |
 | `PAPER_TOOLS_PDF_DPI` | 页面渲染 DPI（72-300） | `160` |
 | `PAPER_TOOLS_PDF_EXTRACT_ONLY` | 仅提取：只做第一阶段逐页识别，不翻译（1/true 开启） | `false` |

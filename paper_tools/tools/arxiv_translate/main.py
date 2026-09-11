@@ -52,6 +52,9 @@ def main() -> None:
     output_markdown = True
     # 跳过翻译：True 时不调用 LLM，仅解析并输出论文英文原文（结构化原文 markdown）。
     translate_skip = False
+    # 输出文件覆盖策略：ask（询问，默认）/ always（直接覆盖）/ never（跳过写入）。
+    # 留空则用 .env 的 PAPER_TOOLS_OVERWRITE 或默认 ask。
+    overwrite = ""
 
     # ===== 参数生效 =====
     if api_key:
@@ -60,6 +63,8 @@ def main() -> None:
         settings.llm.model = model
     if out_dir:
         settings.output_dir = Path(out_dir)
+    if overwrite:
+        settings.overwrite_mode = overwrite
     if cite_search:
         settings.cite_search_engine = cite_search.lower()
     if cite_display:

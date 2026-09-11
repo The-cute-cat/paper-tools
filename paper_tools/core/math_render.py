@@ -56,6 +56,17 @@ _MACRO_MAP = {
 # 把独立的 & 替换为 \ \& （mathtext 中 & 不是合法文本）
 _AMP_RE = re.compile(r"(?<!\\)&(?!&)")
 
+# mathtext 不认识的 LaTeX 简写别名（按"完整命令词"替换，避免 \leq 被 \le 规则
+# 二次改写为 \leqq）。已实测：mathtext 支持 \leq/\geq/\ne/\leqslant/\geqslant/
+# \dfrac，但不支持 \le/\ge/\lt/\gt/\tfrac/\mathbbm。
+_ALIAS_MAP = {
+    "le": r"\leq", "ge": r"\geq", "lt": "<", "gt": ">",
+    "tfrac": r"\frac", "mathbbm": r"\mathbb",
+}
+_ALIAS_RE = re.compile(r"\\([a-zA-Z]+)")
+# 装饰性尺寸命令（\big( / \Bigl[ / \bigr) 等）：删除命令本身、保留其后定界符
+_SIZING_RE = re.compile(r"\\(?:big|Big|bigg|Bigg)[lrm]?(?=[()[\]{}|<>])")
+
 
 def _clean_tex(tex: str) -> str:
     s = " ".join(tex.split())
@@ -67,6 +78,11 @@ def _clean_tex(tex: str) -> str:
     s = _NEWLINE_RE.sub("; ", s)
     for k, v in _MACRO_MAP.items():
         s = s.replace(k, v)
+    # 别名归一（放在 _MACRO_MAP 之后：上面是朴素子串替换，会误伤 \leq 等）
+    s = _ALIAS_RE.sub(
+        lambda m: _ALIAS_MAP[m.group(1)] if m.group(1) in _ALIAS_MAP else m.group(0),
+        s)
+    s = _SIZING_RE.sub("", s)
     s = _AMP_RE.sub(r" \& ", s)
     # 去掉多余 $$ 包裹（mathtext 用 $...$ 或 r"..."）
     s = s.strip().strip("$").strip()

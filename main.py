@@ -45,6 +45,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="额外导出格式：docx、pdf、docx_pdf、all（逗号分隔，如 --export docx,pdf）")
     p.add_argument("--no-md", action="store_true",
                    help="不输出 .zh.md，仅导出 docx/pdf（默认两种都输出）")
+    p.add_argument("--overwrite", action="store_true",
+                   help="目标文件已存在时直接覆盖（默认按配置，ask=询问）")
+    p.add_argument("--no-overwrite", action="store_true",
+                   help="目标文件已存在时不覆盖，跳过写入")
     p = sub.add_parser("pdf-translate", help="逐页识别本地 PDF 论文并翻译为中文 Markdown")
     p.add_argument("input", nargs="?", default=None,
                    help="本地 PDF 文件路径（留空则用 .env 的 PAPER_TOOLS_PDF_INPUT）")
@@ -57,12 +61,20 @@ def build_parser() -> argparse.ArgumentParser:
                    help="视觉模型单页识别最大输出 token（密集页截断时调大）")
     p.add_argument("--extract-only", action="store_true", help="仅执行识图提取（仍调用 API）")
     p.add_argument("--no-resume", action="store_true", help="不复用逐页识别缓存")
+    p.add_argument("--overwrite", action="store_true",
+                   help="目标文件已存在时直接覆盖（默认按配置，ask=询问）")
+    p.add_argument("--no-overwrite", action="store_true",
+                   help="目标文件已存在时不覆盖，跳过写入")
     p = sub.add_parser("md-export", help="把本地 Markdown 转换为 Word / PDF（处理网络图片与公式）")
     p.add_argument("input", nargs="?", default=None,
                    help="Markdown 文件路径（留空则用 .env 的 PAPER_TOOLS_MD_INPUT）")
     p.add_argument("--format", dest="fmt", default=None,
                    help="输出格式：docx、pdf、docx_pdf / all（留空用配置，默认 docx_pdf）")
     p.add_argument("--out", default=None, help="输出目录（默认与源文件同目录）")
+    p.add_argument("--overwrite", action="store_true",
+                   help="目标文件已存在时直接覆盖（默认按配置，ask=询问）")
+    p.add_argument("--no-overwrite", action="store_true",
+                   help="目标文件已存在时不覆盖，跳过写入")
     return parser
 
 
@@ -71,6 +83,11 @@ def main(argv: list[str] | None = None) -> None:
 
     # 应用配置 + 日志
     settings = get_settings()
+    # 覆盖策略开关（对所有子命令生效）：CLI 显式指定 > .env 的 PAPER_TOOLS_OVERWRITE
+    if getattr(args, "overwrite", None):
+        settings.overwrite_mode = "always"
+    elif getattr(args, "no_overwrite", None):
+        settings.overwrite_mode = "never"
     if args.command == "arxiv-translate":
         if args.out:
             settings.output_dir = __import__("pathlib").Path(args.out)

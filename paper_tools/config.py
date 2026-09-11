@@ -68,6 +68,19 @@ def _repair_mangled_path(value: str) -> str:
     return value
 
 
+def _clean_path_value(value: str) -> str:
+    """清理环境变量里的路径值：去空白 + 剥离误写的包裹引号 + 还原转义破坏。
+
+    用户可能把引号写进值里（如 ``PAPER_TOOLS_MD_INPUT='\\"D:\\\\a.md\\"'``），
+    经 dotenv 转义解码后引号会成为路径的一部分，导致「文件不存在」。
+    这里去掉成对包裹的引号（可能有多层），再修复控制字符。
+    """
+    v = (value or "").strip()
+    while len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+        v = v[1:-1].strip()
+    return _repair_mangled_path(v)
+
+
 @dataclass
 class LLMSettings:
     """大模型（翻译）相关配置。"""
@@ -154,6 +167,11 @@ class AppSettings:
     #   auto  = 自动恢复（无交互环境或 CI 下默认沿用缓存，跳过已翻译块）
     #   never = 总是从头翻译（忽略缓存，启动即删除）
     resume_mode: str = "ask"
+    # 输出文件覆盖策略：目标 markdown/译文文件已存在时如何处理。
+    #   ask    = 终端询问 覆盖/跳过/退出（默认；非交互终端自动退化为跳过）
+    #   always = 直接覆盖
+    #   never  = 不覆盖，跳过写入（保留现有文件）
+    overwrite_mode: str = "ask"
     pdf_vision_model: str = "deepseek-v4-flash-vision-exp"
     pdf_dpi: int = 160
     # 待翻译的本地 PDF 文件路径（PDF 工具专用，不支持下载 URL）。
@@ -195,11 +213,11 @@ class AppSettings:
         if env := os.environ.get("PAPER_TOOLS_PDF_MAX_TOKENS"):
             self.pdf_max_output_tokens = int(env)
         if env := os.environ.get("PAPER_TOOLS_PDF_INPUT"):
-            self.pdf_input = _repair_mangled_path(env.strip())
+            self.pdf_input = _clean_path_value(env)
         if env := os.environ.get("PAPER_TOOLS_PDF_EXTRACT_ONLY"):
             self.pdf_extract_only = env.strip().lower() in ("1", "true", "yes", "on")
         if env := os.environ.get("PAPER_TOOLS_OUTPUT"):
-            self.output_dir = Path(_repair_mangled_path(env))
+            self.output_dir = Path(_clean_path_value(env))
         if env := os.environ.get("PAPER_TOOLS_LOG_LEVEL"):
             self.log_level = env
         if env := os.environ.get("PAPER_TOOLS_CONCURRENCY"):
@@ -231,13 +249,15 @@ class AppSettings:
         if env := os.environ.get("PAPER_TOOLS_SKIP_TRANSLATE"):
             self.translate_skip = env.strip().lower() in ("1", "true", "yes", "on")
         if env := os.environ.get("PAPER_TOOLS_INPUT"):
-            self.arxiv_input = env.strip()
+            self.arxiv_input = _clean_path_value(env)
         if env := os.environ.get("PAPER_TOOLS_SUMMARY_MAX_CHARS"):
             self.summary_max_abstract_chars = int(env)
         if env := os.environ.get("PAPER_TOOLS_RESUME_MODE"):
             self.resume_mode = env.strip().lower()
+        if env := os.environ.get("PAPER_TOOLS_OVERWRITE"):
+            self.overwrite_mode = env.strip().lower()
         if env := os.environ.get("PAPER_TOOLS_MD_INPUT"):
-            self.md_input = _repair_mangled_path(env.strip())
+            self.md_input = _clean_path_value(env)
         if env := os.environ.get("PAPER_TOOLS_MD_EXPORT_FORMATS"):
             self.md_export_formats = env.strip().lower()
         if env := os.environ.get("PAPER_TOOLS_MD_FONT"):

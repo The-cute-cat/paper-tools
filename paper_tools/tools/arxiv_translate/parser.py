@@ -782,6 +782,21 @@ def parse_arxiv_html(
             anchor.insert_after(g)
             anchor = g
 
+    # 兼容 LaTeXML oxide（arxiv 新版官方 HTML 生成器）：没有 ltx_title_document，
+    # 论文标题是首个 section 里伪装成 ltx_title_section 的 <h2>（其文本与 <title>
+    # 标签一致）。把它改标为 ltx_title_document，走统一的标题提取路径——否则
+    # 标题块为空，name_mode=title 时文件名回退成 arxiv ID，且正文里会出现与
+    # 文档标题重复的伪一级标题。
+    if not soup.find(class_="ltx_title_document"):
+        def _norm_title(s: str) -> str:
+            return re.sub(r"\s+", " ", s or "").strip().lower()
+        html_title = _norm_title(soup.title.get_text()) if soup.title else ""
+        if html_title:
+            for h in soup.find_all(class_="ltx_title_section"):
+                if _norm_title(h.get_text()) == html_title:
+                    h["class"] = ["ltx_title", "ltx_title_document"]
+                    break
+
     # 给每个"可翻译文本容器"打一个稳定的 data-zh-id，供翻译后回写 HTML
     # （生成 .zh.html，保留原 HTML 的表格合并/颜色/图片结构）。
     _assign_html_ids(soup)
@@ -820,6 +835,11 @@ def parse_arxiv_html(
                             text=title_plain,
                             raw=title_plain,
                             meta={"html_id": _html_id_of(doc_title)}))
+    elif soup.title:
+        # 兜底：任何 HTML 变体的 <title> 标签都是论文标题
+        title_plain = _simplify_tex_plain(re.sub(r"\s+", " ", soup.title.get_text()))
+        if title_plain:
+            blocks.append(Block(kind="title", level=1, text=title_plain, raw=title_plain))
 
     # 提取作者与机构信息。ar5iv 把作者列表放在 <div class="ltx_authors"> 中，
     # 每位作者是 <span class="ltx_creator ltx_role_author">，内含 .ltx_personname
@@ -838,9 +858,9 @@ def parse_arxiv_html(
             # · 脚注 mark：_plain_text 转成 [mark]（如 "Pengyuan Liu[2]"）→ <sup>
             # · 普通上标：sub/sup 元素产出 ^{∗}（共同一作 ∗、通讯 †、‡ 等）→ <sup>
             # · 下标（罕见）_{...} → <sub>
-            name = re.sub(r"\[([^\]]+)\]", r"<sup>\1</sup>", name)
-            name = re.sub(r"\^\{([^{}]*)\}", r"<sup>\1</sup>", name)
-            name = re.sub(r"_\{([^{}]*)\}", r"<sub>\1</sub>", name)
+            name = re.sub(r"\[([^][]+)\]", r"<sup>\1</sup>", name)
+            name = re.sub(r"\^\{([^{}]*)}", r"<sup>\1</sup>", name)
+            name = re.sub(r"_\{([^{}]*)}", r"<sub>\1</sub>", name)
             if not name:
                 continue
             aff = ""
@@ -965,13 +985,36 @@ def _emit_text_box(span: Tag, blocks: list[Block]) -> None:
         return
 
     # 找出"实在的"段落：<span class="ltx_p"> 内嵌在 foreignobject 之下。
+    # 纯插图段落（oxide 图形结构里 p 只包着 img）不算文字段落——交给下方
+    # graphics 逻辑输出，否则同一张图会以 "> <img>" 和独立图片块重复出现。
     paragraphs = span.find_all(class_="ltx_p", recursive=True)
     real_ps: list[Tag] = []
     for p in paragraphs:
-        if not _rich_text(p).strip():
+        rich = _rich_text(p).strip()
+        if not rich:
+            continue
+        if not re.sub(r"<img[^>]*/?>", "", rich).strip():
             continue
         real_ps.append(p)
-    if not real_ps:
+
+    # 同时提取内嵌的展示型插图：LaTeXML oxide（arxiv 新版 HTML）把论文插图包在
+    # <div class="ltx_inline-block"><div transformed_outer><span transformed_inner>
+    # <p><span><img class="ltx_graphics"> 五层结构里。只提取文字会丢整张图。
+    graphics: list[Block] = []
+    for g in span.find_all(["img", "object"], recursive=True):
+        if "ltx_graphics" not in (g.get("class") or []):
+            continue
+        src = _as_str(g.get("src")) or _as_str(g.get("data"))
+        if not src:
+            continue
+        # src 已在 parse_arxiv_html 预处理阶段归一化（本地路径或完整 URL）
+        size = _img_size(g) if g.name == "img" else None
+        graphics.append(Block(
+            kind="figure", text="",
+            raw=_html_img("figure", src, size),
+            meta={"src": src, "local_src": src, "html_id": _html_id_of(g)}))
+
+    if not real_ps and not graphics:
         return
 
     # 合并所有段落：原文按 "\n" 拼接（保持多段结构），富文本 raw 用 "> " 逐段包裹
@@ -985,34 +1028,35 @@ def _emit_text_box(span: Tag, blocks: list[Block]) -> None:
         plain_parts.append(plain)
         rich_parts.append(f"> {rich}")
 
-    if not rich_parts:
-        return
+    if rich_parts:
+        # 主动给这个 text_box 容器打一个 data-zh-id，供后续 .zh.html 回填时定位。
+        # 它内嵌在 SVG <foreignobject> 里，不会被子流程 _assign_html_ids 自动打标。
+        # 用块序号生成稳定 id（soup 在 parse 阶段已经过 _assign_html_ids，
+        # 这里追加的新 id 不会与已有冲突，因为已用的 id 是 zh-N 形式）。
+        box_id = f"zh-textbox-{len(blocks)}"
+        span["data-zh-id"] = box_id
 
-    # 主动给这个 text_box 容器打一个 data-zh-id，供后续 .zh.html 回填时定位。
-    # 它内嵌在 SVG <foreignobject> 里，不会被子流程 _assign_html_ids 自动打标。
-    # 用块序号生成稳定 id（soup 在 parse 阶段已经过 _assign_html_ids，
-    # 这里追加的新 id 不会与已有冲突，因为已用的 id 是 zh-N 形式）。
-    box_id = f"zh-textbox-{len(blocks)}"
-    span["data-zh-id"] = box_id
+        blocks.append(Block(
+            kind="text_box",
+            text="\n".join(plain_parts),
+            raw="\n".join(rich_parts),
+            meta={"html_id": box_id,
+                  "text_box_md": "\n".join(rich_parts)},
+        ))
 
-    blocks.append(Block(
-        kind="text_box",
-        text="\n".join(plain_parts),
-        raw="\n".join(rich_parts),
-        meta={"html_id": box_id,
-              "text_box_md": "\n".join(rich_parts)},
-    ))
+        # 同一文本框内可能还包含 SVG <foreignobject> 包裹的 <span class="ltx_listing">——
+        # 也就是"带框的代码块 / Prompt 模板正文"。例如 Furina 论文 Appendix A 的
+        # "Minor / Moderate / High / Semantic Rewrite Prompt"：外层是图片化文本框
+        # （ltx_inline-block + SVG），框内第一段是标题（已作为 text_box 第一段输出），
+        # 第二段是真正的提示词代码块（带行号的 ltx_listing）。早期实现只在 ltx_paragraph
+        # 直接子节点是 ltx_listing 时才调 _append_listing，嵌在 inline-block 内的
+        # listing 被静默忽略，导致整段 prompt 文本丢失。补一次扫描：对该 span 内的
+        # 每个 ltx_listing 复用行提取逻辑，以 fenced code block 形式输出
+        # （不含行内数学，故无需 GFM 表格），标题已由 text_box 第一段承载，避免重复。
+        _emit_inline_listings(span, blocks, box_id)
 
-    # 同一文本框内可能还包含 SVG <foreignobject> 包裹的 <span class="ltx_listing">——
-    # 也就是"带框的代码块 / Prompt 模板正文"。例如 Furina 论文 Appendix A 的
-    # "Minor / Moderate / High / Semantic Rewrite Prompt"：外层是图片化文本框
-    # （ltx_inline-block + SVG），框内第一段是标题（已作为 text_box 第一段输出），
-    # 第二段是真正的提示词代码块（带行号的 ltx_listing）。早期实现只在 ltx_paragraph
-    # 直接子节点是 ltx_listing 时才调 _append_listing，嵌在 inline-block 内的
-    # listing 被静默忽略，导致整段 prompt 文本丢失。补一次扫描：对该 span 内的
-    # 每个 ltx_listing 复用行提取逻辑，以 fenced code block 形式输出
-    # （不含行内数学，故无需 GFM 表格），标题已由 text_box 第一段承载，避免重复。
-    _emit_inline_listings(span, blocks, box_id)
+    # 内嵌插图（oxide 论文图的所在处）放在文本之后输出
+    blocks.extend(graphics)
 
 
 def _emit_inline_listings(span: Tag, blocks: list[Block], box_id: str) -> None:
@@ -1067,6 +1111,28 @@ def _emit_inline_listings(span: Tag, blocks: list[Block], box_id: str) -> None:
         ))
 
 
+def _emit_verbatim_pre(pre: Tag, blocks: list[Block]) -> None:
+    """提取 <pre class="ltx_verbatim"> 代码块为 fenced code block。
+
+    ar5iv 旧版把 verbatim 包在 ltx_listing / figure 里（已有对应分支）；
+    LaTeXML oxide（arxiv 新版官方 HTML）则把 <pre class="ltx_verbatim"> 直接
+    挂在 ltx_para 下（附录的 judge prompt / 攻击 wrapper 代码块）。两条路径
+    都不覆盖后者，导致代码块整体丢失。
+    """
+    text = pre.get_text().strip("\n")
+    if not text.strip():
+        return
+    fence = "```"
+    while fence in text:
+        fence += "`"
+    code_block = f"{fence}\n{text}\n{fence}"
+    blocks.append(Block(kind="listing", text="",
+                        raw=code_block,
+                        meta={"html_id": _html_id_of(pre),
+                              "listing_md": code_block,
+                              "listing_raw": code_block}))
+
+
 def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
                   base_url: str = "") -> None:
     """按文档顺序遍历 section 的直接子内容节点。"""
@@ -1087,6 +1153,11 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
             _walk_section(child, blocks, img_mapping, base_url)
             continue
 
+        # LaTeXML oxide 可能把 verbatim 代码块直接挂在 section 下（罕见，防御）
+        if child.name == "pre" and "ltx_verbatim" in cls:
+            _emit_verbatim_pre(child, blocks)
+            continue
+
         if "ltx_para" in cls:
             # ltx_para 内部通常交错着 <p class="ltx_p"> 段落和 <table class="ltx_equation...">
             # 公式块。早期实现是"先按段落、再按公式"两轮 append，会把整个段落容器
@@ -1095,9 +1166,14 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
             #       P1, P2, P4, Eq1, Eq2, Eq3, Eq4）。
             # 修复：按子节点文档顺序遍历，逐节点分发到 paragraph / equation append，
             #       保留原始位置关系。
-            for sub in child.find_all(["p", "table", "ul", "ol", "span", "img", "object"],
+            for sub in child.find_all(["p", "table", "ul", "ol", "span", "img", "object",
+                                       "pre", "div"],
                                       recursive=False):
                 sub_cls = sub.get("class") or []
+                if sub.name == "pre" and "ltx_verbatim" in sub_cls:
+                    # LaTeXML oxide 把 verbatim 代码块直接挂在 ltx_para 下
+                    _emit_verbatim_pre(sub, blocks)
+                    continue
                 if sub.name in ("img", "object") and "ltx_graphics" in sub_cls:
                     # 损坏的 wrapfigure 等浮动环境会让 LaTeXML 把插图直接挂在
                     # ltx_para 下（不经 <figure> 包裹、常无图注）。提取为图片块，
@@ -1135,6 +1211,9 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
                     # （<span class="ltx_inline-block"><svg class="ltx_picture">...
                     # <foreignobject><span class="ltx_p">真实文本</span></foreignobject>）。
                     # 实际文本可回收利用，必须在 ltx_para 分支里递归挖出来。
+                    # LaTeXML oxide（arxiv 新版 HTML）的论文插图同样包在
+                    # <div class="ltx_inline-block"> 里（img.ltx_graphics 深嵌
+                    # transformed_inner > p > span），若不分发整个图会被丢弃。
                     _emit_text_box(sub, blocks)
             continue
 
@@ -1155,11 +1234,14 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
             # figure、table、listing 通常直接挂在 ltx_paragraph 下。
             # 行为约束：paragraph / equation 必须保持文档顺序；
             # figure / table / listing 是块级结构元素也参与顺序维护。
-            tag_kinds = ("h4", "div", "p", "table", "figure")
+            tag_kinds = ("h4", "div", "p", "table", "figure", "pre")
 
             def _emit(el):
                 el_cls = el.get("class") or []
                 el_cls_set = set(el_cls)
+                if el.name == "pre" and "ltx_verbatim" in el_cls_set:
+                    _emit_verbatim_pre(el, blocks)
+                    return
                 if "ltx_p" in el_cls_set:
                     para_text = _rich_text(el)
                     if para_text:

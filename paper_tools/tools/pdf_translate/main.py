@@ -55,6 +55,9 @@ def main() -> None:
     # Token 用量报告：True 时翻译结束后输出 token 消耗与费用估算。
     # 也可用 .env 的 PAPER_TOOLS_TOKEN_REPORT
     token_report = False
+    # 输出文件覆盖策略：ask（询问，默认）/ always（直接覆盖）/ never（跳过写入）。
+    # 留空则用 .env 的 PAPER_TOOLS_OVERWRITE 或默认 ask。
+    overwrite = ""
 
     # ===== 参数生效 =====
     if api_key:
@@ -69,6 +72,8 @@ def main() -> None:
         settings.pdf_dpi = int(dpi)
     if max_output_tokens:
         settings.pdf_max_output_tokens = int(max_output_tokens)
+    if overwrite:
+        settings.overwrite_mode = overwrite
     if str(token_report).strip().lower() in ("1", "true", "yes", "on"):
         settings.token_report = True
     if str(translate_skip).strip().lower() in ("1", "true", "yes", "on"):
