@@ -86,7 +86,7 @@ class LLMSettings:
     """大模型（翻译）相关配置。"""
     provider: str = "deepseek"
     api_key: str = ""
-    model: str = "deepseek-v4-flash"
+    model: str = "deepseek-flash"
     base_url: str = "https://api.deepseek.com"
     temperature: float = 0.3
     timeout: int = 60
@@ -144,6 +144,14 @@ class AppSettings:
     # Token 用量报告：翻译结束后在日志中输出总 token 消耗、缓存命中/未命中及其占比。
     # 默认关闭，避免控制台刷屏；可通过配置或环境变量 PAPER_TOOLS_TOKEN_REPORT 开启。
     token_report: bool = False
+    # 价目表解析方式（DeepSeek 官方定价页 → 结构化价格）：
+    #   ai  （默认）= 把页面正文交给 LLM 按固定 JSON schema 抽取。官方改版、模型
+    #                 改名/改价、峰谷档位增删都无需改代码，并能从脚注里识别模型别名
+    #                 （把旧模型名映射到当前计费模型）；LLM 失败时自动回落规则解析。
+    #   rule       = 仅用本地规则（BeautifulSoup + 关键词/正则）解析，零成本、结果
+    #                 确定，但官方一改列结构或文案措辞就可能失效。
+    # 环境变量 PAPER_TOOLS_PRICING_PARSER 可覆盖。
+    pricing_parser: str = "ai"
     # 导出格式：翻译完成后自动导出为哪些额外格式。
     # 可选值：docx、pdf、docx_pdf（等同于同时 docx+pdf）、all（docx+pdf）。
     # 留空表示不导出额外格式，只输出 .zh.md。
@@ -172,7 +180,10 @@ class AppSettings:
     #   always = 直接覆盖
     #   never  = 不覆盖，跳过写入（保留现有文件）
     overwrite_mode: str = "ask"
-    pdf_vision_model: str = "deepseek-v4-flash-vision-exp"
+    # PDF 第一阶段逐页识别用的视觉模型。须支持「图像理解」：deepseek-flash 支持，
+    # deepseek-v4-pro 不支持。该值参与逐页缓存 key，改动会导致已有缓存页重算。
+    # 环境变量 DEEPSEEK_VISION_MODEL 可覆盖。
+    pdf_vision_model: str = "deepseek-flash"
     pdf_dpi: int = 160
     # 待翻译的本地 PDF 文件路径（PDF 工具专用，不支持下载 URL）。
     # 环境变量 PAPER_TOOLS_PDF_INPUT 可覆盖；为空时回退到 main.py 的 pdf_path 常量。
@@ -242,6 +253,8 @@ class AppSettings:
             self.merge_target_max = int(env)
         if env := os.environ.get("PAPER_TOOLS_TOKEN_REPORT"):
             self.token_report = env.strip().lower() in ("1", "true", "yes", "on")
+        if env := os.environ.get("PAPER_TOOLS_PRICING_PARSER"):
+            self.pricing_parser = env.strip().lower()
         if env := os.environ.get("PAPER_TOOLS_EXPORT_FORMATS"):
             self.export_formats = env.strip().lower()
         if env := os.environ.get("PAPER_TOOLS_OUTPUT_MD"):

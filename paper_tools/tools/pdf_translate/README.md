@@ -39,8 +39,8 @@ token_report = False               # 输出 token 用量与费用估算
 ```dotenv
 DEEPSEEK_API_KEY=你的密钥
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-v4-flash
-DEEPSEEK_VISION_MODEL=deepseek-v4-flash-vision-exp
+DEEPSEEK_MODEL=deepseek-flash
+DEEPSEEK_VISION_MODEL=deepseek-flash
 PAPER_TOOLS_PDF_DPI=160
 PAPER_TOOLS_PDF_MAX_TOKENS=16384
 

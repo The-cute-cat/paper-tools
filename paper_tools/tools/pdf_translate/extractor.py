@@ -332,28 +332,51 @@ class VisionExtractor:
                 )
 
 
+# 视觉模型更名兼容：官方说明旧模型名 deepseek-v4-flash-vision-exp 的请求仍由
+# DeepSeek-V4.1-Flash（即 deepseek-flash）提供服务，因此更名前已缓存的逐页识别
+# 结果依然有效，不应因改名而全部重算。
+_VISION_MODEL_ALIASES = {
+    "deepseek-flash": "deepseek-v4-flash-vision-exp",
+    "deepseek-v4-flash-vision-exp": "deepseek-flash",
+}
+
+
 def _extraction_cache_keys(digest: str, page_number: int, carry: str,
                            settings: AppSettings, page_text_hint: str,
                            asset_ids: list[str]) -> tuple[str, set[str]]:
     """返回当前缓存键及可兼容的旧键。
 
-    max_tokens 只限制失败响应，不影响一份已经完整并通过校验的结果，因此不应
-    让调大上限导致前面所有成功页面失效。兼容旧版 16384 键，确保现有任务续跑。
+    三类兼容：
+
+    * max_tokens 只限制失败响应，不影响一份已经完整并通过校验的结果，因此不应
+      让调大上限导致前面所有成功页面失效（兼容参与哈希的旧版 16384 键）；
+    * 视觉模型更名（见 ``_VISION_MODEL_ALIASES``）：实际服务方是同一模型，因此
+      更名前用旧模型名写入的键也一并接受，避免整本 PDF 重算；
+    * 旧版无 ``v2`` 前缀、但 max_tokens 参与哈希的键。
     """
-    stable = ["v2", digest, page_number, carry, settings.pdf_dpi,
-              settings.pdf_vision_model, settings.llm.base_url, PROMPT,
-              page_text_hint, asset_ids]
-    current = hashlib.sha256(
-        json.dumps(stable, ensure_ascii=False).encode()
-    ).hexdigest()
-    legacy = set()
-    for limit in {settings.pdf_max_output_tokens, 16384}:
-        old = [digest, page_number, carry, settings.pdf_dpi,
-               settings.pdf_vision_model, settings.llm.base_url, PROMPT,
-               limit, page_text_hint, asset_ids]
-        legacy.add(hashlib.sha256(
-            json.dumps(old, ensure_ascii=False).encode()
-        ).hexdigest())
+    def key_of(model_name: str, limit: int | None = None,
+               versioned: bool = True) -> str:
+        if versioned:
+            payload: list = ["v2", digest, page_number, carry, settings.pdf_dpi,
+                             model_name, settings.llm.base_url, PROMPT,
+                             page_text_hint, asset_ids]
+        else:
+            payload = [digest, page_number, carry, settings.pdf_dpi,
+                       model_name, settings.llm.base_url, PROMPT,
+                       limit, page_text_hint, asset_ids]
+        return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()
+
+    model_names = {settings.pdf_vision_model}
+    if alias := _VISION_MODEL_ALIASES.get(settings.pdf_vision_model):
+        model_names.add(alias)
+
+    current = key_of(settings.pdf_vision_model)
+    legacy: set[str] = set()
+    for model_name in model_names:
+        legacy.add(key_of(model_name))
+        for limit in {settings.pdf_max_output_tokens, 16384}:
+            legacy.add(key_of(model_name, limit, versioned=False))
+    legacy.discard(current)
     return current, legacy
 
 

@@ -212,7 +212,12 @@ class TokenUsage:
         """
         from .pricing import get_model_price  # 延迟导入，避免循环依赖
 
-        price = get_model_price(model)
+        try:
+            price = get_model_price(model)
+        except Exception as exc:  # noqa: BLE001
+            # 费用估算失败不应影响翻译结果：报告环节只少一行花费，不中断流程
+            _log.warning("获取模型 %s 的价目失败，跳过费用估算：%s", model, exc)
+            return None
         if price is None:
             _log.warning("未获取到模型 %s 的价目，无法估算费用", model)
             return None

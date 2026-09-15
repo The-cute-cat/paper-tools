@@ -12,7 +12,7 @@
 
 环境变量（在 .env 或系统中配置，详见 README）：
     DEEPSEEK_API_KEY      必填，DeepSeek API key
-    DEEPSEEK_MODEL        可选，模型名（默认 deepseek-v4-flash）
+    DEEPSEEK_MODEL        可选，模型名（默认 deepseek-flash）
     DEEPSEEK_BASE_URL     可选，API 地址
     PAPER_TOOLS_OUTPUT    可选，默认输出根目录
     PAPER_TOOLS_LOG_LEVEL 可选，日志级别（默认 INFO）

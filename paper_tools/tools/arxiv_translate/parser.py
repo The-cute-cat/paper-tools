@@ -48,37 +48,59 @@ def _cite_search_url(query: str, engine: str | None = None) -> str:
 
 # ar5iv 正文引用 <cite><a href="#bib...">作者 年份</a></cite> 的 <a title> 通常为空，
 # 论文题目其实保存在文末 bibliography 区块（#bib.xxx 对应的 <li class="ltx_bibitem">）。
-# 正文引用解析时从这里取论文名，才能生成带"搜索引擎链接 + 悬浮论文名"的引用，
+# 正文引用解析时从这里取论文名与外链，才能生成"可点击直达文献"的引用，
 # 否则引用只能退化成无链接的纯文字（再经翻译后彻底丢失）。
 # 该映射在 parse_arxiv_html 开头按当前 soup 重建，避免跨文件调用串味。
-_BIB_MAP: dict[str, str] = {}
+_BIB_MAP: dict[str, dict] = {}
 
 
-def _build_bib_map(soup: "BeautifulSoup") -> dict[str, str]:
-    """解析 ar5iv bibliography，建立 #bib.xxx -> 论文标题 映射。
+def _build_bib_map(soup: "BeautifulSoup") -> dict[str, dict]:
+    """解析 bibliography，建立 #bib.xxx -> {"title":..., "url":...} 映射。
 
-    ar5iv 的 <li class="ltx_bibitem" id="bib.bibN"> 内通常含多个 <span
-    class="ltx_bibblock">：第一个多为 "Author. Year."，后续含论文标题与 URL。
-    策略：取所有 ltx_bibblock 文本，剔除含 http 的（那是链接块），再从剩余里
-    取第一个不含 4 位年份的块作为标题（标题一般形如 "Introducing chatgpt."）。
+    <li class="ltx_bibitem" id="bib.bibN"> 内通常含多个 <span class="ltx_bibblock">：
+      ① ltx_tag（[2] 自锚点）② 作者 ③ 标题 ④ 期刊/预印本 ⑤ External Links
+      ⑥ Cited by: §A.1 , §2（反向索引，内部 href 全是 # 片段）
+
+    取标题必须排除 ⑤（含 http）与 ⑥（cited-by）；否则会把 "Cited by: §..." 当标题，
+    引用链接的搜索词就成了反向索引文本（Mar 2026 审计发现）。
+    取外链只认 http(s) 绝对链接并取 DOM 顺序**最后一个**：LaTeXML 先输出
+    Document(DOI) 再输出 Link，而本页存在双重编码的坏 DOI
+    （https://dx.doi.org/https%3A//doi.org/...），取末尾的 Link 正好绕过。
+    无外链时在条目文本里正则捞裸 URL（如 Note: https://...）。
     """
-    bib_map: dict[str, str] = {}
+    bib_map: dict[str, dict] = {}
     for item in soup.find_all("li", class_="ltx_bibitem"):
         bid = item.get("id")
         if not isinstance(bid, str) or not bid.startswith("bib."):
             continue
-        anchor = "#" + bid
         blocks = [b.get_text(" ", strip=True) for b in item.find_all(class_="ltx_bibblock")]
-        blocks = [b for b in blocks if b and "http" not in b.lower()]
+        # 标题候选：排除链接块、Cited by 反向索引块与 External Links/ISBN/DOI 等元数据块
+        meta_prefixes = ("cited by", "external links", "isbn", "doi:", "url:", "note:")
+        cand = [b for b in blocks
+                if b and "http" not in b.lower()
+                and not b.lower().startswith(meta_prefixes)]
         title = ""
-        for b in reversed(blocks):
-            if not re.search(r"\b(?:19|20)\d{2}\b", b):
-                title = b.rstrip(". ").strip()
-                break
-        if not title and blocks:
-            title = blocks[-1].rstrip(". ").strip()
-        if title:
-            bib_map[anchor] = title
+        # LaTeXML 惯例：bibblock[0]=作者，[1]=标题（仅当 [1] 不含年份时采信）
+        if len(cand) >= 2 and not re.search(r"\b(?:19|20)\d{2}\b", cand[1]):
+            title = cand[1].rstrip(". ").strip()
+        else:
+            # 兜底：从后往前取第一个不含年份的块（排除元数据块后的最后一个）
+            for b in reversed(cand):
+                if not re.search(r"\b(?:19|20)\d{2}\b", b):
+                    title = b.rstrip(". ").strip()
+                    break
+        if not title and cand:
+            title = cand[-1].rstrip(". ").strip()
+        # 外部直链：http(s) 绝对链接，取最后一个（Link 优先于 Document）
+        urls = [a["href"] for a in item.find_all("a", href=True)
+                if isinstance(a.get("href"), str)
+                and a["href"].startswith(("http://", "https://"))]
+        url = urls[-1] if urls else None
+        if not url:
+            m = re.search(r"https?://\S+", item.get_text(" ", strip=True))
+            if m:
+                url = m.group(0).rstrip(".,;)]")
+        bib_map["#" + bid] = {"title": title, "url": url}
     return bib_map
 
 
@@ -374,6 +396,37 @@ def _looks_like_inline_math(tex: str) -> bool:
     )
 
 
+_MATH_SPAN_RE = re.compile(r"\$([^$\n]+)\$")
+
+
+def _fix_math_spacing(text: str) -> str:
+    """统一行内公式与相邻文字的间距，且**不改动公式内部**。
+
+    旧实现用两条不区分开/闭定界符的正则全局替换，会把空格插进公式内部，
+    产出 ``$ \\Delta $``、``$ =0$`` 这类脏数据（2026-03 审计 Minionese）。
+    这里按公式边界分段处理：公式内部 strip，公式外侧只在必要时补一个空格。
+    """
+    if "$" not in text:
+        return text
+    out: list[str] = []
+    pos = 0
+    for m in _MATH_SPAN_RE.finditer(text):
+        out.append(re.sub(r"[ \t]+", " ", text[pos:m.start()]))
+        inner = m.group(1).strip()
+        # 公式前：紧贴文字/右括号等则补一个空格（左括号/已有空白则不加）
+        if out and out[-1] and not out[-1][-1].isspace() and out[-1][-1] not in "([{$":
+            out.append(" ")
+        out.append(f"${inner}$")
+        pos = m.end()
+    tail = re.sub(r"[ \t]+", " ", text[pos:])
+    # 公式后：紧贴文字则补空格；后接标点则不补
+    if out and out[-1].endswith("$") and tail and not tail[0].isspace() \
+            and tail[0] not in ",.;:)]}，。；：）】":
+        out.append(" ")
+    out.append(tail)
+    return "".join(out)
+
+
 def _rich_text(tag: Tag) -> str:
     """把含行内公式/强调/链接的片段转为保留公式的 markdown 文本。"""
     parts: list[str] = []
@@ -413,18 +466,30 @@ def _rich_text(tag: Tag) -> str:
                 if isinstance(c, Tag) and c.name == "a" and "ltx_ref" in (c.get("class") or []):
                     title = _as_str(c.get("title")) or ""
                     visible = c.get_text().strip()
-                    # 正文引用的 <a title> 通常为空，论文名在 bibliography 区块；
-                    # 用预解析的 #bib.xxx -> 论文标题 映射补上，确保引用仍能生成
-                    # 带"搜索引擎链接 + 悬浮论文名"的可点击引用。
+                    url_override = None
+                    # 正文引用的 <a title> 通常为空，论文名/外链在 bibliography 区块；
+                    # 用预解析的 #bib.xxx -> {title, url} 映射补上，确保引用可点击直达。
                     if not title:
                         href = _as_str(c.get("href")) or ""
-                        title = _BIB_MAP.get(href, "")
+                        info = _BIB_MAP.get(href) or {}
+                        title = info.get("title", "")
+                        url_override = info.get("url")
                     if title:
                         # 去掉 title 末尾的 bibkey 年份后缀，如 ", 2024a" → "Title"
                         clean_title = re.sub(r",\s*\d{4}[a-z]?\s*$", "", title).strip()
-                        url = _cite_search_url(clean_title)
-                        # 去掉 visible 末尾多余逗号（避免 "Kuhn et al.,, Title"）
                         vis = visible.rstrip(", ").strip()
+                        if url_override:
+                            # 条目带外部直链：直接指向文献页（arXiv/ACL/出版社等）
+                            url = url_override
+                        else:
+                            # 无外链条目（如只有 ISBN）：用"一作姓氏 + 标题"兜底搜索。
+                            # 绝不能用 cited-by 文本当查询词（信息有损且多篇同 URL）。
+                            author = re.sub(
+                                r"\b(?:et al\.?|and others)\b|(?:19|20)\d{2}[a-z]?",
+                                " ", vis, flags=re.IGNORECASE)
+                            author = re.sub(r"[^\w\u4e00-\u9fff-]+", " ", author).strip()
+                            query = f"{author} {clean_title}".strip()
+                            url = _cite_search_url(query or clean_title)
                         if display_mode == "title":
                             display = f"{vis}, {clean_title}" if vis else clean_title
                         else:  # "short"
@@ -510,11 +575,14 @@ def _rich_text(tag: Tag) -> str:
 
     walk(tag)
     text = "".join(parts)
+    text = text.replace("\u00a0", " ")  # NBSP 归一为普通空格
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{2,}", "\n", text)
     # 公式两侧保留单个空格，避免与正文中英文字粘连（如 "parameters $\theta$ define"）
-    text = re.sub(r"\s*\$([\s$])", lambda m: " $" + m.group(1), text)
-    text = re.sub(r"([\s$])\$\s*", lambda m: m.group(1) + "$ ", text)
+    text = _fix_math_spacing(text)
+    # 排版断字：行尾连字符 + 换行 + 小写字母 → 合并为连字符词
+    # （保留连字符是保守选择：不会把真实复合词粘成 "machinetranslated"）
+    text = re.sub(r"-\n(?=[a-z])", "-", text)
     text = re.sub(r" +", " ", text)
     # 修复：合并紧贴粗体标签的公式前缀（如 **H**$_{tok}$ → **$H_{tok}$**）
     # ar5iv 中表头常将指标名用 <strong>H</strong><sub>tok</sub> 分开渲染，
@@ -835,6 +903,16 @@ def parse_arxiv_html(
                             text=title_plain,
                             raw=title_plain,
                             meta={"html_id": _html_id_of(doc_title)}))
+        # 部分论文把首页插图直接嵌在 <h1>（文档标题）内部，标题块只取文本会漏图
+        for g in doc_title.find_all(["img", "object"]):
+            src = _as_str(g.get("src")) or _as_str(g.get("data"))
+            if not src:
+                continue
+            size = _img_size(g) if g.name == "img" else None
+            blocks.append(Block(kind="figure", text="",
+                                raw=_html_img("figure", src, size),
+                                meta={"src": src, "local_src": src,
+                                      "html_id": _html_id_of(g)}))
     elif soup.title:
         # 兜底：任何 HTML 变体的 <title> 标签都是论文标题
         title_plain = _simplify_tex_plain(re.sub(r"\s+", " ", soup.title.get_text()))
@@ -882,14 +960,21 @@ def parse_arxiv_html(
                     # 通讯作者 / 共同一作 等身份说明通常放在 thanks 里。
                     # 将长句压缩为简短角色标签，便于在同一行显示且不破坏 markdown。
                     lowered = contact_text.lower()
-                    if re.search(r"corresponding", lowered):
+                    if re.search(r"correspond", lowered):
                         roles.append("Corresponding author")
                     elif re.search(r"equal(ly)?|co[-\s]?first", lowered):
                         roles.append("Equal contribution")
                     else:
                         roles.append(contact_text)
                 elif "ltx_role_email" in cls:
-                    roles.append(f"Email: {contact_text}")
+                    # 邮箱 contact 里常混入 "Correspondence to: xxx@yy" 整句：
+                    # 只抽邮箱地址，通讯说明归入角色标签，避免出现
+                    # "Email: Correspondence to: xxx" 这种自造畸形串。
+                    if re.search(r"correspond", contact_text, re.IGNORECASE):
+                        roles.append("Corresponding author")
+                    emails = re.findall(r"[\w.+-]+@[\w.-]+\.\w+", contact_text)
+                    if emails:
+                        roles.append("Email: " + ", ".join(dict.fromkeys(emails)))
             # 组装：机构放最前，身份说明随后，姓名后的上标保留。例如：
             #   Changliang Li (Beijing Language and Culture University, Corresponding author)
             #   Pengyuan Liu<sup>2</sup> (MIT)
@@ -911,6 +996,27 @@ def parse_arxiv_html(
                                 meta={"html_id": _html_id_of(authors_div),
                                       "lines": author_entries}))
 
+    # 作者声明（共同一作/通讯等）：LaTeXML 渲染成畸形串
+    # "††affiliationnotice: Equal contribution"，且挂在 <article> 下（不在
+    # authors 容器内），早期实现会整条丢失。这里取 note 正文并挂到作者块之后。
+    for note in soup.find_all(class_="ltx_role_affiliationnotice"):
+        if note.find_parent(class_="ltx_authors") is not None:
+            continue  # 作者行内的 thanks 已由上面 authors 分支处理，避免重复
+        content_tag = note.find(class_="ltx_note_content") or note
+        note_text = re.sub(r"^[^\w\u4e00-\u9fff]*", "", _plain_text(content_tag))
+        note_text = re.sub(r"^(?:affiliationnotice|thanks|note)\s*:\s*", "",
+                           note_text, flags=re.IGNORECASE).strip()
+        if note_text:
+            blocks.append(Block(kind="paragraph", text=note_text, raw=f"* {note_text}",
+                                meta={"html_id": _html_id_of(note)}))
+
+    # 前排"孤儿"段落容器（article 直属、不在任何 section 内）：Content Warning
+    # 边框盒等。_walk_section 只遍历 section 子节点，这类内容此前被整体丢弃。
+    _doc_root = soup.find("article") or soup.find(class_="ltx_page_content") or soup.body
+    if _doc_root is not None:
+        for para_div in _doc_root.find_all("div", class_="ltx_para", recursive=False):
+            _emit_orphan_para(para_div, blocks)
+
     abstract = soup.find(class_="ltx_abstract")
     if abstract:
         abstract_title = abstract.find(class_="ltx_title_abstract")
@@ -923,11 +1029,21 @@ def parse_arxiv_html(
             rich = _rich_text(p)
             blocks.append(Block(kind="paragraph", text=_plain_text_for_translation(p), raw=rich,
                                 meta={"html_id": _html_id_of(p), "section": "abstract"}))
-        keywords = abstract.find(class_="ltx_keywords")
-        if keywords:
-            blocks.append(Block(kind="paragraph", text=_plain_text(keywords),
-                                raw="**关键词：** " + _plain_text(keywords).strip(),
-                                meta={"html_id": _html_id_of(keywords)}))
+
+    # 关键词：可能内嵌于 abstract，也可能是 <article> 直属的 div.ltx_keywords
+    # （部分论文如此，只看 abstract 内部会整行丢失）。全局查找一次即可。
+    keywords = soup.find(class_="ltx_keywords")
+    if keywords is not None:
+        label_tag = keywords.find(class_=re.compile(r"ltx_title_keywords"))
+        label = _plain_text(label_tag).strip() if label_tag else "Keywords:"
+        full = _plain_text(keywords).strip()
+        value = full[len(label):].strip() if label and full.startswith(label) else full
+        if value or label:
+            blocks.append(Block(
+                kind="paragraph",
+                text=f"{label} {value}".strip(),
+                raw=f"**{label}** {value}".strip(),
+                meta={"html_id": _html_id_of(keywords)}))
 
     content = soup.find("article") or soup.find(class_="ltx_page_content") or soup.body
     if content is None:
@@ -943,7 +1059,63 @@ def parse_arxiv_html(
                                 meta={"html_id": _html_id_of(title_tag)}))
         _walk_section(sec, blocks, img_mapping, base_url)
 
+    # References 整节回收（此前被整节丢弃，正文引用 #bib.xxx 全部悬空）
+    _append_bibliography(soup, blocks)
+
     return blocks, soup
+
+
+def _emit_orphan_para(div: Tag, blocks: list[Block]) -> None:
+    """提取"孤儿"段落容器（article 直属、不在任何 section 内）。
+
+    典型：LaTeXML 把 Content Warning 边框盒、投稿信息等放在
+    <div class="ltx_para"> 直接挂到 <article> 下。_walk_section 只遍历
+    section 子节点，这类前排内容会被整体丢掉。
+    """
+    for sub in div.find_all(["p", "table", "ul", "ol", "pre"], recursive=False):
+        sub_cls = sub.get("class") or []
+        if sub.name == "pre" and "ltx_verbatim" in sub_cls:
+            _emit_verbatim_pre(sub, blocks)
+        elif "ltx_p" in sub_cls:
+            rich = _rich_text(sub)
+            if rich.strip():
+                blocks.append(Block(kind="paragraph",
+                                    text=_plain_text_for_translation(sub), raw=rich,
+                                    meta={"html_id": _html_id_of(sub)}))
+        elif sub.name == "table" and "ltx_equation" not in sub_cls:
+            _append_table(sub, blocks)
+        elif sub.name in ("ul", "ol"):
+            _emit_list(sub, blocks)
+
+
+def _append_bibliography(soup: "BeautifulSoup", blocks: list[Block]) -> None:
+    """回收 References 整节（历史上被整节丢弃，导致正文引用锚点悬空）。
+
+    条目内保留外部链接（"External Links: ... Link"），但剔除 "Cited by: §..."
+    反向索引块——那是 arXiv 页面的附加索引，不属于文献条目内容。
+    """
+    bib = soup.find("section", class_="ltx_bibliography")
+    if bib is None:
+        return
+    blocks.append(Block(kind="heading", level=2, text="References", raw="References",
+                        meta={"html_id": _html_id_of(bib)}))
+    for li in bib.find_all("li", class_="ltx_bibitem"):
+        parts: list[str] = []
+        for b in li.find_all(class_="ltx_bibblock"):
+            if b.get_text(" ", strip=True).lower().startswith("cited by"):
+                continue
+            rich = _rich_text(b).strip()
+            if rich:
+                parts.append(rich)
+        if not parts:
+            continue
+        entry = " ".join(parts)
+        # 剔除"双重编码"的坏链：本页 Document 链接被渲染成
+        # https://dx.doi.org/https%3A//doi.org/...，写进 markdown 无意义且不可点。
+        # 只去掉链接外壳、保留可见文字（同条目通常还有正常的 Link 外链）。
+        entry = re.sub(r"\[([^\]]+)\]\((?:https?://)[^)\s]*%3[Aa][^)\s]*\)", r"\1", entry)
+        blocks.append(Block(kind="list_item", level=0, text=entry, raw="- " + entry,
+                            meta={"html_id": _html_id_of(li)}))
 
 
 def _emit_list(ul: Tag, blocks: list[Block]) -> None:
@@ -959,7 +1131,23 @@ def _emit_list(ul: Tag, blocks: list[Block]) -> None:
     if not any(c in " ".join(ul.get("class") or []) for c in ("ltx_itemize", "ltx_enumerate")):
         return
     for li in ul.find_all(class_="ltx_item", recursive=False):
-        for p in li.find_all(class_="ltx_p", recursive=True):
+        ps = li.find_all(class_="ltx_p", recursive=True)
+        if not ps:
+            # 部分论文（LaTeXML 新版）的 li 直接是文本 + ltx_tag_item，没有 ltx_p
+            # 包裹；早期实现只认 ltx_p，导致整个列表丢失（Minionese 的 contributions
+            # 与 18 语言 tier 清单）。此处退回用 li 自身文本，并剥离编号标记。
+            rich = _rich_text(li)
+            tag_el = li.find(class_=re.compile(r"ltx_tag_item|ltx_tag\b"), recursive=False)
+            if tag_el is not None:
+                marker = _rich_text(tag_el).strip()
+                if marker and rich.lstrip().startswith(marker):
+                    rich = rich.lstrip()[len(marker):].lstrip()
+            if rich.strip():
+                blocks.append(Block(kind="list_item", level=0,
+                                    text=_plain_text_for_translation(li), raw="- " + rich.strip(),
+                                    meta={"html_id": _html_id_of(li)}))
+            continue
+        for p in ps:
             rich = _rich_text(p)
             if rich:
                 blocks.append(Block(kind="list_item", level=0,
@@ -1206,6 +1394,11 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
                     # <div class="ltx_para"><ul class="ltx_itemize">...</ul></div>）。
                     # 早期实现漏掉了这种情况，导致列表项整体丢失。
                     _emit_list(sub, blocks)
+                elif sub.name == "table":
+                    # 裸 <table class="ltx_tabular"> 直接挂在 ltx_para 下（附录 E 的
+                    # 示例内容就是这种形态）：只有 ltx_equation 分支、没有通用表格
+                    # 分支时会被整块丢弃。公式表已被上面的 elif 拦下，这里处理其余。
+                    _append_table(sub, blocks)
                 elif "ltx_inline-block" in sub_cls:
                     # ar5iv 把"Prompt 示例"等带框内容渲染成 SVG 图片
                     # （<span class="ltx_inline-block"><svg class="ltx_picture">...
@@ -1264,6 +1457,13 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
                 if "ltx_table" in el_cls_set:
                     _append_table(el, blocks)
                     return
+                if el.name == "table":
+                    # 裸表格（class 只有 ltx_tabular，无 ltx_table 包裹）同样要提取
+                    _append_table(el, blocks)
+                    return
+                if el.name in ("ul", "ol"):
+                    _emit_list(el, blocks)
+                    return
                 if any(c in el_cls_set for c in ("ltx_algorithm", "ltx_listing", "ltx_float_algorithm")):
                     _append_listing(el, blocks)
                     return
@@ -1310,6 +1510,11 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
                             return
                         if node.name in ("figure", "table"):
                             _emit(node)
+                            return
+                        if node.name in ("ul", "ol"):
+                            # 列表嵌在透明容器里（如 section.ltx_paragraph >
+                            # div.ltx_para > ul.ltx_itemize：18 语言 tier 清单）
+                            _emit_list(node, blocks)
                             return
                         # 其他容器（比如更深层 div）继续透传
                         if node.name in ("div", "section"):
@@ -1360,11 +1565,13 @@ def _append_equation(eq: Tag, blocks: list[Block], html_id: str | None = None) -
     # （LaTeX 排版习惯）。若把 (1) 作为 $$ 块外的普通文本，Markdown 会把它
     # 排到公式下一行，编号与公式分离。
     # aligned 等多行环境的 \tag 会落在最后一行右侧，与 LaTeX 的整组编号一致。
-    md = f"$$\n{tex}\n$$\n"
+    # 结尾不带换行：_block_to_md 会补一个，若这里再带一个会在公式后留下连续
+    # 两个空行（Markdown 渲染成额外空白）。
+    md = f"$$\n{tex}\n$$"
     if lbl:
         m = re.fullmatch(r"\((.+)\)", lbl)
         tag = m.group(1) if m else lbl
-        md = f"$$\n{tex}\n\\tag{{{tag}}}\n$$\n"
+        md = f"$$\n{tex}\n\\tag{{{tag}}}\n$$"
     blocks.append(Block(kind="equation", text="", raw=md,
                         meta={"label": lbl, "html_id": html_id} if html_id else {"label": lbl}))
 

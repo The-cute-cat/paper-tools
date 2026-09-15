@@ -68,7 +68,7 @@ python main.py arxiv-translate https://arxiv.org/abs/2605.26158
 python main.py arxiv-translate 2605.26158v1
 
 # 指定输出目录 / 模型 / API Key（覆盖配置）
-python main.py arxiv-translate 2605.26158v1 --out ./my-output --model deepseek-chat
+python main.py arxiv-translate 2605.26158v1 --out ./my-output --model deepseek-flash
 
 # 额外导出 docx / pdf（实验中 experimental）；--no-md 可只产出导出格式
 python main.py arxiv-translate 2605.26158v1 --export docx,pdf --no-md
@@ -94,7 +94,7 @@ python main.py md-export "D:/papers/paper.zh.md" --format docx --out ./exports
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `DEEPSEEK_API_KEY` | DeepSeek API Key（必填） | — |
-| `DEEPSEEK_MODEL` | 模型名称 | `deepseek-v4-flash` |
+| `DEEPSEEK_MODEL` | 模型名称 | `deepseek-flash` |
 | `DEEPSEEK_BASE_URL` | API 地址 | `https://api.deepseek.com` |
 | `PAPER_TOOLS_OUTPUT` | 输出根目录 | `./output` |
 | `PAPER_TOOLS_LOG_LEVEL` | 日志级别 | `INFO` |
@@ -109,6 +109,7 @@ python main.py md-export "D:/papers/paper.zh.md" --format docx --out ./exports
 | `PAPER_TOOLS_CITE_DISPLAY` | 引用显示模式（short/title） | `short` |
 | `PAPER_TOOLS_NAME_MODE` | 输出文件命名方式（id/title/title_zh） | `id` |
 | `PAPER_TOOLS_TOKEN_REPORT` | 翻译结束后在日志输出 token 用量与费用估算（1/true 开启） | `false` |
+| `PAPER_TOOLS_PRICING_PARSER` | 价目表解析方式：`ai`(LLM 抽取，抗页面改版) / `rule`(本地规则，零成本) | `ai` |
 | `PAPER_TOOLS_EXPORT_FORMATS` | 额外导出格式（docx/pdf/docx_pdf/all，逗号分隔；实验中 experimental） | 空 |
 | `PAPER_TOOLS_OUTPUT_MD` | 导出额外格式时是否仍输出 `.zh.md`（1/true 默认） | `true` |
 | `PAPER_TOOLS_SKIP_TRANSLATE` | 跳过翻译，仅解析并输出论文英文原文（1/true；开启后无需 API Key） | `false` |
@@ -124,7 +125,11 @@ python main.py md-export "D:/papers/paper.zh.md" --format docx --out ./exports
 | `PAPER_TOOLS_MD_EXPORT_FORMATS` | md-export 导出格式（docx/pdf/docx_pdf/all） | `docx_pdf` |
 | `PAPER_TOOLS_MD_FONT` | md-export 中文正文字体（宋体/微软雅黑/黑体/楷体等） | `宋体` |
 
-> **价目表缓存**：Token 费用估算依赖 DeepSeek 官方定价。价目表不会写死在代码中，而是在首次使用时从官方定价页实时抓取，并缓存到 `paper_tools/core/pricing_cache.json`（默认 24 小时有效）。抓取失败时自动回退到最近一次成功缓存；若缓存与实时抓取均失败则报错提示。如需强制刷新价目表，删除该缓存文件后重新运行即可。
+> **价目表缓存**：Token 费用估算依赖 DeepSeek 官方定价。价目表不会写死在代码中，而是在首次使用时从官方定价页实时抓取，并缓存到 `paper_tools/core/pricing_cache.json`（默认 24 小时有效）。
+>
+> 解析方式由 `PAPER_TOOLS_PRICING_PARSER` 决定，默认 `ai`：把页面正文（表格按行展平 + 脚注）交给 LLM 按固定 JSON schema 抽取，因此官方改版、模型改名改价、峰谷档位增删都无需改代码，还能从脚注里识别旧模型名别名（如把 `deepseek-v4-flash` 映射到当前的 `deepseek-flash`）。LLM 不可用（未配 Key、超时、返回不合法）时自动回落到本地规则解析（`rule`，纯 BeautifulSoup + 关键词/正则，零成本、结果确定，但官方改版后可能失效）。
+>
+> 两条通道的产出都要通过同一套校验（币种/单位、数值范围、模型名合法性、空闲价不高于高峰价）才会写入缓存；缓存会记录来源（`source`）。抓取与解析均失败时回退到最近一次缓存（含已过期缓存）；全部失败才报错提示。如需强制刷新价目表，删除该缓存文件后重新运行即可，也可直接运行 `python -m paper_tools.core.pricing` 查看当前解析结果。
 
 ## 项目结构
 
@@ -143,7 +148,8 @@ paper-tools/
 │   │   ├── exporter.py                  #   DOCX / PDF 导出（实验性）
 │   │   ├── math_render.py               #   公式渲染辅助
 │   │   ├── glossary.py                  #   术语表（翻译记忆）
-│   │   └── pricing.py                   #   DeepSeek 价目表动态获取与本地缓存
+│   │   ├── pricing.py                   #   DeepSeek 价目表动态获取（LLM 抽取 + 规则兜底）与本地缓存
+│   │   └── pricing_prompts.yaml         #   价目表抽取 prompt 模板
 │   └── tools/                           # 工具目录（每个子目录是一个独立工具）
 │       ├── arxiv_translate/             #   工具：arxiv 论文翻译
 │       │   ├── README.md                #     工具详细文档

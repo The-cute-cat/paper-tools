@@ -35,8 +35,8 @@ def main() -> None:
     pdf_path = r""       # 本地 PDF 文件路径，例如 r"D:/papers/paper.pdf"（不支持下载 URL）
                          # 留空则用 .env 的 PAPER_TOOLS_PDF_INPUT
     api_key = ""        # 留空则用 .env / 环境变量里的 DEEPSEEK_API_KEY
-    model = ""          # 第二阶段翻译模型，留空则用配置默认（deepseek-v4-flash）
-    vision_model = ""   # 第一阶段视觉提取模型，留空则用配置默认（deepseek-v4-flash-vision-exp）
+    model = ""          # 第二阶段翻译模型，留空则用配置默认（deepseek-flash）
+    vision_model = ""   # 第一阶段视觉提取模型，留空则用配置默认（deepseek-flash）
     out_dir = ""        # 留空则用配置里的默认输出目录（项目根/output）
     dpi = 0             # 页面渲染 DPI（72-300），0 表示用配置默认（160）
                         # 也可用 .env 的 PAPER_TOOLS_PDF_DPI

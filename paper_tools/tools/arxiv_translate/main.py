@@ -30,7 +30,7 @@ def main() -> None:
     # ===== 在这里填写参数 =====
     input_ = ""  # arxiv 链接或 ID，例如 "https://arxiv.org/abs/2605.26158v1" 或 "2605.26158v1"
     api_key = ""            # 留空则用 .env / 环境变量里的 DEEPSEEK_API_KEY
-    model = ""              # 留空则用配置里的默认模型（deepseek-v4-flash）
+    model = ""              # 留空则用配置里的默认模型（deepseek-flash）
     out_dir = ""            # 留空则用配置里的默认输出目录（项目根/output）
     # 引用搜索引擎：google | bing | duckduckgo | semantic_scholar | arxiv（默认 bing，国内可访问）
     cite_search = "bing"

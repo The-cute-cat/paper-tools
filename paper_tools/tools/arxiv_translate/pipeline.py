@@ -323,6 +323,27 @@ def _strip_trailing_punct(text: str) -> str:
     return text.rstrip(".。")
 
 
+_FENCE_BLOCK_RE = re.compile(r"(?ms)^[ \t]*(`{3,}|~{3,})[^\n]*\n.*?^[ \t]*\1[ \t]*$")
+
+
+def _normalize_nbsp(body: str) -> str:
+    """把 NBSP（U+00A0）归一为普通空格，fenced code block 内部保持原样。
+
+    源 HTML 里 NBSP 常出现在表格单元格、图注、标题等不走 _rich_text 的位置，
+    渲染时表现为奇怪的不可见字符，翻译时也可能被模型误判。
+    """
+    if "\u00a0" not in body:
+        return body
+    out: list[str] = []
+    pos = 0
+    for m in _FENCE_BLOCK_RE.finditer(body):
+        out.append(body[pos:m.start()].replace("\u00a0", " "))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(body[pos:].replace("\u00a0", " "))
+    return "".join(out)
+
+
 def _escape_md_atx_headings(md: str) -> str:
     """转义 markdown 行首的 ATX 标题标记（# ~ ######），避免正文 / 提示词模板里
     字面以 "#..." 开头的行（如附录 A 的 "## Given Question"）被误渲染成标题。
@@ -397,13 +418,13 @@ def _block_to_md(block: Block, translation: str, img_mapping: dict[str, str],
         # 列表项严格保持单段渲染：一个块 = 一条 list_item，
         # 即便译文里残留了 ⟦NEWPAR⟧ 标记（不该出现，兜底清洗），也不应拆段。
         # 强制 strip 防止模型混入标记破坏 markdown 列表结构。
-        # 原文模式(use_original)用富文本 block.raw（保留 **粗体**/链接），
-        # 并去掉 parser 加的 "- " 前缀以维持既有的"非项目符号"渲染（避免改坏已审结构）。
+        # 保留 "- " 项目符号：此前为"非项目符号"渲染而剥掉，导致列表在 markdown
+        # 里退化成普通段落（2026-03 审计 Minionese 的 contributions/tier 清单）。
         if use_original:
             raw = block.raw or ""
-            text = raw[2:].lstrip() if raw.startswith("- ") else raw
+            text = raw if raw.startswith("- ") else (f"- {raw}" if raw else "")
         else:
-            text = translation
+            text = f"- {translation}" if (translation or "").strip() else ""
         cleaned = _NEWPAR_RE.sub("", text).strip()
         return _escape_md_atx_headings(f"{cleaned}\n")
     if block.kind == "paragraph":
@@ -1664,7 +1685,8 @@ def run(url_or_id: str) -> Path:
     )
     body = "\n".join(md_parts) + "\n"
     if skip:
-        # 原文模式无需做中英文间距修复（本身即英文），仅兜底清理残留标记。
+        # 原文模式无需做中英文间距修复（本身即英文），仅做字符卫生兜底。
+        body = _normalize_nbsp(body)
         body = _NEWPAR_RE.sub("", body)
     else:
         # 中英文/数字排版间距自动修复（pangu 风格）：先保护公式与链接，修复后再还原
@@ -1673,6 +1695,7 @@ def run(url_or_id: str) -> Path:
 
         # 兜底：清除译文里可能残留的段尾换行标记（理论上已被 _block_to_md 拆分消费，
         # 但模型偶发漏加/误加、或误写成半角 [NEWPAR] 时仍保证最终 markdown 干净无标记字面）。
+        body = _normalize_nbsp(body)
         body = _NEWPAR_RE.sub("", body)
 
     # 5.1 生成保留原 HTML 结构（表格合并/颜色/图片）的 .zh.html。

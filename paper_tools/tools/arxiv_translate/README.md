@@ -32,7 +32,7 @@ python main.py arxiv-translate https://arxiv.org/abs/2605.26158
 python main.py arxiv-translate 2605.26158v1
 
 # 指定输出目录和模型
-python main.py arxiv-translate 2605.26158v1 --out ./my-papers --model deepseek-chat
+python main.py arxiv-translate 2605.26158v1 --out ./my-papers --model deepseek-flash
 ```
 
 ### IDE 直接运行
@@ -179,6 +179,8 @@ TRANSLATE_SKIP = False     # 跳过翻译：True 时不调用 LLM，仅解析并
 - 依据 DeepSeek 官方价目表估算的费用
 
 费用按 `缓存命中输入/1e6 × 命中单价 + 未命中输入/1e6 × 未命中单价 + 输出/1e6 × 输出单价` 计算。价目表不写死在代码里，由 `paper_tools/core/pricing.py` 在运行时从官方定价页动态抓取并本地缓存（`pricing_cache.json`，默认 24h 有效）；抓取失败时回退到最近一次缓存。
+
+默认用 LLM 把页面正文解析成结构化价目（`PAPER_TOOLS_PRICING_PARSER=ai`），官方改版、模型改名改价都无需改代码，并能从页面脚注识别旧模型名别名；LLM 不可用时自动回落到本地规则解析（`=rule`）。价目表首次获取会多一次 LLM 调用，之后 24 小时内走缓存。模型名解析依次尝试精确名 → 别名 → 前缀 → 家族名（忽略版本号，如 `deepseek-v4-flash` 归到 `deepseek-flash`）。
 
 ### 原文模式（仅解析不翻译）
 
