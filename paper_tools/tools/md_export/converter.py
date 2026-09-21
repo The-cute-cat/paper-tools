@@ -506,12 +506,16 @@ def _download_image(url: str, dest: Path, ctx: ConvertCtx) -> str:
     return f"error:{last}"
 
 
-def _resolve_image(src: str, ctx: ConvertCtx) -> Path | None:
+def _resolve_image(src: str, ctx: ConvertCtx, *,
+                   rasterize_svg: bool = True) -> Path | None:
     """把图片 src 解析为本地文件；网络图片按 URL 哈希缓存下载。
 
     带负缓存：确认 4xx（资源不存在）的 URL 记入 ctx.missed_urls 并在缓存
     目录写 .miss 标记文件（跨运行持久），后续解析直接跳过，不再发起请求。
     网络类失败只做会话级缓存（不写标记），下次运行会重试。
+
+    rasterize_svg=False 时保留 SVG 原格式（仅输出 HTML/markdown 时才需要，
+    此时 SVG 能作为 data URI 直接渲染，可保住矢量清晰度）。
     """
     src = (src or "").strip()
     if src.startswith("<") and src.endswith(">"):
@@ -533,14 +537,14 @@ def _resolve_image(src: str, ctx: ConvertCtx) -> Path | None:
             key = hashlib.md5(cand.encode("utf-8")).hexdigest()[:14]
             dest = ctx.images_dir / f"net_{key}{ext}"
             if dest.exists() and dest.stat().st_size > 100:
-                return _finalize_image(dest, ctx)
+                return _finalize_image(dest, ctx, rasterize_svg)
             miss_marker = dest.with_name(dest.name + ".miss")
             if cand in ctx.missed_urls or miss_marker.exists():
                 continue
             logger.info(f"  下载网络图片: {cand}")
             status = _download_image(cand, dest, ctx)
             if status == "ok" and dest.exists() and dest.stat().st_size > 100:
-                return _finalize_image(dest, ctx)
+                return _finalize_image(dest, ctx, rasterize_svg)
             if status.startswith("miss"):
                 # 4xx = 资源永久不存在：持久化负缓存，之后不再请求
                 ctx.missed_urls.add(cand)
@@ -555,7 +559,7 @@ def _resolve_image(src: str, ctx: ConvertCtx) -> Path | None:
     p = Path(src)
     if not p.is_absolute():
         p = ctx.source_dir / p
-    return _finalize_image(p, ctx) if p.exists() else None
+    return _finalize_image(p, ctx, rasterize_svg) if p.exists() else None
 
 
 def _rasterize_svg(svg_path: Path, ctx: ConvertCtx) -> Path | None:
@@ -572,6 +576,9 @@ def _rasterize_svg(svg_path: Path, ctx: ConvertCtx) -> Path | None:
     out = ctx.images_dir / f"svg_{svg_path.stem}_{key}.png"
     if out.exists() and out.stat().st_size > 100:
         return out
+    # 目录只有在下过网络图片时才存在；纯本地图片的场景需自行创建，
+    # 否则写入报 FileNotFoundError 并静默回退为原始 SVG。
+    ctx.images_dir.mkdir(parents=True, exist_ok=True)
     try:
         drawing = svg2rlg(str(svg_path))
         if drawing is None:
@@ -588,9 +595,14 @@ def _rasterize_svg(svg_path: Path, ctx: ConvertCtx) -> Path | None:
     return None
 
 
-def _finalize_image(path: Path, ctx: ConvertCtx) -> Path:
-    """图片落地后的统一处理：SVG 栅格化为位图，便于 docx/pdf 嵌入。"""
-    if path.suffix.lower() == ".svg":
+def _finalize_image(path: Path, ctx: ConvertCtx,
+                    rasterize_svg: bool = True) -> Path:
+    """图片落地后的统一处理：SVG 栅格化为位图，便于 docx/pdf 嵌入。
+
+    docx/pdf 无法嵌入 SVG，必须栅格化；输出 HTML/markdown 时可传
+    rasterize_svg=False 保留矢量（栅格化失败时同样回退为原 SVG）。
+    """
+    if rasterize_svg and path.suffix.lower() == ".svg":
         png = _rasterize_svg(path, ctx)
         return png or path
     return path
@@ -606,6 +618,8 @@ def _docx_safe_image(path: Path, ctx: ConvertCtx) -> Path | None:
         out = ctx.images_dir / f"conv_{path.stem}_{key}.png"
         if out.exists():
             return out
+        # 同 _rasterize_svg：纯本地图片时 images_dir 可能尚未创建
+        ctx.images_dir.mkdir(parents=True, exist_ok=True)
         with Image.open(path) as im:
             im.convert("RGBA" if "A" in im.mode or im.mode == "P" else "RGB") \
               .save(out, "PNG")
@@ -1263,12 +1277,14 @@ def blocks_to_pdf(blocks: list[dict], out_path: Path, ctx: ConvertCtx) -> Path:
 def run(md_path: str | Path | None = None, *, fmt: str | None = None,
         out_dir: str | Path | None = None,
         settings=None) -> list[Path]:
-    """把 Markdown 文件转换为 docx / pdf，返回生成的文件路径列表。
+    """把 Markdown 文件转换为 docx / pdf / 自包含 markdown，返回生成的文件路径列表。
 
     Args:
         md_path:  Markdown 文件路径；留空回退到 .env 的 PAPER_TOOLS_MD_INPUT。
-        fmt:      输出格式 docx / pdf / docx_pdf / all；
-                  留空回退到 .env 的 PAPER_TOOLS_MD_EXPORT_FORMATS（默认 docx_pdf）。
+        fmt:      输出格式 docx / pdf / docx_pdf / portable / all，可用逗号组合
+                  （如 docx,portable）。portable = 自包含 markdown，图片内联为
+                  base64，便于直接发给他人。留空回退到 .env 的
+                  PAPER_TOOLS_MD_EXPORT_FORMATS（默认 docx_pdf）。
         out_dir:  输出目录；留空与源文件同目录。
         settings: 全局配置（不传则自动读取）。
     """
@@ -1281,15 +1297,17 @@ def run(md_path: str | Path | None = None, *, fmt: str | None = None,
     if not md_path.exists():
         raise FileNotFoundError(f"Markdown 文件不存在: {md_path}")
     text = md_path.read_text(encoding="utf-8")
-    blocks = parse_markdown(text)
 
     fmt = (fmt or settings.md_export_formats or "docx_pdf").strip().lower().replace(",", "_")
     if fmt == "all":
         fmt = "docx_pdf"
     want_docx = "docx" in fmt
     want_pdf = "pdf" in fmt
-    if not (want_docx or want_pdf):
-        raise ValueError(f"不支持的导出格式: {fmt}（可选 docx / pdf / docx_pdf / all）")
+    want_portable = "portable" in fmt
+    if not (want_docx or want_pdf or want_portable):
+        raise ValueError(
+            f"不支持的导出格式: {fmt}（可选 docx / pdf / docx_pdf / portable / all，"
+            "可用逗号组合，如 docx,portable）")
 
     out_dir = Path(out_dir) if out_dir else md_path.parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1308,12 +1326,21 @@ def run(md_path: str | Path | None = None, *, fmt: str | None = None,
     )
 
     results: list[Path] = []
-    if want_docx:
-        docx_out = out_dir / f"{stem}.docx"
-        if confirm_overwrite(docx_out, settings=settings):
-            results.append(blocks_to_docx(blocks, docx_out, ctx))
-    if want_pdf:
-        pdf_out = out_dir / f"{stem}.pdf"
-        if confirm_overwrite(pdf_out, settings=settings):
-            results.append(blocks_to_pdf(blocks, pdf_out, ctx))
+    if want_docx or want_pdf:
+        blocks = parse_markdown(text)
+        if want_docx:
+            docx_out = out_dir / f"{stem}.docx"
+            if confirm_overwrite(docx_out, settings=settings):
+                results.append(blocks_to_docx(blocks, docx_out, ctx))
+        if want_pdf:
+            pdf_out = out_dir / f"{stem}.pdf"
+            if confirm_overwrite(pdf_out, settings=settings):
+                results.append(blocks_to_pdf(blocks, pdf_out, ctx))
+    if want_portable:
+        # 延迟导入：portable 反向依赖本模块的图片解析，模块级导入会成环
+        from .portable import write_portable
+
+        portable_out = out_dir / f"{stem}.portable.md"
+        if confirm_overwrite(portable_out, settings=settings):
+            results.append(write_portable(text, portable_out, ctx))
     return results

@@ -69,7 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("input", nargs="?", default=None,
                    help="Markdown 文件路径（留空则用 .env 的 PAPER_TOOLS_MD_INPUT）")
     p.add_argument("--format", dest="fmt", default=None,
-                   help="输出格式：docx、pdf、docx_pdf / all（留空用配置，默认 docx_pdf）")
+                   help="输出格式：docx、pdf、docx_pdf、portable（图片内联为 base64 的"
+                        "自包含 markdown）/ all；可用逗号组合如 docx,portable"
+                        "（留空用配置，默认 docx_pdf）")
     p.add_argument("--out", default=None, help="输出目录（默认与源文件同目录）")
     p.add_argument("--overwrite", action="store_true",
                    help="目标文件已存在时直接覆盖（默认按配置，ask=询问）")

@@ -200,9 +200,18 @@ class AppSettings:
     # 待转换的本地 Markdown 文件路径（md-export 工具专用）。
     # 环境变量 PAPER_TOOLS_MD_INPUT 可覆盖；为空时需在命令行/IDE 入口传入。
     md_input: str = ""
-    # md-export 默认导出格式：docx、pdf、docx_pdf（等同同时导出两者）、all。
+    # md-export 默认导出格式：docx、pdf、docx_pdf（等同同时导出两者）、portable、
+    # all（等同 docx_pdf）。可用逗号组合，如 docx,portable。
     # 环境变量 PAPER_TOOLS_MD_EXPORT_FORMATS 可覆盖。
     md_export_formats: str = "docx_pdf"
+    # portable 输出时是否保留 SVG 的矢量格式（默认 False = 栅格化为 PNG）。
+    #   False = 兼容性优先：data:image/svg+xml 属于「活动内容」，带 HTML 消毒的
+    #           渲染环境可能过滤掉它，栅格化为 PNG 后各处都能显示。
+    #   True  = 清晰度优先：SVG 以矢量内联，放大不糊、线条锐利，适合确定接收方
+    #           用 Typora / VS Code / Obsidian 这类浏览器内核预览的场景。
+    # 注意：docx/pdf 输出无法嵌入 SVG，始终栅格化，本项只影响 portable。
+    # 环境变量 PAPER_TOOLS_MD_PORTABLE_KEEP_SVG 可覆盖。
+    md_portable_keep_svg: bool = False
     # md-export 中文正文字体（DOCX 写入 eastAsia 字体；PDF 按名称查找系统字体）。
     # 常见可选：宋体（默认）、微软雅黑、黑体、楷体、仿宋、等线。
     # 环境变量 PAPER_TOOLS_MD_FONT 可覆盖。
@@ -275,6 +284,8 @@ class AppSettings:
             self.md_export_formats = env.strip().lower()
         if env := os.environ.get("PAPER_TOOLS_MD_FONT"):
             self.md_export_font = env.strip()
+        if env := os.environ.get("PAPER_TOOLS_MD_PORTABLE_KEEP_SVG"):
+            self.md_portable_keep_svg = env.strip().lower() in ("1", "true", "yes", "on")
         return self
 
 

@@ -4,7 +4,7 @@
     1. 在 IDE 中右键本文件 -> Run / Debug（无需命令行参数）
     2. 命令行：python paper_tools/tools/md_export/main.py
     3. 包模式：python -m paper_tools.tools.md_export.main
-    4. 根入口：python main.py md-export <markdown路径> [--format docx|pdf|all]
+    4. 根入口：python main.py md-export <markdown路径> [--format docx|pdf|portable|all]
 
 无需命令行参数：直接修改下方 `if __name__ == "__main__":` 里的常量即可。
 
@@ -35,7 +35,8 @@ def main() -> None:
     # 所有常量留空/保持默认时，会自动回退到 .env 对应的环境变量（见每条注释）。
     md_path = r""   # 待转换的 Markdown 文件路径，例如 r"D:/papers/paper.zh.md"
                     # 留空则用 .env 的 PAPER_TOOLS_MD_INPUT
-    fmt = ""        # 输出格式：docx / pdf / docx_pdf / all
+    fmt = ""        # 输出格式：docx / pdf / docx_pdf / portable / all（可用逗号组合）
+                    #   portable = 自包含 markdown：图片内联为 base64，可直接发给他人
                     # 留空则用 .env 的 PAPER_TOOLS_MD_EXPORT_FORMATS（默认 docx_pdf）
     out_dir = ""    # 输出目录；留空则与源文件同目录
     overwrite = ""  # 输出文件覆盖策略：ask（询问，默认）/ always / never

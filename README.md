@@ -11,7 +11,7 @@
 |------|------|
 | [arxiv-translate](./paper_tools/tools/arxiv_translate/README.md) | 下载 arxiv HTML 论文，解析公式/图表/引用，调用 DeepSeek 翻译为中文 Markdown |
 | [pdf-translate](./paper_tools/tools/pdf_translate/README.md) | 本地 PDF 逐页视觉提取、跨页续接，再翻译为中文 Markdown |
-| [md-export](./paper_tools/tools/md_export/README.md) | 通用 Markdown → Word / PDF 转换：网络图片内嵌、公式渲染、表格/任务列表/代码块完整支持 |
+| [md-export](./paper_tools/tools/md_export/README.md) | 通用 Markdown → Word / PDF / 自包含 Markdown 转换：网络图片内嵌、公式渲染、表格/任务列表/代码块完整支持 |
 
 > 更多工具正在规划中，欢迎 [贡献](#贡献) 或提交 issue。
 
@@ -80,6 +80,9 @@ python main.py pdf-translate "D:/papers/paper.pdf" --dpi 180 --extract-only
 # 把 markdown 转为 Word / PDF（网络图片自动下载内嵌、公式渲染为图片）
 python main.py md-export "D:/papers/paper.zh.md"
 python main.py md-export "D:/papers/paper.zh.md" --format docx --out ./exports
+
+# 转为自包含 markdown（图片内联为 base64，单文件可直接发给他人）
+python main.py md-export "D:/papers/paper.zh.md" --format portable
 ```
 
 各工具的输出文件、目录结构与进阶用法见对应工具文档：
@@ -122,8 +125,9 @@ python main.py md-export "D:/papers/paper.zh.md" --format docx --out ./exports
 | `PAPER_TOOLS_PDF_EXTRACT_ONLY` | 仅提取：只做第一阶段逐页识别，不翻译（1/true 开启） | `false` |
 | `PAPER_TOOLS_PDF_MAX_TOKENS` | 视觉模型单页识别最大输出 token（密集页截断时调大） | `16384` |
 | `PAPER_TOOLS_MD_INPUT` | 待转换的本地 Markdown 文件路径（仅 md-export） | 空 |
-| `PAPER_TOOLS_MD_EXPORT_FORMATS` | md-export 导出格式（docx/pdf/docx_pdf/all） | `docx_pdf` |
+| `PAPER_TOOLS_MD_EXPORT_FORMATS` | md-export 导出格式（docx/pdf/docx_pdf/portable/all，可用逗号组合） | `docx_pdf` |
 | `PAPER_TOOLS_MD_FONT` | md-export 中文正文字体（宋体/微软雅黑/黑体/楷体等） | `宋体` |
+| `PAPER_TOOLS_MD_PORTABLE_KEEP_SVG` | portable 输出保留 SVG 矢量（1/true；默认栅格化为 PNG 以兼容性优先） | `false` |
 
 > **价目表缓存**：Token 费用估算依赖 DeepSeek 官方定价。价目表不会写死在代码中，而是在首次使用时从官方定价页实时抓取，并缓存到 `paper_tools/core/pricing_cache.json`（默认 24 小时有效）。
 >
@@ -161,10 +165,11 @@ paper-tools/
 │       │   ├── main.py                  #     独立入口（可直接 IDE 运行）
 │       │   ├── pipeline.py              #     提取 + 翻译流水线
 │       │   └── extractor.py             #     逐页渲染与视觉提取
-│       └── md_export/                   #   工具：Markdown → Word / PDF
+│       └── md_export/                   #   工具：Markdown → Word / PDF / 自包含 Markdown
 │           ├── README.md                #     工具详细文档
 │           ├── main.py                  #     独立入口（可直接 IDE 运行）
-│           └── converter.py             #     Markdown 解析 + docx/pdf 渲染
+│           ├── converter.py             #     Markdown 解析 + docx/pdf 渲染
+│           └── portable.py              #     自包含 markdown（图片内联为 base64）
 └── output/                              # 默认输出目录（gitignore）
 ```
 
