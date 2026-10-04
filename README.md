@@ -11,7 +11,7 @@
 |------|------|
 | [arxiv-translate](./paper_tools/tools/arxiv_translate/README.md) | 下载 arxiv HTML 论文，解析公式/图表/引用，调用 DeepSeek 翻译为中文 Markdown |
 | [pdf-translate](./paper_tools/tools/pdf_translate/README.md) | 本地 PDF 逐页视觉提取、跨页续接，再翻译为中文 Markdown |
-| [md-export](./paper_tools/tools/md_export/README.md) | 通用 Markdown → Word / PDF / 自包含 Markdown 转换：网络图片内嵌、公式渲染、表格/任务列表/代码块完整支持 |
+| [md-export](./paper_tools/tools/md_export/README.md) | 通用 Markdown → Word / PDF / 自包含 Markdown 转换：网络图片内嵌、公式与图表（Mermaid / flowchart.js / js-sequence）渲染、表格/任务列表/代码块完整支持 |
 
 > 更多工具正在规划中，欢迎 [贡献](#贡献) 或提交 issue。
 
@@ -77,7 +77,7 @@ python main.py arxiv-translate 2605.26158v1 --export docx,pdf --no-md
 python main.py pdf-translate "D:/papers/paper.pdf"
 python main.py pdf-translate "D:/papers/paper.pdf" --dpi 180 --extract-only
 
-# 把 markdown 转为 Word / PDF（网络图片自动下载内嵌、公式渲染为图片）
+# 把 markdown 转为 Word / PDF（网络图片自动下载内嵌、公式与图表渲染为图片）
 python main.py md-export "D:/papers/paper.zh.md"
 python main.py md-export "D:/papers/paper.zh.md" --format docx --out ./exports
 
@@ -128,6 +128,11 @@ python main.py md-export "D:/papers/paper.zh.md" --format portable
 | `PAPER_TOOLS_MD_EXPORT_FORMATS` | md-export 导出格式（docx/pdf/docx_pdf/portable/all，可用逗号组合） | `docx_pdf` |
 | `PAPER_TOOLS_MD_FONT` | md-export 中文正文字体（宋体/微软雅黑/黑体/楷体等） | `宋体` |
 | `PAPER_TOOLS_MD_PORTABLE_KEEP_SVG` | portable 输出保留 SVG 矢量（1/true；默认栅格化为 PNG 以兼容性优先） | `false` |
+| `PAPER_TOOLS_MD_MERMAID` | 图表围栏（mermaid / flow / sequence）的渲染后端：`auto`(有 mmdc 用本地，否则在线) / `local` / `online` / `off` | `auto` |
+| `PAPER_TOOLS_MD_MERMAID_ENDPOINT` | 在线图表渲染服务地址（图表源码会发送到该服务） | `https://mermaid.ink` |
+| `PAPER_TOOLS_MD_MERMAID_WIDTH` | 在线渲染输出宽度（像素，越大越清晰） | `1600` |
+| `PAPER_TOOLS_MD_MERMAID_THEME` | 图表主题：default/neutral/dark/forest/base | 空（默认主题） |
+| `PAPER_TOOLS_MD_MERMAID_MMDC` | 本地 mermaid-cli（mmdc）可执行文件路径 | 空（自动查找） |
 
 > **价目表缓存**：Token 费用估算依赖 DeepSeek 官方定价。价目表不会写死在代码中，而是在首次使用时从官方定价页实时抓取，并缓存到 `paper_tools/core/pricing_cache.json`（默认 24 小时有效）。
 >
@@ -151,6 +156,7 @@ paper-tools/
 │   │   ├── downloader.py                #   通用下载（文本/二进制，带浏览器伪装头与代理）
 │   │   ├── exporter.py                  #   DOCX / PDF 导出（实验性）
 │   │   ├── math_render.py               #   公式渲染辅助
+│   │   ├── diagram_render.py            #   图表渲染（mermaid/flow/sequence → PNG）
 │   │   ├── glossary.py                  #   术语表（翻译记忆）
 │   │   ├── pricing.py                   #   DeepSeek 价目表动态获取（LLM 抽取 + 规则兜底）与本地缓存
 │   │   └── pricing_prompts.yaml         #   价目表抽取 prompt 模板
@@ -159,12 +165,15 @@ paper-tools/
 │       │   ├── README.md                #     工具详细文档
 │       │   ├── main.py                  #     独立入口（可直接 IDE 运行）
 │       │   ├── pipeline.py              #     翻译流水线（下载→解析→翻译→写出）
-│       │   └── parser.py                #     ar5iv HTML 解析器
+│       │   ├── parser.py                #     ar5iv HTML 解析器
+│       │   └── other/                   #     补充资料（不参与运行，仅供人工参考）
+│       │       └── 论文翻译提示词.md      #       独立提示词：可复制到任意对话式 LLM 手动翻译论文
 │       ├── pdf_translate/               #   工具：本地 PDF 论文翻译
 │       │   ├── README.md                #     工具详细文档
 │       │   ├── main.py                  #     独立入口（可直接 IDE 运行）
 │       │   ├── pipeline.py              #     提取 + 翻译流水线
-│       │   └── extractor.py             #     逐页渲染与视觉提取
+│       │   ├── extractor.py             #     逐页渲染与视觉提取
+│       │   └── extractor_prompts.yaml   #     逐页提取 prompt 模板
 │       └── md_export/                   #   工具：Markdown → Word / PDF / 自包含 Markdown
 │           ├── README.md                #     工具详细文档
 │           ├── main.py                  #     独立入口（可直接 IDE 运行）

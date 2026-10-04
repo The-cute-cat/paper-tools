@@ -203,6 +203,22 @@ TRANSLATE_SKIP = False     # 跳过翻译：True 时不调用 LLM，仅解析并
 - `PAPER_TOOLS_PROXY`：标准 CONNECT 隧道代理（如 `http://127.0.0.1:7890`），文本与图片二进制下载都经它；也兼容 `HTTP_PROXY` / `HTTPS_PROXY` 环境变量。
 - `PAPER_TOOLS_CORS_PROXY`：轻量 CORS 文本转发代理（如 `https://your-worker.dev/?url=`）。仅用于文本/HTML 下载（abs 页 + 全文），不支持二进制；图片下载仍走 `PAPER_TOOLS_PROXY`。适用于不支持 CONNECT 隧道但有服务侧出网能力的场景。
 
+## 独立提示词（`other/`）
+
+`other/论文翻译提示词.md` 收录了一套**与工具运行时解耦**的完整提示词，共两部分：
+
+| 部分 | 内容 |
+|------|------|
+| `### 翻译用` | 按原文顺序完整翻译，覆盖完整性要求、翻译原则、专业术语处理（`中文译名（English Term, ABBR）`）、Prompt/实验指令类特殊文本、公式代码算法与符号、表格与图片、Markdown 格式、禁止事项、输出要求 |
+| `### 检查用` | 对译文逐项质检：文件对应关系、完整性核验、结构守恒与机械一致性、忠实性、图片完整性、表格逐单元格核对、公式与符号、HTML/Markdown 格式继承、图题表题、AI 痕迹清理、附录、引用与参考文献、最终质量检查 |
+
+**用法**：把对应小节围栏内的提示词整段复制到任意对话式 LLM（网页版 ChatGPT / Claude / DeepSeek 等），再附上论文即可——无需配置 `DEEPSEEK_API_KEY`，也不用运行本工具。
+
+两点说明：
+
+- 它**不参与工具运行时**：程序实际加载的是 `paper_tools/core/translator_prompts.yaml`（pdf-translate 为 `tools/pdf_translate/extractor_prompts.yaml`）。因此放在 `other/` 下，不随工具打包执行，也不影响自动流水线的任何行为。
+- 相比自动流程，它更适合单篇精读、只翻某几节、或需要人工逐步确认的场景。
+
 ## 输出说明
 
 翻译完成后在 `output/<arxiv_id>/` 下生成：

@@ -2,13 +2,17 @@
 
 通用的本地 Markdown 转换工具，可输出 Word（.docx）、PDF，以及**图片内联的
 自包含 Markdown**。适用于技术笔记、博客、翻译稿、论文等任意 Markdown 文档。
-对三类常见痛点做了重点处理：
+对四类常见痛点做了重点处理：
 
 1. **在线图片**：markdown 里引用的网络图片（`http(s)://...`）在 Word/PDF
    中无法直接使用，本工具会自动下载并内嵌到文档中。
 2. **LaTeX 公式**：`$...$`、`$$...$$` 等公式在 Office 中无法直接显示，
    本工具把公式渲染为高清 PNG 后按排版位置嵌入（inline 随文、display 居中独立成行）。
-3. **分享单文件**：markdown 引用的图片是本地相对路径时，直接发给别人会缺图。
+3. **图表（diagram-as-code）**：主流 Markdown 编辑器（Typora 等）会原生渲染的
+   三种围栏——```` ```mermaid ````、```` ```flow ````（flowchart.js）、
+   ```` ```sequence ````（js-sequence-diagrams）——在原文里「本应是图」，
+   直接导出却会显示源码。本工具会把它们渲染为图片后居中嵌入。
+4. **分享单文件**：markdown 引用的图片是本地相对路径时，直接发给别人会缺图。
    `--format portable` 会把本地/网络图片统一转成 base64 内联进新的 markdown，
    得到一个单文件、对方直接打开即可看到全部图片的版本。
 
@@ -55,6 +59,7 @@ run("paper.zh.md", fmt="portable")          # 自包含 markdown
 |------|------|
 | 标题 | `#` ~ `######`，映射为 Word 标题样式（可在 Word 中生成目录） |
 | 公式 | `$inline$`、`$$display$$`、`\(...\)`、`\[...\]`、`\begin{equation}` 等，渲染为 PNG 内嵌 |
+| 图表 | ` ```mermaid `、` ```flow `（flowchart.js）、` ```sequence `（js-sequence-diagrams）渲染为 PNG 居中内嵌 |
 | 图片 | `![alt](src)`、HTML `<img>`；本地相对/绝对路径，或网络 URL（自动下载内嵌） |
 | 表格 | GFM 表格，首行加粗为表头，支持列对齐 `:---` / `:--:` / `---:`；cell 内公式同样渲染为图片 |
 | 列表 | 有序/无序列表（两级嵌套）、任务列表 `- [ ]` / `- [x]` |
@@ -143,8 +148,9 @@ python main.py md-export paper.zh.md --format portable
 如果接收方用的是 Typora 这类渲染器，处理办法是**先压缩图片**（缩小尺寸或
 转 JPEG/WebP）再转换，让每张图的 data URI 落在阈值内。
 
-> 说明：`portable` 只处理图片，不处理公式。若接收方的渲染器不支持 `$...$`，
-> 公式仍会显示为源码（docx/pdf 会把公式渲染成图片）。
+> 说明：`portable` 只处理图片，不处理公式与图表。若接收方的渲染器不支持
+> `$...$` 或 ```` ```mermaid ````，它们仍会显示为源码（docx/pdf 会把公式和
+> 图表渲染成图片）。
 
 ## 公式处理细节
 
@@ -156,6 +162,52 @@ python main.py md-export paper.zh.md --format portable
   退化为灰色斜体的 LaTeX 源码文本，保证内容不丢。
 - 围栏代码块与行内代码中的 `$`、`\command` 不会被误判为公式。
 
+## 图表（Mermaid / flowchart.js / js-sequence）细节
+
+只处理**主流 Markdown 编辑器会原生渲染**的三种围栏，因为只有它们在原文里
+「本应是图」：
+
+| 围栏 | 语法 | 会被谁渲染 |
+|------|------|-----------|
+| ```` ```mermaid ````（或 `mmd`） | Mermaid | Typora、Obsidian、GitHub、GitLab、Notion，VS Code（装 Mermaid 扩展） |
+| ```` ```flow ```` | flowchart.js | Typora、Mark Text |
+| ```` ```sequence ```` | js-sequence-diagrams | Typora、Mark Text |
+
+> 其他「图即代码」语言（PlantUML、Graphviz、D2、Vega-Lite 等）这些编辑器
+> 都不渲染，在 markdown 里通常就是普通代码块，因此**刻意不处理**，按代码块输出。
+
+这些图都要靠浏览器 JS 才能画出来，Python 无法直接渲染，因此 `flow` /
+`sequence` 会先**机械转译成 Mermaid**（两者语法分别源自 Mermaid / PlantUML 系），
+再复用同一套渲染后端。后端由 `PAPER_TOOLS_MD_MERMAID` 选择：
+
+| 取值 | 行为 | 适用场景 |
+|------|------|---------|
+| `auto`（默认） | 系统 PATH 上有 `mmdc` 就用本地渲染，否则用在线服务 | 无需配置，开箱即用 |
+| `local` | 仅用本地 mermaid-cli（`mmdc`）；缺失时退回 `npx -y @mermaid-js/mermaid-cli` | 离线、涉密、内网文档 |
+| `online` | 仅用在线渲染服务（`PAPER_TOOLS_MD_MERMAID_ENDPOINT`，默认 mermaid.ink） | 机器上没有 Node.js |
+| `off` | 关闭，三种围栏都按普通代码块原样输出 | 不希望图表被替换 |
+
+- **在线渲染有隐私代价**：图表源码会发送到第三方服务（默认 mermaid.ink，
+  采用 deflate 压缩后拼接在 URL 里）。涉密或不外传的文档请用 `local` 或 `off`。
+- **本地渲染**需 Node.js 与 `@mermaid-js/mermaid-cli`（`npm i -g @mermaid-js/mermaid-cli`）。
+  自定义路径可设 `PAPER_TOOLS_MD_MERMAID_MMDC`；`local` 模式下若没有 `mmdc`
+  会尝试 `npx`（首次会联网下载依赖，较慢）。本地渲染默认加 `--no-sandbox`
+  （Windows / 容器里 Chromium 常因沙箱崩溃）。
+- **清晰度**：在线渲染默认按 `PAPER_TOOLS_MD_MERMAID_WIDTH`（1600px）请求，
+  本地渲染按其换算的 scale 放大，保证插入文档后不糊。
+- **主题**：`PAPER_TOOLS_MD_MERMAID_THEME` 可设 `default` / `neutral` /
+  `dark` / `forest` / `base`；留空用 Mermaid 默认主题。
+- **渲染结果按内容哈希缓存**到 `<文件名>.md_export/diagram/`，docx 与 pdf
+  两轮渲染只算一次，重复转换不重复请求。
+- **失败不中断**：语法错误、转译后 Mermaid 解析失败、服务不可达、未装
+  mermaid-cli 等情况只记录 warning，该代码块退化为普通代码块输出，其余内容
+  照常转换。
+- **转译是有损的**：`flow` / `sequence` 转成 Mermaid 后样式与原编辑器略有差异
+  （节点形状/配色按 Mermaid 默认），但语义与连线一致。若某个图转译后渲染失败，
+  会原样输出源码而不是产出错图。
+- **portable 不处理图表**：与公式一致，`--format portable` 只内联图片，
+  三种围栏的代码块原样保留（接收方渲染器能否画图取决于其自身支持）。
+
 ## PDF 字形兼容
 
 PDF 嵌入字体（宋体等 GBK 字体）缺少部分符号字形（✓ ✗ ☑ ➜ 等），
@@ -165,4 +217,4 @@ PDF 嵌入字体（宋体等 GBK 字体）缺少部分符号字形（✓ ✗ ☑
 
 - `<同名>.docx` / `<同名>.pdf` / `<同名>.portable.md`：位于 `--out` 目录
   （默认与源文件同目录），按 `--format` 选择生成。
-- `<文件名>.md_export/`：图片与公式的本地缓存目录，可安全删除（会自动重建）。
+- `<文件名>.md_export/`：图片、公式与 Mermaid 渲染的本地缓存目录，可安全删除（会自动重建）。

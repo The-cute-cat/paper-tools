@@ -16,6 +16,14 @@
     inline 公式随文嵌入（基线高度对齐正文），display 公式单独成行居中；
   - 代码块 / 行内代码内的 $ 与 \\ 命令不会被误判为公式。
 
+* 图表（diagram-as-code）处理
+  - 主流 Markdown 编辑器（Typora 等）会原生渲染的三种围栏：```mermaid、
+    ```flow（flowchart.js）、```sequence（js-sequence-diagrams），
+    统一渲染为 PNG 后居中嵌入（否则会在文档里显示源码）；
+  - flow / sequence 会先机械转译为 Mermaid 再渲染（无可用在线服务）；
+  - 后端可在 本地 mermaid-cli / 在线 mermaid.ink 之间选择（见 config 的
+    PAPER_TOOLS_MD_MERMAID），渲染失败则回退为普通代码块，不中断转换。
+
 支持的语法：标题、段落（含行尾两空格硬换行）、有序/无序列表（两级嵌套）、
 任务列表 - [ ] / - [x]、GFM 表格（含列对齐 :--- / :--: / ---:）、引用块、
 围栏/缩进代码块、分隔线、行内样式（粗体/斜体/行内代码/链接/删除线）、
@@ -41,6 +49,7 @@ from ...core.exporter import (
 )
 from ...core.user_io import confirm_overwrite
 from ...core.math_render import render_math_to_png
+from ...core.diagram_render import diagram_kind, render_diagram_to_png
 from ...logging_setup import get_logger
 
 logger = get_logger()
@@ -447,7 +456,7 @@ _DOCX_OK_IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp"}
 
 @dataclass
 class ConvertCtx:
-    """转换上下文：源目录、下载缓存目录、公式缓存目录。
+    """转换上下文：源目录、下载缓存目录、公式/图表渲染缓存目录。
 
     missed_urls: 本次运行中确认「4xx 不存在」的 URL 集合（会话级负缓存），
                  避免 docx/pdf 两轮渲染重复请求。
@@ -455,6 +464,7 @@ class ConvertCtx:
     source_dir: Path
     images_dir: Path
     math_dir: Path
+    diagram_dir: Path = field(default_factory=Path)
     settings: object = field(default_factory=get_settings)
     missed_urls: set = field(default_factory=set)
 
@@ -738,6 +748,23 @@ def _docx_insert_image(p, src: str, ctx: ConvertCtx, *,
     p.add_run().add_picture(str(safe), width=Cm(w_cm))
 
 
+def _docx_insert_diagram_block(doc, kind: str, code: str,
+                               ctx: ConvertCtx) -> bool:
+    """把图表代码块渲染为图片并居中写入；失败返回 False（调用方回退代码块）。"""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.shared import Cm
+
+    png = render_diagram_to_png(kind, code, ctx.diagram_dir, ctx.settings)
+    if png is None:
+        return False
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    w_px, h_px, dpi = _image_size(png)
+    w_cm, _ = _fit_cm(w_px, h_px, dpi, 16.0, 22.0)
+    p.add_run().add_picture(str(png), width=Cm(w_cm))
+    return True
+
+
 def _docx_write_segs(p, segs: list[Seg], ctx: ConvertCtx) -> None:
     from docx.shared import Pt, RGBColor
 
@@ -841,6 +868,9 @@ def _docx_render_blocks(doc, blocks: list[dict], ctx: ConvertCtx,
         if kind == "code":
             code = b["text"]
             if not code:
+                continue
+            kind_name = diagram_kind(b.get("lang", ""))
+            if kind_name and _docx_insert_diagram_block(doc, kind_name, code, ctx):
                 continue
             p = doc.add_paragraph()
             p.paragraph_format.left_indent = Cm(0.5)
@@ -1037,6 +1067,16 @@ def _pdf_place_image(pdf, path: Path, page_width: float, max_w_mm: float) -> Non
         logger.warning(f"  PDF 图片嵌入失败: {path.name} ({e})")
 
 
+def _pdf_insert_diagram_block(pdf, kind: str, code: str, page_width: float,
+                              ctx: ConvertCtx) -> bool:
+    """把图表代码块渲染为图片嵌入；失败返回 False（调用方回退代码块）。"""
+    png = render_diagram_to_png(kind, code, ctx.diagram_dir, ctx.settings)
+    if png is None:
+        return False
+    _pdf_place_image(pdf, png, page_width, max_w_mm=page_width)
+    return True
+
+
 def _pdf_write_segs(pdf, segs: list[Seg], page_width: float, ctx: ConvertCtx,
                     indent: float = 0.0, base_color=None) -> None:
     """把行内片段写入 PDF 流（公式/图片就地嵌入，文本流式换行）。"""
@@ -1163,6 +1203,10 @@ def _pdf_render_blocks(pdf, blocks: list[dict], page_width: float,
         if kind == "code":
             code = b["text"]
             if not code:
+                continue
+            kind_name = diagram_kind(b.get("lang", ""))
+            if kind_name and _pdf_insert_diagram_block(pdf, kind_name, code,
+                                                       page_width, ctx):
                 continue
             pdf.ln(2)
             pdf.set_font(_pdf_code_font(pdf, code), "", 9)
@@ -1322,6 +1366,7 @@ def run(md_path: str | Path | None = None, *, fmt: str | None = None,
         source_dir=md_path.parent,
         images_dir=cache_root / "images",
         math_dir=cache_root / "math",
+        diagram_dir=cache_root / "diagram",
         settings=get_settings(),
     )
 

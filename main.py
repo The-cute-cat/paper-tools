@@ -7,7 +7,7 @@
 可用工具：
     arxiv-translate   下载 arxiv HTML 论文并翻译为中文 markdown
     pdf-translate     本地 PDF 逐页视觉提取并翻译为中文 markdown
-    md-export         把本地 markdown 转换为 Word / PDF（处理网络图片与公式）
+    md-export         把本地 markdown 转换为 Word / PDF（网络图片、公式与图表）
                       例：python main.py md-export paper.zh.md [--format docx|pdf|all]
 
 环境变量（在 .env 或系统中配置，详见 README）：
@@ -65,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="目标文件已存在时直接覆盖（默认按配置，ask=询问）")
     p.add_argument("--no-overwrite", action="store_true",
                    help="目标文件已存在时不覆盖，跳过写入")
-    p = sub.add_parser("md-export", help="把本地 Markdown 转换为 Word / PDF（处理网络图片与公式）")
+    p = sub.add_parser("md-export", help="把本地 Markdown 转换为 Word / PDF（网络图片、公式与图表）")
     p.add_argument("input", nargs="?", default=None,
                    help="Markdown 文件路径（留空则用 .env 的 PAPER_TOOLS_MD_INPUT）")
     p.add_argument("--format", dest="fmt", default=None,

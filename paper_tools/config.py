@@ -216,6 +216,28 @@ class AppSettings:
     # 常见可选：宋体（默认）、微软雅黑、黑体、楷体、仿宋、等线。
     # 环境变量 PAPER_TOOLS_MD_FONT 可覆盖。
     md_export_font: str = "宋体"
+    # md-export：图表围栏渲染为图片的后端。覆盖主流 Markdown 编辑器（Typora 等）
+    # 会原生渲染的三种围栏：```mermaid、```flow（flowchart.js）、
+    # ```sequence（js-sequence-diagrams）；后两者先转译为 Mermaid 再渲染。
+    #   auto（默认）= 系统 PATH 上有 mermaid-cli（mmdc）就用本地渲染，否则用在线服务。
+    #   local  = 仅本地 mmdc：完全离线、不外传内容；缺失时退回 npx（首次会联网下载）。
+    #   online = 仅在线渲染服务（见 md_mermaid_endpoint）。
+    #   off    = 关闭，图表代码块按普通代码块原样输出。
+    # 环境变量 PAPER_TOOLS_MD_MERMAID 可覆盖。
+    md_mermaid_renderer: str = "auto"
+    # 在线图表渲染服务地址（默认 mermaid.ink 的 pako 接口）。
+    # 注意：在线渲染会把图表源码发送到该第三方服务器；涉密/内网文档请改用 local 或 off。
+    # 环境变量 PAPER_TOOLS_MD_MERMAID_ENDPOINT 可覆盖。
+    md_mermaid_endpoint: str = "https://mermaid.ink"
+    # 在线渲染输出宽度（像素）：越大越清晰、体积越大；0 = 用服务默认尺寸。
+    # 环境变量 PAPER_TOOLS_MD_MERMAID_WIDTH 可覆盖。
+    md_mermaid_width: int = 1600
+    # 图表主题：default / neutral / dark / forest / base；留空用默认主题。
+    # 环境变量 PAPER_TOOLS_MD_MERMAID_THEME 可覆盖。
+    md_mermaid_theme: str = ""
+    # 本地 mermaid-cli（mmdc）可执行文件路径；留空则自动在 PATH 查找，再退回 npx。
+    # 环境变量 PAPER_TOOLS_MD_MERMAID_MMDC 可覆盖。
+    md_mermaid_mmdc: str = ""
 
     def resolve(self) -> "AppSettings":
         """用环境变量/默认值补全缺失字段。"""
@@ -286,6 +308,16 @@ class AppSettings:
             self.md_export_font = env.strip()
         if env := os.environ.get("PAPER_TOOLS_MD_PORTABLE_KEEP_SVG"):
             self.md_portable_keep_svg = env.strip().lower() in ("1", "true", "yes", "on")
+        if env := os.environ.get("PAPER_TOOLS_MD_MERMAID"):
+            self.md_mermaid_renderer = env.strip().lower()
+        if env := os.environ.get("PAPER_TOOLS_MD_MERMAID_ENDPOINT"):
+            self.md_mermaid_endpoint = env.strip()
+        if env := os.environ.get("PAPER_TOOLS_MD_MERMAID_WIDTH"):
+            self.md_mermaid_width = int(env)
+        if env := os.environ.get("PAPER_TOOLS_MD_MERMAID_THEME"):
+            self.md_mermaid_theme = env.strip()
+        if env := os.environ.get("PAPER_TOOLS_MD_MERMAID_MMDC"):
+            self.md_mermaid_mmdc = _clean_path_value(env)
         return self
 
 

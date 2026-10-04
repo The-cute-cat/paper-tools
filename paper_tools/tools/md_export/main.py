@@ -5,11 +5,13 @@
     2. 命令行：python paper_tools/tools/md_export/main.py
     3. 包模式：python -m paper_tools.tools.md_export.main
     4. 根入口：python main.py md-export <markdown路径> [--format docx|pdf|portable|all]
+     （处理网络图片、LaTeX 公式与图表围栏 mermaid/flow/sequence）
 
 无需命令行参数：直接修改下方 `if __name__ == "__main__":` 里的常量即可。
 
 与 pdf_translate/main.py 保持同样的结构：sys.path 引导 + 配置/日志初始化
-+ IDE 常量区。本工具为离线转换（仅下载网络图片需联网），不依赖 API Key。
++ IDE 常量区。本工具不依赖 API Key；联网仅用于下载网络图片与（默认的）
+在线图表渲染，可用 PAPER_TOOLS_MD_MERMAID=local/off 改为全离线。
 """
 
 import sys

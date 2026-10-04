@@ -1,4 +1,4 @@
-"""工具：Markdown → Word / PDF 导出（重点处理网络图片与 LaTeX 公式）。"""
+"""工具：Markdown → Word / PDF 导出（重点处理网络图片、LaTeX 公式与图表）。"""
 
 from .converter import run
 
