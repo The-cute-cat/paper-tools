@@ -3,9 +3,11 @@
 用法：
     python main.py arxiv-translate <arxiv链接或ID> [--out 目录] [--model xxx]
     python main.py arxiv-translate 2605.26158v1
+    python main.py arxiv-translate https://link.springer.com/article/10.1007/s10506-025-09437-x
+    python main.py arxiv-translate D:/papers/saved-article.html   # 本地保存的网页
 
 可用工具：
-    arxiv-translate   下载 arxiv HTML 论文并翻译为中文 markdown
+    arxiv-translate   下载论文 HTML（arXiv / Springer Nature Link / 本地 HTML）并翻译为中文 markdown
     pdf-translate     本地 PDF 逐页视觉提取并翻译为中文 markdown
     md-export         把本地 markdown 转换为 Word / PDF（网络图片、公式与图表）
                       例：python main.py md-export paper.zh.md [--format docx|pdf|all]
@@ -36,8 +38,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="paper-tools", description="论文相关实用工具集合")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("arxiv-translate", help="下载 arxiv HTML 论文并翻译为中文 markdown")
-    p.add_argument("input", help="arxiv 链接 (https://arxiv.org/abs/...) 或 ID (如 2605.26158v1)")
+    p = sub.add_parser("arxiv-translate",
+                       help="下载论文 HTML（arXiv / Springer / 本地 HTML）并翻译为中文 markdown")
+    p.add_argument("input",
+                   help="arXiv 链接/ID（如 2605.26158v1）、Springer 文章链接或 DOI"
+                        "（如 https://link.springer.com/article/10.1007/…）、或本地 HTML 文件路径")
     p.add_argument("--out", default=None, help="输出根目录（默认读配置 PAPER_TOOLS_OUTPUT）")
     p.add_argument("--model", default=None, help="DeepSeek 模型名（覆盖配置）")
     p.add_argument("--api-key", default=None, help="DeepSeek API key（覆盖环境变量）")

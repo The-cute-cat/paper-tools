@@ -2,12 +2,20 @@
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
 
-将 arxiv 论文的 HTML 预览版（ar5iv 格式）下载并翻译为中文 Markdown，保留公式、图表、表格、引用等所有结构。
+将论文网页下载（或读取本地已保存的 HTML）并翻译为中文 Markdown，保留公式、图表、表格、引用等所有结构。
+
+支持的**来源**：
+
+| 来源 | 输入 | 说明 |
+|------|------|------|
+| arXiv | 链接 / ID（`2605.26158v1`、`https://arxiv.org/abs/…`） | 自动下载 ar5iv / LaTeXML HTML 预览版 |
+| Springer Nature Link | 文章链接 / DOI（`https://link.springer.com/article/10.1007/…`） | 见下方「Springer 来源说明」 |
+| 本地 HTML | 本地 `.html` 文件路径 | 自动嗅探来源（arXiv / Springer）；适合反爬站点「另存为网页」后解析 |
 
 ## 功能概览
 
-- 输入 arxiv 链接或 ID，自动下载 HTML 预览版
-- 解析论文结构：标题、章节、段落、公式、图表、列表、表格、引用、文本框/提示框
+- 输入链接/ID/本地文件，自动识别来源并获取 HTML
+- 解析论文结构：标题、作者、章节、段落、公式、图表、列表、表格、引用、脚注、文本框/提示框
 - 公式完整保护（LaTeX 占位符机制）：翻译时公式以占位符保护不被改写，同时公式原文作为上下文发给 LLM 以理解语义、提升翻译准确性
 - 自动构建术语表，全文术语锁定，消除前后译法不一致
 - 引用智能处理：论文引用转为搜索引擎链接（论文名作 hover 提示），方便查阅
@@ -31,16 +39,40 @@ python main.py arxiv-translate https://arxiv.org/abs/2605.26158
 # 仅 arxiv ID
 python main.py arxiv-translate 2605.26158v1
 
+# Springer 文章（链接 / DOI 均可）
+python main.py arxiv-translate https://link.springer.com/article/10.1007/s10506-025-09437-x
+python main.py arxiv-translate 10.1007/s10506-025-09437-x
+
+# 本地保存的网页
+python main.py arxiv-translate "D:/papers/saved-article.html"
+
 # 指定输出目录和模型
 python main.py arxiv-translate 2605.26158v1 --out ./my-papers --model deepseek-flash
 ```
+
+### Springer 来源说明
+
+`link.springer.com` 对脚本化请求返回 JS 反爬挑战页（`Client Challenge`），普通 HTTP 下载拿不到正文。
+两种可用方式（任选其一）：
+
+1. **配置 CORS 转发代理**（推荐，服务端代抓可绕过挑战）：
+
+   ```env
+   PAPER_TOOLS_CORS_PROXY=https://你的worker.workers.dev/?url=
+   ```
+
+2. **浏览器另存为 HTML**：打开文章页 → 「另存为 → 网页, 仅 HTML」→ 把本地 `.html` 路径作为输入。
+
+补充：Springer 的**表格数据不在正文页**，而在独立的 `/tables/N` 页面；工具会在配置了代理时按需抓取，
+抓取失败则退化为「题注 + 表格页链接」（不丢信息、可跳转）。图片引用协议相对地址
+`//media.springernature.com/…` 会自动补全为 `https://`。
 
 ### IDE 直接运行
 
 在 IDE 中打开 `paper_tools/tools/arxiv_translate/main.py`，修改 `main()` 函数中的常量即可直接 Run（无需配置命令行参数）：
 
 ```python
-INPUT = "2605.26158v1"   # arxiv 链接或 ID
+INPUT = "2605.26158v1"   # arXiv 链接/ID、Springer 链接/DOI、或本地 HTML 路径
 API_KEY = ""              # 留空则从 .env 读取
 MODEL = ""                # 留空则用默认模型
 OUT_DIR = ""              # 留空则用默认输出目录
@@ -60,23 +92,25 @@ TRANSLATE_SKIP = False     # 跳过翻译：True 时不调用 LLM，仅解析并
 ## 工作流程
 
 ```
-用户输入（链接/ID）
+用户输入（链接 / DOI / 本地 HTML）
     │
     ▼
-解析 arxiv ID
+识别来源（arXiv / Springer）并确定输出标识
     │
     ▼
-下载 HTML 预览版 ──→ 保存原始 HTML
+获取 HTML：下载（arXiv 先解析版本化地址）或读取本地文件 ──→ 保存原始 HTML
     │
     ▼
 （可选）下载图片到本地
     │
     ▼
-解析 HTML 结构
-  ├─ 标题 / 章节标题
+按来源选择解析器解析 HTML 结构
+  ├─ 标题 / 作者 / 关键词
+  ├─ 章节 / 子章节标题
   ├─ 段落 / 列表项
-  ├─ 行内/行间公式（LaTeX）
-  ├─ 图片 / 表格（含 caption）
+  ├─ 行内/行间公式（LaTeX / MathML）
+  ├─ 图片 / 表格（含 caption；Springer 表格按需抓取 /tables/N）
+  ├─ 脚注定义（Markdown footnote）
   └─ 参考文献引用
     │
     ▼

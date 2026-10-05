@@ -9,7 +9,7 @@
 
 | 工具 | 说明 |
 |------|------|
-| [arxiv-translate](./paper_tools/tools/arxiv_translate/README.md) | 下载 arxiv HTML 论文，解析公式/图表/引用，调用 DeepSeek 翻译为中文 Markdown |
+| [arxiv-translate](./paper_tools/tools/arxiv_translate/README.md) | 下载论文 HTML（arXiv / Springer Nature Link / 本地网页），解析公式/图表/引用，调用 DeepSeek 翻译为中文 Markdown |
 | [pdf-translate](./paper_tools/tools/pdf_translate/README.md) | 本地 PDF 逐页视觉提取、跨页续接，再翻译为中文 Markdown |
 | [md-export](./paper_tools/tools/md_export/README.md) | 通用 Markdown → Word / PDF / 自包含 Markdown 转换：网络图片内嵌、公式与图表（Mermaid / flowchart.js / js-sequence）渲染、表格/任务列表/代码块完整支持 |
 
@@ -66,6 +66,12 @@ python main.py arxiv-translate https://arxiv.org/abs/2605.26158
 
 # 或直接使用 arxiv ID
 python main.py arxiv-translate 2605.26158v1
+
+# 翻译一篇 Springer 文章（链接 / DOI 均可）
+python main.py arxiv-translate https://link.springer.com/article/10.1007/s10506-025-09437-x
+
+# 或解析本地保存的网页（Springer 有 JS 反爬挑战，浏览器另存为 HTML 后可直接解析）
+python main.py arxiv-translate "D:/papers/saved-article.html"
 
 # 指定输出目录 / 模型 / API Key（覆盖配置）
 python main.py arxiv-translate 2605.26158v1 --out ./my-output --model deepseek-flash
@@ -133,6 +139,12 @@ python main.py md-export "D:/papers/paper.zh.md" --format portable
 | `PAPER_TOOLS_MD_MERMAID_WIDTH` | 在线渲染输出宽度（像素，越大越清晰） | `1600` |
 | `PAPER_TOOLS_MD_MERMAID_THEME` | 图表主题：default/neutral/dark/forest/base | 空（默认主题） |
 | `PAPER_TOOLS_MD_MERMAID_MMDC` | 本地 mermaid-cli（mmdc）可执行文件路径 | 空（自动查找） |
+
+> **Springer 来源说明**：`link.springer.com` 对脚本化请求返回 JS 反爬挑战页（Client Challenge），
+> 普通 HTTP 下载无法通过。两种可用方式：
+> 1. 配置 CORS 转发代理（服务端代抓，可绕过挑战）：`PAPER_TOOLS_CORS_PROXY=https://你的worker.workers.dev/?url=`；
+> 2. 浏览器打开文章页 →「另存为 → 网页, 仅 HTML」→ 把本地 `.html` 路径作为输入（工具会自动识别来源）。
+> 注意 Springer 表格数据在独立的 `/tables/N` 页面，抓取失败时会退化为「题注 + 表格页链接」。
 
 > **价目表缓存**：Token 费用估算依赖 DeepSeek 官方定价。价目表不会写死在代码中，而是在首次使用时从官方定价页实时抓取，并缓存到 `paper_tools/core/pricing_cache.json`（默认 24 小时有效）。
 >

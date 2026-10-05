@@ -1,4 +1,8 @@
-"""arxiv 论文翻译流水线：解析链接 -> 下载 -> 解析 -> 翻译 -> 写出 markdown。"""
+"""论文翻译流水线：识别来源 -> 下载/读取 -> 解析 -> 翻译 -> 写出 markdown。
+
+来源（arXiv / Springer / 本地 HTML）由 ``sources.detect_source`` 识别，
+流水线主体与来源无关。
+"""
 
 import re
 import time
@@ -17,11 +21,10 @@ from ...core.glossary import Glossary, KEEP_AS_IS, Term, WRONG_VARIANT_MAP
 from ...core.translator import LLMTranslator, TABLE_UNTRANSLATABLE_MARKER
 from ...core.user_io import confirm_overwrite
 from ...logging_setup import get_logger
-from .parser import Block, parse_arxiv_html
+from .parser import Block
+from .sources import detect_source, parse_arxiv_id  # noqa: F401  (parse_arxiv_id 保留导出)
 
 logger = get_logger()
-
-ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5}(v\d+)?)", re.IGNORECASE)
 
 # 翻译缓存文件格式版本。结构变化（如字段增删）时 +1，旧版本缓存会被视为不兼容而忽略。
 _TRANSLATE_CACHE_VERSION = 1
@@ -183,64 +186,9 @@ def _new_tqdm(
 
 
 def parse_arxiv_id(url_or_id: str) -> str:
-    m = ARXIV_ID_RE.search(url_or_id)
-    if not m:
-        raise ValueError(f"无法从输入中识别 arxiv ID: {url_or_id}")
-    return m.group(1)
-
-
-def _resolve_html_url(arxiv_id: str) -> tuple[str, str]:
-    """解析 arxiv HTML 全文页面地址。
-
-    arxiv 的 HTML 版本化资源位于 ``https://arxiv.org/html/<id>vN``，
-    不带版本号的根路径 ``/html/<id>`` 在部分论文上会 404。为稳定获取
-    “最新版本” 的 HTML，这里统一访问 abs 摘要页
-    ``https://arxiv.org/abs/<id>``，解析其中指向 ``/html/`` 的链接，
-    取版本号最大的那个作为 HTML 全文地址。
-
-    返回 (html_url, base_url)：
-      - html_url：可下载的 HTML 全文完整 URL（含版本号）。
-      - base_url：该 HTML 文档根（用于补全相对图片路径），如
-        ``https://arxiv.org/html/2603.16192v1/``。
-    若 abs 页解析失败，回退为直接构造 ``/html/<arxiv_id>``。
-    """
-    base_id = re.sub(r"v\d+$", "", arxiv_id, flags=re.IGNORECASE)
-    abs_url = f"https://arxiv.org/abs/{base_id}"
-    try:
-        from ...core.downloader import _text_request
-        fetch_url, proxies = _text_request(abs_url)
-        resp = requests.get(fetch_url, timeout=get_settings().download_timeout,
-                            headers=get_settings().download_headers,
-                            proxies=proxies)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        # abs 页 ACCESS PAPER 区域通常有 "HTML (experimental)" 链接指向 /html/<id>vN
-        best: tuple[int, str] | None = None
-        for a in soup.find_all("a", href=re.compile(r"/html/" + re.escape(base_id) + r"v\d+")):
-            href = a.get("href", "")
-            vm = re.search(r"v(\d+)$", href)
-            if not vm:
-                continue
-            ver = int(vm.group(1))
-            cand = "https://arxiv.org" + href if href.startswith("/") else href
-            if best is None or ver > best[0]:
-                best = (ver, cand)
-        if best:
-            html_url = best[1]
-            # ar5iv 的图片 src 是相对于 arxiv html 站点的相对路径，
-            # 形如 ``2603.16192v1/illustration6.png``，完整 URL 为
-            # ``https://arxiv.org/html/<id>vN/<file>``，故文档根为
-            # ``https://arxiv.org/html/``（不带版本号子目录）。
-            base_url = "https://arxiv.org/html/"
-            logger.info(f"从 abs 页解析到最新 HTML 版本: {html_url}")
-            return html_url, base_url
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"解析 abs 页获取 HTML 链接失败，回退直接构造: {e}")
-
-    # 回退：直接使用用户输入（可能含版本号）构造
-    html_url = f"https://arxiv.org/html/{arxiv_id}"
-    base_url = "https://arxiv.org/html/"
-    return html_url, base_url
+    # 兼容旧调用方：实现已迁至 sources.py。
+    from .sources import parse_arxiv_id as _impl
+    return _impl(url_or_id)
 
 
 # 文件名非法字符 -> 等价中文/全角符号映射（Windows/Linux 均不支持的字符）
@@ -376,7 +324,8 @@ def _degrade_dangling_anchors(text: str) -> str:
     """
     if "](#" not in text:
         return text
-    anchors = set(re.findall(r'<a id="([^"]+)"></a>', text))
+    # 注意：锚点可能带内容（<a id="x">文字</a>），故不能要求紧跟 "</a>"。
+    anchors = set(re.findall(r'<a id="([^"]+)"', text))
     return _DANGLING_LINK_RE.sub(
         lambda m: m.group(0) if m.group(2) in anchors else m.group(1), text)
 
@@ -396,21 +345,63 @@ def _escape_md_atx_headings(md: str) -> str:
     return "\n".join(out)
 
 
+def _attach_anchor(md: str, anchor: str, kind: str) -> str:
+    """把 ``<a id="...">`` 锚点**包住块自身的可见文字**。
+
+    为什么不是写一个空标签 ``<a id="x"></a>``：Typora 出于"便于编辑"的考虑，
+    **会把空标签（以及 display:none 内容）在编辑器里显式显示成源码**（官方文档：
+    "Typora will show empty tags or HTML with display:none styles"），导致页面里
+    出现可见的灰色 ``<a id="Sec2"></a>``。把文字放进标签内部（``<a id="x">文字</a>``）
+    则属于普通行内 HTML，会被正常渲染成原文字（无 href，不会变成链接样式），
+    既不显示源码、又保留锚点。
+
+    equation 不挂锚点（数学块内无法安全内联，且公式交叉引用极少），对应链接会由
+    ``_degrade_dangling_anchors`` 退化为纯文本。
+    """
+    if kind == "equation":
+        return md
+    open_tag = f'<a id="{anchor}">'
+    close_tag = "</a>"
+
+    def wrap(text: str) -> str:
+        return f"{open_tag}{text}{close_tag}"
+
+    # 列表项：包住 "- " 之后的文本
+    if kind == "list_item":
+        return re.sub(r"^(\s*- )(.*)$",
+                      lambda m: m.group(1) + wrap(m.group(2)),
+                      md, count=1, flags=re.MULTILINE)
+
+    lines = md.split("\n")
+    # 1) 优先包住题注行（"> ..."）——图/表/伪代码通常都有题注
+    for i, ln in enumerate(lines):
+        if ln.startswith("> ") and ln.strip() != ">":
+            lines[i] = "> " + wrap(ln[2:].rstrip())
+            return "\n".join(lines)
+    # 2) 首行本身是 HTML 块（<img> / <table> 等）→ 用标签包住该行
+    if lines and lines[0].lstrip().startswith("<"):
+        lines[0] = wrap(lines[0].rstrip())
+        return "\n".join(lines)
+    # 3) 结构块（表格/伪代码等）且无题注：无处可包，退化为空标签行（罕见）
+    if kind in ("figure", "table", "listing", "footnote"):
+        return f'{open_tag}{close_tag}\n{md}'
+    # 4) 标题 / 段落等文本块：包住首行（标题保留 "## " 前缀）
+    m = re.match(r"^(#{1,6}\s+)(.*)$", lines[0])
+    lines[0] = m.group(1) + wrap(m.group(2).rstrip()) if m else wrap(lines[0].rstrip())
+    return "\n".join(lines)
+
+
 def _block_to_md(block: Block, translation: str, img_mapping: dict[str, str],
                  use_original: bool = False) -> str:
-    """把单个块渲染为 markdown，并视需要在其前补上 <a id="..."> 锚点。
+    """把单个块渲染为 markdown，并在需要时内联 <a id="..."> 锚点。
 
     锚点用于让正文里的内部引用（如 [Table 2](#S4.T2)）真正可跳转。只有被引用的
-    目标才会输出锚点（parser 阶段已筛好，存于 block.meta["anchor"]）。
+    目标才会输出锚点（parser 阶段已筛好，存于 ``block.meta["anchor"]``）。
     """
     md = _render_block_md(block, translation, img_mapping, use_original)
     anchor = (block.meta or {}).get("anchor")
     if anchor:
-        if block.kind == "list_item" and md.lstrip().startswith("- "):
-            # 列表项：锚点内联在项目符号之后，避免插入独立 HTML 块打断列表。
-            md = re.sub(r"^(\s*- )", lambda m: f'{m.group(1)}<a id="{anchor}"></a>', md, count=1)
-        else:
-            md = f'<a id="{anchor}"></a>\n{md}'
+        md = _attach_anchor(md, anchor, block.kind)
     return md
 
 
@@ -686,13 +677,16 @@ def _download_images(html_text: str, img_dir: Path, base: str = "https://arxiv.o
     for kind, src in refs:
         if src.startswith("data:") or not src.rstrip("/").split("/")[-1]:
             continue
-        if src.startswith("http"):
+        if src.startswith("//"):
+            # 协议相对 URL（Springer 的 //media.springernature.com/...）
+            full = "https:" + src
+        elif src.startswith("http"):
             full = src
         elif src.startswith("/"):
             full = "https://arxiv.org" + src
         else:
             full = base + src
-        fname = src.rstrip("/").split("/")[-1]
+        fname = src.split("?", 1)[0].rstrip("/").split("/")[-1]
         todo.append((src, full, fname))
 
     success = 0
@@ -1476,20 +1470,31 @@ def _needs_repair(block: Block, translation: str, glossary: Glossary) -> bool:
 def run(url_or_id: str) -> Path:
     """执行完整翻译流程，返回输出 markdown 路径。"""
     settings = get_settings()
-    arxiv_id = parse_arxiv_id(url_or_id)
-    logger.info(f"解析到 arxiv ID: {arxiv_id}")
 
-    workdir = settings.output_dir / arxiv_id
+    # 0. 识别来源（arXiv / Springer / 本地 HTML 文件）
+    source = detect_source(url_or_id)
+    doc_key = source.key
+    logger.info(f"识别来源: {source.display_name}（标识: {doc_key}）")
+
+    workdir = settings.output_dir / doc_key
     workdir.mkdir(parents=True, exist_ok=True)
     img_dir = workdir / "images"
 
-    # 1. 下载 HTML（通过 abs 页解析最新版本化 HTML 地址，规避无版本号 404）
-    html_url, html_base = _resolve_html_url(arxiv_id)
-    logger.info(f"下载 HTML: {html_url}")
-    html_text = download_text(html_url)
-    html_path = workdir / f"{arxiv_id}.html"
-    html_path.write_text(html_text, encoding="utf-8")
-    logger.info(f"  已保存: {html_path}")
+    # 1. 取得 HTML：本地文件直接读取；否则下载（arXiv 会先解析版本化地址）
+    if source.local_html is not None:
+        html_path = source.local_html
+        html_text = html_path.read_text(encoding="utf-8")
+        html_base = source.base_url
+        logger.info(f"使用本地 HTML：{html_path}")
+    else:
+        html_url, html_base = source.resolve_html()
+        logger.info(f"下载 HTML: {html_url}")
+        html_text = download_text(html_url)
+        if source.validate_html is not None:
+            source.validate_html(html_text)
+        html_path = workdir / f"{doc_key}.html"
+        html_path.write_text(html_text, encoding="utf-8")
+        logger.info(f"  已保存: {html_path}")
 
     # 2. 下载图片（仅在本地模式开启时下载，否则图片保持原网络 URL）
     img_mapping: dict[str, str] = {}
@@ -1499,9 +1504,9 @@ def run(url_or_id: str) -> Path:
     else:
         logger.info("图片本地模式未开启，引用保持原网络 URL，跳过下载")
 
-    # 3. 解析
+    # 3. 解析（由来源提供对应解析器）
     logger.info("解析 HTML 结构 ...")
-    blocks, html_soup = parse_arxiv_html(html_path, img_mapping=img_mapping, base_url=html_base)
+    blocks, html_soup = source.parser(html_path, img_mapping, html_base)
     logger.info(f"  提取到 {len(blocks)} 个内容块")
 
     # 记录原论文英文标题（用于 title 命名模式）
@@ -1517,9 +1522,9 @@ def run(url_or_id: str) -> Path:
     # 命名不一致的残留旧文件由写入阶段兜底（此类场景较少见）。
     _name_mode = (settings.output_name_mode or "id").strip().lower()
     if _name_mode == "title" or (_name_mode == "title_zh" and settings.translate_skip):
-        _probe_stem = _safe_filename(orig_title or arxiv_id)
+        _probe_stem = _safe_filename(orig_title or doc_key)
     else:
-        _probe_stem = arxiv_id
+        _probe_stem = doc_key
     _probe_out = workdir / f"{_probe_stem}{'.en.md' if settings.translate_skip else '.zh.md'}"
     if not confirm_overwrite(_probe_out, settings=settings, logger=logger):
         existing = _probe_out if _probe_out.exists() else None
@@ -1547,8 +1552,8 @@ def run(url_or_id: str) -> Path:
                     f"并发={settings.translate_concurrency})")
 
         # 4.0 断点续译：检测上次异常退出的翻译缓存。
-        # 缓存以 arxiv_id 为唯一基（与最终文件名命名模式无关），避免不同论文串用。
-        cache = _TranslateCache(workdir / f".{arxiv_id}.translate_cache.json", arxiv_id)
+        # 缓存以来源标识（doc_key）为唯一基（与最终文件名命名模式无关），避免不同论文串用。
+        cache = _TranslateCache(workdir / f".{doc_key}.translate_cache.json", doc_key)
         resume = False
         if cache.load():  # 加载成功 = 存在且版本/论文匹配
             choice = _ask_resume(cache)
@@ -1696,13 +1701,13 @@ def run(url_or_id: str) -> Path:
     # 输出文件名命名方式：id / title / title_zh（非法字符自动换为等价中文符号）
     mode = (settings.output_name_mode or "id").strip().lower()
     if mode == "title":
-        out_stem = _safe_filename(orig_title or arxiv_id)
+        out_stem = _safe_filename(orig_title or doc_key)
     elif mode == "title_zh":
         # 原文模式无"中文标题"，回退为用原文标题命名（等价于 title），
         # 避免文件名声称中文标题但实际是英文原文。
-        out_stem = _safe_filename(title_text if not skip else orig_title or arxiv_id)
+        out_stem = _safe_filename(title_text if not skip else orig_title or doc_key)
     else:  # id（默认）
-        out_stem = arxiv_id
+        out_stem = doc_key
     glossary_path = workdir / f"{out_stem}.glossary.json"
     logger.info(f"输出文件命名方式: {mode}（文件名基: {out_stem}）")
 
@@ -1736,7 +1741,7 @@ def run(url_or_id: str) -> Path:
     header = (
         f"# {title_text}\n\n"
         + authors_md
-        + f"> 原文: https://arxiv.org/abs/{arxiv_id}\n"
+        + (f"> 原文: {source.origin_url}\n" if source.origin_url else "")
         + (
             f"> 本文件为解析后的论文原文（translate_skip：未翻译），公式与结构保留。\n\n---\n\n"
             if skip else
