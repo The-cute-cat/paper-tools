@@ -344,6 +344,43 @@ def _normalize_nbsp(body: str) -> str:
     return "".join(out)
 
 
+_SOFT_CHARS_RE = re.compile(r"[\u200b\u200c\u200d\u00ad\ufeff]")
+
+
+def _strip_soft_chars(text: str) -> str:
+    """删除零宽空格/零宽连接符/软连字符/ BOM 等不可见字符（代码围栏内保留）。
+
+    这些字符多来自 LaTeXML 的标注残留（如公式旁的 U+200B），肉眼不可见但会污染
+    markdown、干扰复制与检索。
+    """
+    if not _SOFT_CHARS_RE.search(text):
+        return text
+    out: list[str] = []
+    pos = 0
+    for m in _FENCE_BLOCK_RE.finditer(text):
+        out.append(_SOFT_CHARS_RE.sub("", text[pos:m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(_SOFT_CHARS_RE.sub("", text[pos:]))
+    return "".join(out)
+
+
+_DANGLING_LINK_RE = re.compile(r"\[([^\[\]]*)\]\(#([^)\s]+)\)")
+
+
+def _degrade_dangling_anchors(text: str) -> str:
+    """把指向不存在锚点的内部链接退化为纯文本（[x](#id) → x）。
+
+    兜底保险：parser 已尽量为被引用的正文元素输出 <a id="...">，但仍可能有目标
+    无法定位（如锚点挂在无对应块的深层元素上）。这里保证输出里不残留死链。
+    """
+    if "](#" not in text:
+        return text
+    anchors = set(re.findall(r'<a id="([^"]+)"></a>', text))
+    return _DANGLING_LINK_RE.sub(
+        lambda m: m.group(0) if m.group(2) in anchors else m.group(1), text)
+
+
 def _escape_md_atx_headings(md: str) -> str:
     """转义 markdown 行首的 ATX 标题标记（# ~ ######），避免正文 / 提示词模板里
     字面以 "#..." 开头的行（如附录 A 的 "## Given Question"）被误渲染成标题。
@@ -361,7 +398,25 @@ def _escape_md_atx_headings(md: str) -> str:
 
 def _block_to_md(block: Block, translation: str, img_mapping: dict[str, str],
                  use_original: bool = False) -> str:
-    """把单个块渲染为 markdown。
+    """把单个块渲染为 markdown，并视需要在其前补上 <a id="..."> 锚点。
+
+    锚点用于让正文里的内部引用（如 [Table 2](#S4.T2)）真正可跳转。只有被引用的
+    目标才会输出锚点（parser 阶段已筛好，存于 block.meta["anchor"]）。
+    """
+    md = _render_block_md(block, translation, img_mapping, use_original)
+    anchor = (block.meta or {}).get("anchor")
+    if anchor:
+        if block.kind == "list_item" and md.lstrip().startswith("- "):
+            # 列表项：锚点内联在项目符号之后，避免插入独立 HTML 块打断列表。
+            md = re.sub(r"^(\s*- )", lambda m: f'{m.group(1)}<a id="{anchor}"></a>', md, count=1)
+        else:
+            md = f'<a id="{anchor}"></a>\n{md}'
+    return md
+
+
+def _render_block_md(block: Block, translation: str, img_mapping: dict[str, str],
+                     use_original: bool = False) -> str:
+    """把单个块渲染为 markdown（不含锚点，锚点由 _block_to_md 统一补）。
 
     use_original=True 时（translate_skip 模式）直接输出解析后的英文原文，
     跳过章节标题中文化映射，确保输出是未经翻译的原文。
@@ -447,7 +502,8 @@ def _block_to_md(block: Block, translation: str, img_mapping: dict[str, str],
             return _escape_md_atx_headings(f"{pieces[0]}\n")
         # 多段：段之间用空行分隔，末尾单换行（避免与下一块产生双空行）
         return _escape_md_atx_headings("\n\n".join(pieces) + "\n")
-    if block.kind in ("equation", "figure", "table", "listing"):
+    if block.kind in ("equation", "figure", "table", "listing", "footnote"):
+        # footnote：脚注定义 [^n]: ...，原样输出（内容是 URL 等，不翻译）。
         raw = block.raw
         for orig, local in img_mapping.items():
             raw = raw.replace(orig, local)
@@ -521,7 +577,8 @@ def _merge_short_blocks(blocks: list[Block], target_min: int,
         return blocks, [[i] for i in range(len(blocks))]
 
     TEXT_KINDS = ("paragraph", "list_item", "text_box")
-    STRUCT_KINDS = ("title", "heading", "equation", "figure", "table", "listing")
+    # footnote（脚注定义）按结构块处理：独立成单元、不参与文本合并、不被翻译。
+    STRUCT_KINDS = ("title", "heading", "equation", "figure", "table", "listing", "footnote")
 
     def _len(b: Block) -> int:
         return len((b.text or "").strip())
@@ -687,8 +744,11 @@ def _split_text_box_lines(translation: str) -> list[str]:
 
 
 def _text_of_block(block: Block) -> str:
-    """取一个块用于翻译的文本（标题/段落/列表用 text，图表表格及伪代码用 caption）。"""
-    if block.kind in ("equation", "figure", "table", "listing"):
+    """取一个块用于翻译的文本（标题/段落/列表用 text，图表表格及伪代码用 caption）。
+
+    footnote（脚注定义，内容是 URL 等）不参与翻译，返回空串使其被跳过。
+    """
+    if block.kind in ("equation", "figure", "table", "listing", "footnote"):
         return block.meta.get("caption") or ""
     return block.text or ""
 
@@ -1607,13 +1667,13 @@ def run(url_or_id: str) -> Path:
                 block.raw = (prefix + cap_zh) if cap_zh else (prefix.strip() or "(图)")
             elif block.kind == "listing":
                 # 伪代码块：代码内容以两列 GFM 表格原样保留（行号列 + 代码列），
-                # 仅替换 caption 译文放在表格下方。
+                # caption 译文置于表格**上方**（算法题注在原文中位于块顶）。
                 code_block = block.meta.get("listing_md") or ""
                 parts = []
-                if code_block:
-                    parts.append(code_block)
                 if cap_zh:
                     parts.append("> " + cap_zh)
+                if code_block:
+                    parts.append(code_block)
                 block.raw = "\n\n".join(parts) if parts else "(伪代码)"
             elif block.kind == "table":
                 # 表格内容（含表头）已提前并发翻译完成，直接回填；保留 Markdown 表格语法、
@@ -1688,6 +1748,8 @@ def run(url_or_id: str) -> Path:
         # 原文模式无需做中英文间距修复（本身即英文），仅做字符卫生兜底。
         body = _normalize_nbsp(body)
         body = _NEWPAR_RE.sub("", body)
+        body = _strip_soft_chars(body)
+        body = _degrade_dangling_anchors(body)
     else:
         # 中英文/数字排版间距自动修复（pangu 风格）：先保护公式与链接，修复后再还原
         logger.info("进行中英文排版间距修复 ...")
@@ -1697,6 +1759,8 @@ def run(url_or_id: str) -> Path:
         # 但模型偶发漏加/误加、或误写成半角 [NEWPAR] 时仍保证最终 markdown 干净无标记字面）。
         body = _normalize_nbsp(body)
         body = _NEWPAR_RE.sub("", body)
+        body = _strip_soft_chars(body)
+        body = _degrade_dangling_anchors(body)
 
     # 5.1 生成保留原 HTML 结构（表格合并/颜色/图片）的 .zh.html。
     # 注意：DOCX / PDF 导出功能尚未开发完毕，暂时禁用，此处仅作为 Markdown 的中间产物。

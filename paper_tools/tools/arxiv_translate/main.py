@@ -32,7 +32,8 @@ def main() -> None:
     api_key = ""            # 留空则用 .env / 环境变量里的 DEEPSEEK_API_KEY
     model = ""              # 留空则用配置里的默认模型（deepseek-flash）
     out_dir = ""            # 留空则用配置里的默认输出目录（项目根/output）
-    # 引用搜索引擎：google | bing | duckduckgo | semantic_scholar | arxiv（默认 bing，国内可访问）
+    # 引用搜索引擎：google | bing | duckduckgo | semantic_scholar | arxiv
+    #              | none（关闭搜索外链，无直链引用退化为纯文本）
     cite_search = "bing"
     # 引用显示模式：short = 只显示作者年份（论文名靠 hover 提示，短链不占行宽）
     #              title = 显示作者年份 + 完整论文名（信息全但占行宽）

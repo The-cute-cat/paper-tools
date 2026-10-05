@@ -131,7 +131,8 @@ class AppSettings:
     # 设为 0 表示不限制上限（仍受 merge_min_chars 触发关闭）。
     merge_target_max: int = 1500
     # 引用搜索引擎：google | bing | duckduckgo | semantic_scholar | arxiv
-    #   默认 bing（国内可访问），Google 在国内常被拦截
+    #   默认 bing（国内可访问），Google 在国内常被拦截。
+    #   none/off = 关闭搜索外链：无外部直链的文献引用退化为纯文本 "Author (Year)"。
     cite_search_engine: str = "bing"
     # 引用显示模式：short = 只显示作者年份（短链，论文名靠 hover 提示）
     #              title = 显示作者年份 + 完整论文名（信息全但占行宽）

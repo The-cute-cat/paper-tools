@@ -24,6 +24,9 @@ from bs4 import BeautifulSoup, Tag
 from bs4.element import NavigableString, PageElement
 
 from ...config import get_settings
+from ...logging_setup import get_logger
+
+logger = get_logger()
 
 # ============ 引用搜索引擎 ============
 # 默认 Bing 国内可直连；Google/Bing/DuckDuckGo/Semantic Scholar/arXiv 全部可切换。
@@ -38,10 +41,16 @@ _CITE_SEARCH_URL_TEMPLATES: dict[str, str] = {
 }
 
 
-def _cite_search_url(query: str, engine: str | None = None) -> str:
-    """根据配置的搜索引擎构造引用查询 URL。"""
+def _cite_search_url(query: str, engine: str | None = None) -> str | None:
+    """根据配置的搜索引擎构造引用查询 URL。
+
+    engine 为 "none"/"off"/"plain" 时返回 None —— 表示不挂搜索引擎外链，引用退化为
+    纯文本（有些读者更希望引用只是 "Author (Year)"，而不是一条搜索链接）。
+    """
     if engine is None:
         engine = get_settings().cite_search_engine
+    if (engine or "").strip().lower() in ("none", "off", "plain", "no"):
+        return None
     template = _CITE_SEARCH_URL_TEMPLATES.get(engine, _CITE_SEARCH_URL_TEMPLATES["bing"])
     return template.format(query=quote(query))
 
@@ -52,6 +61,16 @@ def _cite_search_url(query: str, engine: str | None = None) -> str:
 # 否则引用只能退化成无链接的纯文字（再经翻译后彻底丢失）。
 # 该映射在 parse_arxiv_html 开头按当前 soup 重建，避免跨文件调用串味。
 _BIB_MAP: dict[str, dict] = {}
+
+# 文档中真实存在的 id 集合，以及被 <a href="#..."> 内部链接引用的 id 集合。
+# 用于：① 给标题/图表等块补 <a id="...">，让内部引用可跳转；② 引用目标不存在时
+# 把链接退化为纯文本，避免 markdown 里留下死链（2026-10 审计）。
+_EXISTING_IDS: set[str] = set()
+_REFERENCED_ANCHORS: set[str] = set()
+
+# 全文脚注定义（标记 -> 正文）。正文里以 [^n] 标记，文末集中输出 [^n]: 定义，
+# 由 parse_arxiv_html 收集（此前脚注正文被整体丢弃，只剩悬空的裸标记）。
+_FOOTNOTE_DEFS: list[tuple[str, str]] = []
 
 
 def _build_bib_map(soup: "BeautifulSoup") -> dict[str, dict]:
@@ -156,6 +175,101 @@ def _as_str(v: object) -> str | None:
     if isinstance(v, (list, tuple)) and v and isinstance(v[0], str):
         return v[0]
     return None
+
+
+def _build_anchor_sets(soup: "BeautifulSoup") -> tuple[set[str], set[str]]:
+    """收集文档中「真实存在的 id」与「被内部链接引用的 id」。"""
+    existing: set[str] = set()
+    for tag in soup.find_all(id=True):
+        tid = _as_str(tag.get("id"))
+        if tid:
+            existing.add(tid)
+    referenced: set[str] = set()
+    for a in soup.find_all("a", href=True):
+        href = _as_str(a.get("href")) or ""
+        if not (href.startswith("#") and len(href) > 1):
+            continue
+        # 只统计「会出现在正文输出里的」内部链接：
+        #  · ltx_cite 内的锚点会被替换成文献外链/搜索引擎链接 → 排除；
+        #  · 参考文献条目的 cited-by、页面导航/目录（不进入正文提取）→ 排除。
+        # 否则会为大量无人引用的目标产出 <a id> 噪声。
+        if a.find_parent(class_="ltx_cite") is not None:
+            continue
+        if a.find_parent(class_=re.compile(r"ltx_bibitem|ltx_page_navbar|ltx_TOC")):
+            continue
+        referenced.add(href[1:])
+    return existing, referenced
+
+
+def _find_referenced_anchor(tag: Optional["Tag"]) -> str | None:
+    """从 tag 自身向上找第一个「被内部链接引用」的 id，供输出 <a id> 使用。
+
+    例如正文引用 #S4，而 S4 是 <section id="S4">，章节标题 <h2> 自身没有该 id，
+    这里沿祖先链找到它，使标题块能输出锚点。
+    """
+    cur: Optional[Tag] = tag
+    while cur is not None:
+        tid = _as_str(cur.get("id"))
+        if tid and tid in _REFERENCED_ANCHORS:
+            return tid
+        parent = cur.parent
+        cur = parent if isinstance(parent, Tag) else None
+    return None
+
+
+def _find_referenced_anchor_in_subtree(tag: Optional["Tag"]) -> str | None:
+    """在 tag 的后代中找第一个「被内部链接引用」的 id。
+
+    用于 id 挂在内部元素上的情形：如 equationgroup 的 id 在内层 <tbody> 上，
+    标题/公式本身没有该 id。
+    """
+    if tag is None:
+        return None
+    for el in tag.find_all(id=True):
+        tid = _as_str(el.get("id"))
+        if tid and tid in _REFERENCED_ANCHORS:
+            return tid
+    return None
+
+
+def _note_content_text(note: "Tag") -> str:
+    """提取 ltx_note_content 的正文文本。
+
+    * 剔除上标标记（sup.ltx_note_mark）与编号标签（.ltx_tag_note），否则会得到
+      "1 1 https://..." 这种带重复编号的串；
+    * 链接（<a href>）优先取真实 href —— LaTeXML 会把 URL 里的 "~" 渲染成 NBSP，
+      直接取可见文本会得到不可用的坏 URL；
+    * 清理 U+02DC（˜）残留与 "thanks:" / "note:" 前缀。
+    """
+    content = note.find(class_="ltx_note_content")
+    if content is None:
+        return ""
+    parts: list[str] = []
+
+    def walk(node: PageElement) -> None:
+        if isinstance(node, NavigableString):
+            parts.append(str(node))
+            return
+        if not isinstance(node, Tag):
+            return
+        cls = node.get("class") or []
+        if any(c in cls for c in ("ltx_note_mark", "ltx_tag_note", "ltx_note_type")):
+            return
+        if node.name == "a":
+            href = _as_str(node.get("href")) or ""
+            if href.startswith(("http://", "https://")):
+                parts.append(href)
+                return
+        for c in node.children:
+            if isinstance(c, (Tag, NavigableString)):
+                walk(c)
+
+    for c in content.children:
+        if isinstance(c, (Tag, NavigableString)):
+            walk(c)
+    text = "".join(parts).replace("\u00a0", " ").replace("\u02dc", "")
+    text = re.sub(r"^\s*\^?\s*(?:thanks|note)\s*:\s*", "", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _img_size(tag: "Tag", base_width: int = 600) -> tuple[int, int] | None:
@@ -433,7 +547,14 @@ def _rich_text(tag: Tag) -> str:
 
     def walk(node: Tag | NavigableString) -> None:
         if isinstance(node, NavigableString):
-            parts.append(str(node))
+            s = str(node)
+            # 源 HTML 的文本节点里常带原始换行（LaTeXML 保留了 .tex 源码换行），
+            # 直接输出会在 markdown 里表现为硬折行、甚至从链接中间截断。这里把
+            # 文本节点内的换行折叠为空格；结构性换行（<br>/块级元素边界）由下方
+            # 各分支显式产生，不受影响。pre/code 等字面量上下文保持原样。
+            if s and node.find_parent(["pre", "code"]) is None:
+                s = re.sub(r"[ \t]*\r?\n[ \t]*", " ", s)
+            parts.append(s)
             return
         if not isinstance(node, Tag):
             return
@@ -447,13 +568,15 @@ def _rich_text(tag: Tag) -> str:
         if "ltx_ERROR" in cls:
             # LaTeXML 环境转换错误标记（如损坏的 {wrapfigure}）——不是论文内容
             return
-        if "ltx_note" in cls and "ltx_role_footnote" in cls:
-            # 脚注：只保留上标标记 [n]，不把脚注正文插入段落内部（避免重复数字与错位）
+        if "ltx_note" in cls and ("ltx_role_footnote" in cls or "ltx_role_footnotemark" in cls):
+            # 脚注：正文处只留 Markdown footnote 标记 [^n]（不把脚注正文内联进段落，
+            # 避免重复编号与错位）；脚注正文由 parse_arxiv_html 统一收集到文末
+            # [^n]: 定义区。此前只输出裸 "[n]" 且从不生成定义区 → 标记全部悬空、内容全丢。
             mark = node.find(class_="ltx_note_mark")
             if mark:
                 mtxt = (mark.get_text() or "").strip()
                 if mtxt:
-                    parts.append(f"[{mtxt}]")
+                    parts.append(f"[^{mtxt}]")
             return
         if "ltx_cite" in cls:
             # 参考文献引用：
@@ -494,10 +617,18 @@ def _rich_text(tag: Tag) -> str:
                             display = f"{vis}, {clean_title}" if vis else clean_title
                         else:  # "short"
                             display = vis if vis else clean_title
-                        # 浏览器原生 title 属性显示为悬浮提示，论文名挂在这里
-                        parts.append(f"[{display}]({url} \"{clean_title}\")")
+                        if url:
+                            # 浏览器原生 title 属性显示为悬浮提示，论文名挂在这里
+                            parts.append(f"[{display}]({url} \"{clean_title}\")")
+                        else:
+                            # cite_search_engine=none：不挂搜索引擎外链，退化为纯文本
+                            parts.append(display)
                     else:
                         href = _as_str(c.get("href")) or ""
+                        # 无标题引用：内部锚点只有在会真实输出锚点时才保留链接，
+                        # 否则退化为纯文本，避免死链。
+                        if href.startswith("#") and href[1:] not in _REFERENCED_ANCHORS:
+                            href = ""
                         parts.append(f"[{visible}]({href})" if href else visible)
                 else:
                     # 其他文本节点（如 "(Shi et al., "、"；"、")"）原样
@@ -565,6 +696,13 @@ def _rich_text(tag: Tag) -> str:
             return
         if name == "a":
             href = _as_str(node.get("href")) or ""
+            # 指向文档内不存在锚点的链接（如已丢弃元素的 #id）：退化为纯文本，
+            # 避免 markdown 里留下点不动的死链。目标存在的锚点则由块输出
+            # <a id="..."> 承载（见 _find_referenced_anchor）。
+            if href.startswith("#") and href[1:] not in _EXISTING_IDS:
+                for c in node.children:
+                    _walk_child(c)
+                return
             parts.append("[")
             for c in node.children:
                 _walk_child(c)
@@ -651,11 +789,12 @@ def _plain_text(node: Tag | NavigableString, *, wrap_math: bool = False) -> str:
             return f"${sym}{{{inner}}}$"
         return f"{sym}{{{inner}}}"
     if "ltx_note" in cls and ("ltx_role_footnote" in cls or "ltx_role_footnotemark" in cls):
-        # footnote / footnotemark 在纯文本中只保留上标标记；忽略 ltx_note_outer 中的
-        # 完整脚注内容，避免把脚注正文泄露到标题/作者/图注等位置。
+        # footnote / footnotemark 在纯文本中只保留 Markdown footnote 标记 [^n]；
+        # 忽略 ltx_note_outer 中的完整脚注内容（由文末定义区承载），避免把脚注
+        # 正文泄露到标题/作者/图注等位置。
         mark = node.find(class_="ltx_note_mark")
         mtxt = (mark.get_text() or "").strip() if mark else ""
-        return f"[{mtxt}]" if mtxt else ""
+        return f"[^{mtxt}]" if mtxt else ""
     return "".join(
         _plain_text(c, wrap_math=wrap_math)
         for c in node.children
@@ -873,6 +1012,24 @@ def parse_arxiv_html(
     global _BIB_MAP
     _BIB_MAP = _build_bib_map(soup)
 
+    # 收集锚点信息：文档内被 <a href="#..."> 引用的 id，用于给对应块输出 <a id>，
+    # 以及判断引用目标是否存在（不存在则退化为纯文本，避免死链）。
+    global _EXISTING_IDS, _REFERENCED_ANCHORS, _FOOTNOTE_DEFS
+    _EXISTING_IDS, _REFERENCED_ANCHORS = _build_anchor_sets(soup)
+
+    # 收集全文脚注定义：正文只留 [^n] 标记，正文内容（URL 等）集中到文末输出。
+    _FOOTNOTE_DEFS = []
+    for note in soup.find_all("span", class_="ltx_note"):
+        if "ltx_role_footnote" not in (note.get("class") or []):
+            continue
+        mark_el = note.find(class_="ltx_note_mark")
+        mark = (mark_el.get_text() or "").strip() if mark_el else ""
+        if not mark:
+            continue
+        note_body = _note_content_text(note)
+        if note_body:
+            _FOOTNOTE_DEFS.append((mark, note_body))
+
     # 图片路径归一化（必须在 _walk_section 之前执行，使所有块——含复杂表格
     # 走 HTML 路径直接 str(html_table) 输出——都能拿到正确的图片地址）：
     #   - 本地图片模式：把 <img src>/<object data> 改写为本地相对路径；
@@ -933,16 +1090,26 @@ def parse_arxiv_html(
             name_tag = creator.find(class_="ltx_personname")
             name = _plain_text(name_tag).strip() if name_tag else ""
             # 上标语义还原（裸 ^{...} 在 Markdown 中不会被渲染，会原样显示）：
-            # · 脚注 mark：_plain_text 转成 [mark]（如 "Pengyuan Liu[2]"）→ <sup>
+            # · 脚注 mark：_plain_text 转成 [^mark]（如 "Pengyuan Liu[^2]"）→ <sup>
             # · 普通上标：sub/sup 元素产出 ^{∗}（共同一作 ∗、通讯 †、‡ 等）→ <sup>
             # · 下标（罕见）_{...} → <sub>
-            name = re.sub(r"\[([^][]+)\]", r"<sup>\1</sup>", name)
+            name = re.sub(r"\[\^?([^][]+)\]", r"<sup>\1</sup>", name)
             name = re.sub(r"\^\{([^{}]*)}", r"<sup>\1</sup>", name)
             name = re.sub(r"_\{([^{}]*)}", r"<sub>\1</sub>", name)
             if not name:
                 continue
             aff = ""
             roles: list[str] = []
+
+            def _role_of(text: str) -> str:
+                """把 thanks 长句压缩为简短角色标签。"""
+                lowered = text.lower()
+                if re.search(r"correspond", lowered):
+                    return "Corresponding author"
+                if re.search(r"equal(ly)?|co[-\s]?first", lowered):
+                    return "Equal contribution"
+                return text
+
             # 一位作者可能同时带有 affiliation、thanks（通讯/共同一作）和 email。
             # 这里逐条解析 ltx_contact，避免只识别 affiliation 而漏掉共同一作等信息。
             for contact in creator.find_all(class_="ltx_contact"):
@@ -957,15 +1124,7 @@ def parse_arxiv_html(
                 if "ltx_role_affiliation" in cls:
                     aff = contact_text
                 elif "ltx_role_thanks" in cls:
-                    # 通讯作者 / 共同一作 等身份说明通常放在 thanks 里。
-                    # 将长句压缩为简短角色标签，便于在同一行显示且不破坏 markdown。
-                    lowered = contact_text.lower()
-                    if re.search(r"correspond", lowered):
-                        roles.append("Corresponding author")
-                    elif re.search(r"equal(ly)?|co[-\s]?first", lowered):
-                        roles.append("Equal contribution")
-                    else:
-                        roles.append(contact_text)
+                    roles.append(_role_of(contact_text))
                 elif "ltx_role_email" in cls:
                     # 邮箱 contact 里常混入 "Correspondence to: xxx@yy" 整句：
                     # 只抽邮箱地址，通讯说明归入角色标签，避免出现
@@ -975,6 +1134,16 @@ def parse_arxiv_html(
                     emails = re.findall(r"[\w.+-]+@[\w.-]+\.\w+", contact_text)
                     if emails:
                         roles.append("Email: " + ", ".join(dict.fromkeys(emails)))
+            # 作者脚注式说明（共同一作 / 通讯作者）：LaTeXML 把说明渲染成
+            # <span class="ltx_note ltx_role_thanks">（带 ltx_note_content），它**不是**
+            # ltx_contact，因此上面只扫 ltx_contact 时会整体漏掉这类说明（整条信息丢失）。
+            for note in creator.find_all(class_="ltx_role_thanks"):
+                if "ltx_contact" in (note.get("class") or []):
+                    continue  # 已由上面的 ltx_contact 循环处理，避免重复
+                note_text = _note_content_text(note)
+                if note_text:
+                    roles.append(_role_of(note_text))
+            roles = list(dict.fromkeys(roles))  # 去重且保序
             # 组装：机构放最前，身份说明随后，姓名后的上标保留。例如：
             #   Changliang Li (Beijing Language and Culture University, Corresponding author)
             #   Pengyuan Liu<sup>2</sup> (MIT)
@@ -999,13 +1168,17 @@ def parse_arxiv_html(
     # 作者声明（共同一作/通讯等）：LaTeXML 渲染成畸形串
     # "††affiliationnotice: Equal contribution"，且挂在 <article> 下（不在
     # authors 容器内），早期实现会整条丢失。这里取 note 正文并挂到作者块之后。
-    for note in soup.find_all(class_="ltx_role_affiliationnotice"):
+    for note in soup.find_all(
+        class_=re.compile(r"ltx_role_affiliationnotice|ltx_role_thanks")
+    ):
         if note.find_parent(class_="ltx_authors") is not None:
             continue  # 作者行内的 thanks 已由上面 authors 分支处理，避免重复
-        content_tag = note.find(class_="ltx_note_content") or note
-        note_text = re.sub(r"^[^\w\u4e00-\u9fff]*", "", _plain_text(content_tag))
-        note_text = re.sub(r"^(?:affiliationnotice|thanks|note)\s*:\s*", "",
-                           note_text, flags=re.IGNORECASE).strip()
+        note_text = _note_content_text(note)
+        if not note_text:
+            content_tag = note.find(class_="ltx_note_content") or note
+            note_text = re.sub(r"^[^\w\u4e00-\u9fff]*", "", _plain_text(content_tag))
+            note_text = re.sub(r"^(?:affiliationnotice|thanks|note)\s*:\s*", "",
+                               note_text, flags=re.IGNORECASE).strip()
         if note_text:
             blocks.append(Block(kind="paragraph", text=note_text, raw=f"* {note_text}",
                                 meta={"html_id": _html_id_of(note)}))
@@ -1015,7 +1188,19 @@ def parse_arxiv_html(
     _doc_root = soup.find("article") or soup.find(class_="ltx_page_content") or soup.body
     if _doc_root is not None:
         for para_div in _doc_root.find_all("div", class_="ltx_para", recursive=False):
-            _emit_orphan_para(para_div, blocks)
+            _emit_orphan_para(para_div, blocks, img_mapping, base_url)
+        # 直接挂在 article 下的图/表/列表（不包在 ltx_para 里）同属正文内容，
+        # 之前会被整体丢弃（如不属任何 section 的孤图）。
+        for sub in _doc_root.find_all(["figure", "table", "ul", "ol"], recursive=False):
+            sub_cls = sub.get("class") or []
+            if sub.name == "figure" and "ltx_figure" in sub_cls:
+                _append_figure(sub, blocks, img_mapping, base_url)
+            elif "ltx_table" in sub_cls:
+                _append_table(sub, blocks)
+            elif sub.name == "table" and "ltx_equation" not in sub_cls:
+                _append_table(sub, blocks)
+            elif sub.name in ("ul", "ol"):
+                _emit_list(sub, blocks)
 
     abstract = soup.find(class_="ltx_abstract")
     if abstract:
@@ -1047,6 +1232,8 @@ def parse_arxiv_html(
 
     content = soup.find("article") or soup.find(class_="ltx_page_content") or soup.body
     if content is None:
+        _finalize_anchor_meta(blocks, soup)
+        _append_footnotes(blocks)
         return blocks, soup
     for sec in content.find_all(["section", "subsection", "subsubsection"],
                                 class_=re.compile(r"ltx_section|ltx_appendix"),
@@ -1062,17 +1249,70 @@ def parse_arxiv_html(
     # References 整节回收（此前被整节丢弃，正文引用 #bib.xxx 全部悬空）
     _append_bibliography(soup, blocks)
 
+    # 给被内部链接引用的块补锚点，再追加脚注定义区。
+    _finalize_anchor_meta(blocks, soup)
+    _append_footnotes(blocks)
+
     return blocks, soup
 
 
-def _emit_orphan_para(div: Tag, blocks: list[Block]) -> None:
+def _finalize_anchor_meta(blocks: list[Block], soup: "BeautifulSoup") -> None:
+    """给「被文档内链接引用」的块补 meta['anchor']，供渲染时输出 <a id="...">。
+
+    做法：按块的 html_id（data-zh-id）反查 DOM 元素，再沿祖先链找被引用的 id。
+    同一锚点只认领一次（块按文档顺序排列，标题会先于其正文认领），避免重复输出
+    相同的 id。未被任何链接引用的 id 不输出锚点，保持 markdown 干净。
+    """
+    if not _REFERENCED_ANCHORS:
+        return
+    zh_index: dict[str, Tag] = {}
+    for el in soup.find_all(attrs={"data-zh-id": True}):
+        zid = _as_str(el.get("data-zh-id"))
+        if zid and zid not in zh_index:
+            zh_index[zid] = el
+    claimed: set[str] = set()
+    for b in blocks:
+        # 块若已自带锚点（如公式/图片块按元素自身解析得到），认领；同一锚点只保留
+        # 第一次出现（例如一组并列子图共享同一个 figure 锚点），避免重复 id。
+        existing = (b.meta or {}).get("anchor")
+        if existing:
+            if existing in claimed:
+                del b.meta["anchor"]
+            else:
+                claimed.add(existing)
+            continue
+        hid = (b.meta or {}).get("html_id")
+        if not hid:
+            continue
+        el = zh_index.get(hid)
+        if el is None:
+            continue
+        anchor = _find_referenced_anchor(el)
+        if anchor and anchor not in claimed:
+            claimed.add(anchor)
+            b.meta["anchor"] = anchor
+
+
+def _append_footnotes(blocks: list[Block]) -> None:
+    """在文末集中输出脚注定义区（Markdown footnote 语法 [^n]: ...）。"""
+    for mark, text in _FOOTNOTE_DEFS:
+        if not text:
+            continue
+        blocks.append(Block(kind="footnote", text=text, raw=f"[^{mark}]: {text}",
+                            meta={"mark": mark}))
+
+
+def _emit_orphan_para(div: Tag, blocks: list[Block],
+                      img_mapping: Optional[dict[str, str]] = None,
+                      base_url: str = "") -> None:
     """提取"孤儿"段落容器（article 直属、不在任何 section 内）。
 
     典型：LaTeXML 把 Content Warning 边框盒、投稿信息等放在
     <div class="ltx_para"> 直接挂到 <article> 下。_walk_section 只遍历
     section 子节点，这类前排内容会被整体丢掉。
     """
-    for sub in div.find_all(["p", "table", "ul", "ol", "pre"], recursive=False):
+    img_mapping = img_mapping or {}
+    for sub in div.find_all(["p", "table", "figure", "ul", "ol", "pre"], recursive=False):
         sub_cls = sub.get("class") or []
         if sub.name == "pre" and "ltx_verbatim" in sub_cls:
             _emit_verbatim_pre(sub, blocks)
@@ -1082,7 +1322,11 @@ def _emit_orphan_para(div: Tag, blocks: list[Block]) -> None:
                 blocks.append(Block(kind="paragraph",
                                     text=_plain_text_for_translation(sub), raw=rich,
                                     meta={"html_id": _html_id_of(sub)}))
-        elif sub.name == "table" and "ltx_equation" not in sub_cls:
+        elif "ltx_figure" in sub_cls:
+            _append_figure(sub, blocks, img_mapping, base_url)
+        elif "ltx_equation" in sub_cls or "ltx_equationgroup" in sub_cls:
+            _append_equation(sub, blocks, html_id=_html_id_of(sub))
+        elif sub.name == "table":
             _append_table(sub, blocks)
         elif sub.name in ("ul", "ol"):
             _emit_list(sub, blocks)
@@ -1387,7 +1631,7 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
                             meta={"html_id": _html_id_of(sub)},
                         ))
                 elif "ltx_equation" in sub_cls or "ltx_equationgroup" in sub_cls:
-                    _append_equation(sub, blocks)
+                    _append_equation(sub, blocks, html_id=_html_id_of(sub))
                 elif sub.name in ("ul", "ol"):
                     # ltx_para 内可能直接嵌套列表（这是 ar5iv 把整个小节包进
                     # 一个 ltx_para 时的常见结构，例如 4.2 Datasets 节：
@@ -1449,7 +1693,7 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
                     # 已在上方统一处理；此处忽略，避免重复。
                     return
                 if "ltx_equation" in el_cls_set or "ltx_equationgroup" in el_cls_set:
-                    _append_equation(el, blocks)
+                    _append_equation(el, blocks, html_id=_html_id_of(el))
                     return
                 if "ltx_figure" in el_cls_set:
                     _append_figure(el, blocks, img_mapping, base_url)
@@ -1572,8 +1816,15 @@ def _append_equation(eq: Tag, blocks: list[Block], html_id: str | None = None) -
         m = re.fullmatch(r"\((.+)\)", lbl)
         tag = m.group(1) if m else lbl
         md = f"$$\n{tex}\n\\tag{{{tag}}}\n$$"
-    blocks.append(Block(kind="equation", text="", raw=md,
-                        meta={"label": lbl, "html_id": html_id} if html_id else {"label": lbl}))
+    meta: dict = {"label": lbl}
+    if html_id:
+        meta["html_id"] = html_id
+    # 公式元素本身可能没有 data-zh-id（挂在已有 id 的容器下），故这里直接用元素
+    # 自身解析锚点，保证 [eq](#S3.E1) 这类引用能跳转。
+    anchor = _find_referenced_anchor(eq) or _find_referenced_anchor_in_subtree(eq)
+    if anchor:
+        meta["anchor"] = anchor
+    blocks.append(Block(kind="equation", text="", raw=md, meta=meta))
 
 
 def _unescape_verbatim(text: str) -> str:
@@ -1720,7 +1971,8 @@ def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
                     #    figure 类与子 panel caption 同流，直接走 raw 输出，
                     #    不进翻译也不进大纲，仅作为图注说明显示。
                     out_blocks.append(Block(kind="figure", text=outer_text, raw=raw_cap,
-                                            meta={"caption": outer_text}))
+                                            meta={"caption": outer_text,
+                                                  "anchor": _find_referenced_anchor(figure)}))
 
     # ar5iv 中"并列多图"结构：一个外层 <figure class="ltx_figure"> 包了一个
     # ltx_flex_figure 容器，内部并排放了多个 <figure class="ltx_figure_panel">，
@@ -1759,7 +2011,8 @@ def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
                                         text=_plain_text(caption) if caption else "",
                                         raw=(table_html + "\n\n" if table_html else "")
                                              + (f"> {cap_text}" if cap_text else ""),
-                                        meta={"caption": cap_text, "html_id": _html_id_of(fig)}))
+                                        meta={"caption": cap_text, "html_id": _html_id_of(fig),
+                                              "anchor": _find_referenced_anchor(fig)}))
                     return
 
     # ar5iv 中另一种"并列多图"结构：外层 <figure> 内是 <div class="ltx_flex_figure">，
@@ -1796,7 +2049,9 @@ def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
                     render_src = src if src.startswith("http") else (base_url.rstrip("/") + "/" + src.lstrip("/"))
                 blocks.append(Block(kind="figure", text="",
                                     raw=_html_img("figure", render_src, size),
-                                    meta={"src": src, "local_src": render_src, "html_id": _html_id_of(fig)}))
+                                    meta={"src": src, "local_src": render_src,
+                                          "html_id": _html_id_of(fig),
+                                          "anchor": _find_referenced_anchor(fig)}))
             # 外层总 caption（"Figure 10: …"）以引用块形式追加，顺序在所有子图之后
             _append_figure_caption_block(fig, blocks)
             return
@@ -1833,7 +2088,8 @@ def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
             blocks.append(Block(kind="figure", text=text,
                                 raw=raw,
                                 meta={"src": None, "local_src": None, "caption": cap_text,
-                                      "html_id": _html_id_of(fig)}))
+                                      "html_id": _html_id_of(fig),
+                                      "anchor": _find_referenced_anchor(fig)}))
             return
         render_src = None
     elif img_mapping:
@@ -1851,7 +2107,30 @@ def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
                              if render_src else "")
                              + (f"> {cap_text}" if cap_text else ""),
                         meta={"src": src, "local_src": render_src, "caption": cap_text,
-                              "html_id": _html_id_of(fig)}))
+                              "html_id": _html_id_of(fig),
+                              "anchor": _find_referenced_anchor(fig)}))
+
+
+def _escape_bare_asterisks(text: str) -> str:
+    """转义不在 $...$ 公式内的 '*'。
+
+    算法伪代码里的 C 风格注释 ``/* ... */`` 会被 markdown 当作强调（斜体），
+    导致 cell 内容错乱。这里只转义公式外的 '*'（公式内的 '*' 可能是有意义
+    的数学符号，保持原样）。
+    """
+    if "*" not in text:
+        return text
+    out: list[str] = []
+    in_math = False
+    for ch in text:
+        if ch == "$":
+            in_math = not in_math
+            out.append(ch)
+        elif ch == "*" and not in_math:
+            out.append("\\*")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _append_listing(fig: Tag, blocks: list[Block]) -> None:
@@ -1864,7 +2143,8 @@ def _append_listing(fig: Tag, blocks: list[Block]) -> None:
     输出为 **两列 GFM 表格**（列1 = 行号标签，列2 = 代码内容），而非 fenced code
     block —— 这样 Typora 等渲染器能在代码内容中正常解析 inline math（$…$），
     同时行号与代码左右对齐、可读性好。代码内容中的 `|` 会转义避免破坏表格结构。
-    caption 置于表格下方（学术规范：表注/算法说明在块之后）。
+    caption 置于表格**上方**：算法题注在源 HTML 中本就位于块顶（ltx_framed_top），
+    此前被搬到块后，与原文顺序相反（2026-10 审计）。
     """
     # --- caption ---
     caption = fig.find("figcaption") or fig.find(class_="ltx_caption")
@@ -1902,31 +2182,32 @@ def _append_listing(fig: Tag, blocks: list[Block]) -> None:
             # 尝试识别 "Word:" 形式
             m = re.match(r"^([A-Za-z][A-Za-z ]*?):\s*(.*)$", content)
             if m and len(m.group(1)) <= 12:
-                rows.append((m.group(1), m.group(2)))
+                # 保留冒号，忠实反映原文的 "Input: …" / "Output: …" 写法
+                rows.append((m.group(1) + ":", m.group(2)))
             else:
                 rows.append(("", content))
 
-    # 组装两列表格。GFM 表格强制要求 header row，否则不识别为表格。
-    # 使用 zero-width space (U+200B) 作占位单元格 —— 视觉上完全不可见，
-    # 但满足 GFM "单元格内必须有内容"的语法要求，避免渲染成两行空白。
-    # 分隔行用 :-: 对齐让它视觉上看起来"中心对齐"占位。
-    _ZW = "\u200b"
-    table_lines: list[str] = [f"{_ZW} | {_ZW}", ":-: | :-"]
+    # 组装两列表格。GFM 表格强制要求 header row 且单元格非空，否则不识别为表格。
+    # 用可见的 &nbsp; 作空白占位（不再使用零宽空格 U+200B，避免输出里残留不可见
+    # 字符）；分隔行用规范的三横线写法。
+    table_lines: list[str] = ["| &nbsp; | &nbsp; |", "| :--- | :--- |"]
     for label, content in rows:
         # 单元格内 | 转义，避免破坏表格
-        cell_content = content.replace("|", "\\|").strip()
+        cell_content = _escape_bare_asterisks(content.replace("|", "\\|").strip())
+        label_cell = _escape_bare_asterisks(label.replace("|", "\\|").strip())
         if cell_content == "":
-            table_lines.append(f"| {label} | |")
+            table_lines.append(f"| {label_cell} | |")
         else:
-            table_lines.append(f"| {label} | {cell_content} |")
+            table_lines.append(f"| {label_cell} | {cell_content} |")
     code_block = "\n".join(table_lines)
 
     # --- caption 翻译交给 translator，代码块原样保留 ---
-    raw_parts: list[str] = [code_block]
+    # 题注在源 HTML 中位于算法块顶部，这里保持同样的顺序（题注 + 代码表格）。
+    raw_parts: list[str] = []
     if cap_text:
-        cap_text_clean = cap_text.replace("\n", " ").strip()
-        raw_parts.append(f"> {cap_text_clean}")
-    raw = "\n\n".join(raw_parts) if raw_parts else "(伪代码)"
+        raw_parts.append(f"> {cap_text.replace(chr(10), ' ').strip()}")
+    raw_parts.append(code_block)
+    raw = "\n\n".join(p for p in raw_parts if p) or "(伪代码)"
 
     blocks.append(Block(
         kind="listing",  # 独立类型，与 figure/table 区分
@@ -1996,6 +2277,30 @@ def _is_rule_row(tr: Tag) -> bool:
             cs = 1
         if cs > 1:
             return True
+    return False
+
+
+def _is_likely_data_cell(text: str) -> bool:
+    """判断表格 cell 是否更像「数据」而非表头标签。
+
+    用于阻止"双层表头"启发式把数据行误判为第二层表头：一旦误判，这些行会被
+    `<br>` 合并进唯一的表头行，整张表塌成一行（2026-10 审计：T9/T10 行塌缩）。
+    """
+    s = text.strip()
+    if not s:
+        return False
+    # 引文（"Li et al. (2020)"）或括号年份
+    if re.search(r"\bet\s+al\.?", s, re.IGNORECASE):
+        return True
+    if re.search(r"\(\s*(?:19|20)\d{2}[a-z]?\s*\)", s):
+        return True
+    # 剥离前导标签 / 公式 / 命令后，以数字或正负号打头的数值（"510.7M"、"$>$ 355M"）
+    core = re.sub(r"^(?:\s|<[^>]+>|\$[^$]*\$|\\[a-zA-Z]+)+", "", s)
+    if re.match(r"^[-–—]?\s*\d", core):
+        return True
+    # 百分比
+    if re.search(r"\d+(?:\.\d+)?\s*%", s):
+        return True
     return False
 
 
@@ -2072,6 +2377,58 @@ def _span_tabular_to_markdown(tab: Tag) -> str:
     for r in grid[1:]:
         lines.append(fmt(r))
     return "\n".join(lines)
+
+
+def _clean_table_html(table: Tag) -> None:
+    """净化「HTML 直出」表格：映射语义标签 + 清除 ltx_* 装饰类名。
+
+    LaTeXML 用 <span class="ltx_text ltx_font_bold"> 表示粗体，直接 str() 输出会把
+    ltx_* 类名原样泄漏进 markdown（渲染器没有对应 CSS，粗体/斜体全部失效，
+    且正文出现大量 ltx_* 噪声，2026-10 审计）。这里：
+      * ltx_font_bold → <strong>、ltx_font_italic → <em>（保住粗/斜体语义）；
+      * 其余 ltx_* 类名（ltx_td/ltx_align_center/ltx_text/ltx_border_t…）全部删除；
+      * 清掉因此失去全部属性的空 <span> 包装，减少无意义标签。
+    """
+    for span in table.find_all("span"):
+        cls = span.get("class") or []
+        bold = "ltx_font_bold" in cls
+        italic = "ltx_font_italic" in cls
+        if bold and italic:
+            # 同时加粗+斜体（如 \textbf{\textit{Traditional Method}}）：单标签无法
+            # 同时表达，用 <strong><em>…</em></strong> 嵌套。
+            em = BeautifulSoup("", "html.parser").new_tag("em")
+            for child in list(span.contents):
+                em.append(child.extract())
+            span.append(em)
+            span.name = "strong"
+        elif bold:
+            span.name = "strong"
+        elif italic:
+            span.name = "em"
+    # 注意：find_all 不含自身，需把 <table> 根节点也纳入类名清理。
+    for tag in [table, *table.find_all(True)]:
+        cls = tag.get("class")
+        if not cls:
+            continue
+        kept = [c for c in cls if not c.startswith("ltx_")]
+        if kept:
+            tag["class"] = kept
+        else:
+            del tag["class"]
+    # 清掉单元格上的纯排版 style（padding/vertical-align 等，对 markdown 无意义）；
+    # 含 color 的样式保留（用于保留表格里的颜色标注）。
+    for cell in table.find_all(["td", "th"]):
+        style = _as_str(cell.get("style"))
+        if style and "color" not in style.lower():
+            del cell["style"]
+    for _ in range(3):
+        changed = False
+        for span in table.find_all("span"):
+            if not span.attrs:
+                span.unwrap()
+                changed = True
+        if not changed:
+            break
 
 
 def _collect_table_text(tbl: Tag) -> str:
@@ -2193,6 +2550,7 @@ def _collect_table_text(tbl: Tag) -> str:
             html_table["style"] = (
                 f"display:block;overflow-x:auto;max-width:100%;{existing_style}"
             ).strip()
+        _clean_table_html(html_table)
         html = str(html_table)
         # 防止 Typora 把独占一行的 GFM 表格分隔线误判；表格 HTML 块前后
         # 加空行并非必须（GFM 块级 HTML 由空行分隔），但 remove 掉前后
@@ -2321,6 +2679,12 @@ def _collect_table_text(tbl: Tag) -> str:
                 and cell_count >= max_cols // 2   # 至少要有一半 cell
                 and cols_span <= max_cols + 1     # 且不能超过首层
                 and max_rs <= 2
+                # 至少 2 个非空 cell：整行只有 1 个值（如 T9 的 "Ours" 分组标签行）是
+                # 数据/分组行，不是表头，合并进表头会丢失该行。
+                and sum(1 for t in (text for text, _, _ in row) if t.strip()) >= 2
+                # 含引文/年份/数值的 cell → 数据行，不能当表头（T10 每行首列是引文）。
+                and not any(_is_likely_data_cell(t)
+                            for t in (text for text, _, _ in row))
                 and not any(_SHORT_ABBR.match(t) and t.isalpha() and t.upper() == t and len(t) <= 5
                             and t not in ("DATASET", "METHOD", "TABLE", "ABBR")
                             for t in (text for text, _, _ in row))
@@ -2498,6 +2862,14 @@ def _collect_table_text(tbl: Tag) -> str:
                 # 用 <br> 拼接（GFM 表格 cell 内允许 <br>）
                 merged_header.append("<br>".join(pieces))
         header_row = merged_header
+        # 回归预警：多行表头里若出现数值/引文等「数据」特征，很可能是数据行被
+        # 误判为第二层表头后合并了进来（曾导致 T9/T10 整表塌成一行）。这里给出
+        # 运行时可观测的告警，便于及时发现并修正启发式规则。
+        if any(_is_likely_data_cell(t) for r in header_rows for t in grid[r]):
+            logger.warning(
+                "表格疑似把数据行并入表头（表头 %d 行），请检查该表行是否完整",
+                len(header_rows),
+            )
     elif len(header_rows) == 1:
         header_row = grid[header_rows[0]]
     else:
