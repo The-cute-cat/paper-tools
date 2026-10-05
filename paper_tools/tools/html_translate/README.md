@@ -1,6 +1,8 @@
-# arxiv-translate
+# html-translate
 
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
+
+> 旧名 `arxiv-translate` 仍作为命令别名保留（`python main.py arxiv-translate …` 可继续使用）。
 
 将论文网页下载（或读取本地已保存的 HTML）并翻译为中文 Markdown，保留公式、图表、表格、引用等所有结构。
 
@@ -34,20 +36,20 @@
 
 ```bash
 # 完整 arxiv 链接
-python main.py arxiv-translate https://arxiv.org/abs/2605.26158
+python main.py html-translate https://arxiv.org/abs/2605.26158
 
 # 仅 arxiv ID
-python main.py arxiv-translate 2605.26158v1
+python main.py html-translate 2605.26158v1
 
 # Springer 文章（链接 / DOI 均可）
-python main.py arxiv-translate https://link.springer.com/article/10.1007/s10506-025-09437-x
-python main.py arxiv-translate 10.1007/s10506-025-09437-x
+python main.py html-translate https://link.springer.com/article/10.1007/s10506-025-09437-x
+python main.py html-translate 10.1007/s10506-025-09437-x
 
 # 本地保存的网页
-python main.py arxiv-translate "D:/papers/saved-article.html"
+python main.py html-translate "D:/papers/saved-article.html"
 
 # 指定输出目录和模型
-python main.py arxiv-translate 2605.26158v1 --out ./my-papers --model deepseek-flash
+python main.py html-translate 2605.26158v1 --out ./my-papers --model deepseek-flash
 ```
 
 ### Springer 来源说明
@@ -69,24 +71,25 @@ python main.py arxiv-translate 2605.26158v1 --out ./my-papers --model deepseek-f
 
 ### IDE 直接运行
 
-在 IDE 中打开 `paper_tools/tools/arxiv_translate/main.py`，修改 `main()` 函数中的常量即可直接 Run（无需配置命令行参数）：
+在 IDE 中打开 `paper_tools/tools/html_translate/main.py`，修改 `main()` 里的常量即可直接 Run（无需配置命令行参数）：
 
 ```python
-INPUT = "2605.26158v1"   # arXiv 链接/ID、Springer 链接/DOI、或本地 HTML 路径
-API_KEY = ""              # 留空则从 .env 读取
-MODEL = ""                # 留空则用默认模型
-OUT_DIR = ""              # 留空则用默认输出目录
-CITE_SEARCH = "bing"      # 引用搜索引擎
-CITE_DISPLAY = "short"    # 引用显示模式
-IMAGE_LOCAL = False       # 是否下载图片到本地
-MERGE_MIN_CHARS = 1000    # 翻译单元目标长度下限（字符）：相邻同类文本块会被贪心
-                            # 凑成 [MERGE_MIN_CHARS, MERGE_TARGET_MAX] 区间的单元，一起
-                            # 以 JSON 分块翻译；设为 0 关闭合并。
-MERGE_TARGET_MAX = 1500    # 翻译单元目标长度上限（字符）：凑单元时累计达此值即关闭
-                            # 当前单元；单块 ≥ 此值则独立成单元（不强行拆分）；设为 0 不限制。
-EXPORT_FORMATS = ""        # 额外导出格式（DOCX / PDF，实验中），逗号分隔如 "docx,pdf"
-OUTPUT_MARKDOWN = True     # 是否仍输出 .zh.md；导出额外格式时设为 False 可只产出导出格式
-TRANSLATE_SKIP = False     # 跳过翻译：True 时不调用 LLM，仅解析并输出论文英文原文（结构化原文 markdown）
+input_ = ""               # 论文输入：arXiv 链接/ID、Springer 链接/DOI、或本地 HTML 路径
+api_key = ""              # 留空则从 .env 读取
+model = ""                # 留空则用默认模型
+out_dir = ""              # 留空则用默认输出目录
+cite_search = "bing"      # 引用搜索引擎
+cite_display = "short"    # 引用显示模式
+image_local = False       # 是否下载图片到本地
+merge_min_chars = 1000    # 翻译单元目标长度下限（字符）：相邻同类文本块会被贪心
+                          # 凑成 [merge_min_chars, merge_target_max] 区间的单元，一起
+                          # 以 JSON 分块翻译；设为 0 关闭合并。
+merge_target_max = 1500   # 翻译单元目标长度上限（字符）：凑单元时累计达此值即关闭
+                          # 当前单元；单块 ≥ 此值则独立成单元（不强行拆分）；设为 0 不限制。
+export_formats = ""       # 额外导出格式（DOCX / PDF，实验中），逗号分隔如 "docx,pdf"
+output_markdown = True    # 是否仍输出 .zh.md；导出额外格式时设为 False 可只产出导出格式
+translate_skip = False    # 跳过翻译：True 时不调用 LLM，仅解析并输出论文英文原文（结构化原文 markdown）
+overwrite = ""            # 覆盖策略：ask / always / never（留空用 .env）
 ```
 
 ## 工作流程
@@ -255,7 +258,7 @@ TRANSLATE_SKIP = False     # 跳过翻译：True 时不调用 LLM，仅解析并
 
 ## 输出说明
 
-翻译完成后在 `output/<arxiv_id>/` 下生成：
+翻译完成后在 `output/<论文标识>/` 下生成（arXiv 用 arxiv ID，如 `2605.26158v1`；Springer 用 DOI 转义名，如 `10.1007_s10506-025-09437-x`）：
 
 ```
 output/2605.26158v1/
@@ -325,7 +328,7 @@ Markdown 文件顶部包含论文标题、原文链接和翻译说明：
 | `PAPER_TOOLS_EXPORT_FORMATS` | 额外导出格式（docx/pdf/docx_pdf/all，实验中） |
 | `PAPER_TOOLS_OUTPUT_MD` | 导出额外格式时是否仍输出 `.zh.md` |
 | `PAPER_TOOLS_SKIP_TRANSLATE` | 跳过翻译，仅输出英文原文（1/true；开启后无需 API Key） |
-| `PAPER_TOOLS_INPUT` | 待翻译的 arxiv 链接或 ID（命令行/INPUT 未提供时回退） |
+| `PAPER_TOOLS_INPUT` | 待翻译论文输入：arXiv 链接/ID、Springer 链接/DOI、或本地 HTML 路径（命令行/`input_` 未提供时回退） |
 | `PAPER_TOOLS_SUMMARY_MAX_CHARS` | 立场摘要截断上限（字符，0=不截断） |
 | `PAPER_TOOLS_RESUME_MODE` | 断点续译模式：ask / auto / never |
 
@@ -333,10 +336,11 @@ Markdown 文件顶部包含论文标题、原文链接和翻译说明：
 
 ## 局限性
 
-1. **仅支持 arxiv HTML 预览版**：依赖 ar5iv（LaTeXML）生成的 HTML 格式，约 80% 的 arxiv 论文有此版本。不支持的论文会下载失败。
-2. **翻译质量受 LLM 影响**：依赖 DeepSeek 模型的翻译能力，极端专业领域可能需人工校对。
-3. **需 API Key**：依赖 DeepSeek API，无本地离线翻译能力。
-4. **表格翻译可能不完美**：复杂表格（合并单元格、分组头）的 Markdown 转换可能有信息损失，翻译时建议人工复核。
+1. **依赖页面 HTML 结构**：按来源使用两套解析器——arXiv 依赖 ar5iv（LaTeXML）生成的 HTML（约 80% 的 arXiv 论文有此版本，无此版本的论文会下载失败）；Springer 按 `c-article-*` 语义类名解析，站点改版可能影响结果。
+2. **Springer 需反爬绕过**：`link.springer.com` 返回 JS 挑战页，需配置 CORS 转发代理或改用「另存为 HTML」的本地文件；其表格数据在独立的 `/tables/N` 页面，抓取失败时退化为题注 + 表格页链接。
+3. **翻译质量受 LLM 影响**：依赖 DeepSeek 模型的翻译能力，极端专业领域可能需人工校对。
+4. **需 API Key**：依赖 DeepSeek API，无本地离线翻译能力。
+5. **表格翻译可能不完美**：复杂表格（合并单元格、分组头）的 Markdown 转换可能有信息损失，翻译时建议人工复核。
 
 ## License
 

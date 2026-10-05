@@ -7,7 +7,7 @@
 
 无需命令行参数：直接修改下方 `if __name__ == "__main__":` 里的常量即可。
 
-与 arxiv_translate/main.py 保持同样的结构：sys.path 引导 + 配置/日志初始化
+与 html_translate/main.py 保持同样的结构：sys.path 引导 + 配置/日志初始化
 + IDE 常量区，不依赖根目录 main.py（避免从任意工作目录运行时找不到入口）。
 """
 

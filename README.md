@@ -9,7 +9,7 @@
 
 | 工具 | 说明 |
 |------|------|
-| [arxiv-translate](./paper_tools/tools/arxiv_translate/README.md) | 下载论文 HTML（arXiv / Springer Nature Link / 本地网页），解析公式/图表/引用，调用 DeepSeek 翻译为中文 Markdown |
+| [html-translate](paper_tools/tools/html_translate/README.md) | 下载论文 HTML（arXiv / Springer Nature Link / 本地网页），解析公式/图表/引用，调用 DeepSeek 翻译为中文 Markdown |
 | [pdf-translate](./paper_tools/tools/pdf_translate/README.md) | 本地 PDF 逐页视觉提取、跨页续接，再翻译为中文 Markdown |
 | [md-export](./paper_tools/tools/md_export/README.md) | 通用 Markdown → Word / PDF / 自包含 Markdown 转换：网络图片内嵌、公式与图表（Mermaid / flowchart.js / js-sequence）渲染、表格/任务列表/代码块完整支持 |
 
@@ -33,7 +33,7 @@
 一句话概括：**下载 → 解析 → 术语/立场准备 → 并发翻译 → 一致性返修 → 输出**。
 
 各步骤的实现细节（公式占位符保护、术语表与缩写预热、论文立场摘要、短块合并、一致性检查与返修、Token 用量统计等）见
-[arxiv-translate 文档 · 翻译策略详解](./paper_tools/tools/arxiv_translate/README.md#翻译策略详解)。
+[html-translate 文档 · 翻译策略详解](paper_tools/tools/html_translate/README.md#翻译策略详解)。
 
 ## 快速开始
 
@@ -61,23 +61,23 @@ cp .env.example .env
 ### 3. 运行
 
 ```bash
-# 翻译一篇 arxiv 论文
-python main.py arxiv-translate https://arxiv.org/abs/2605.26158
+# 翻译一篇 arXiv 论文
+python main.py html-translate https://arxiv.org/abs/2605.26158
 
 # 或直接使用 arxiv ID
-python main.py arxiv-translate 2605.26158v1
+python main.py html-translate 2605.26158v1
 
 # 翻译一篇 Springer 文章（链接 / DOI 均可）
-python main.py arxiv-translate https://link.springer.com/article/10.1007/s10506-025-09437-x
+python main.py html-translate https://link.springer.com/article/10.1007/s10506-025-09437-x
 
 # 或解析本地保存的网页（Springer 有 JS 反爬挑战，浏览器另存为 HTML 后可直接解析）
-python main.py arxiv-translate "D:/papers/saved-article.html"
+python main.py html-translate "D:/papers/saved-article.html"
 
 # 指定输出目录 / 模型 / API Key（覆盖配置）
-python main.py arxiv-translate 2605.26158v1 --out ./my-output --model deepseek-flash
+python main.py html-translate 2605.26158v1 --out ./my-output --model deepseek-flash
 
 # 额外导出 docx / pdf（实验中 experimental）；--no-md 可只产出导出格式
-python main.py arxiv-translate 2605.26158v1 --export docx,pdf --no-md
+python main.py html-translate 2605.26158v1 --export docx,pdf --no-md
 
 # 翻译本地 PDF（逐页视觉识别 → 翻译）
 python main.py pdf-translate "D:/papers/paper.pdf"
@@ -92,7 +92,7 @@ python main.py md-export "D:/papers/paper.zh.md" --format portable
 ```
 
 各工具的输出文件、目录结构与进阶用法见对应工具文档：
-[arxiv-translate](./paper_tools/tools/arxiv_translate/README.md#输出说明) ·
+[html-translate](paper_tools/tools/html_translate/README.md#输出说明) ·
 [pdf-translate](./paper_tools/tools/pdf_translate/README.md#输出) ·
 [md-export](./paper_tools/tools/md_export/README.md#输出)。
 
@@ -114,7 +114,7 @@ python main.py md-export "D:/papers/paper.zh.md" --format portable
 | `PAPER_TOOLS_CORS_PROXY` | 轻量 CORS 文本转发代理（仅文本/HTML 下载，不支持二进制），如 `https://worker.dev/?url=` | 空 |
 | `PAPER_TOOLS_MERGE_MIN` | 翻译单元目标长度下限（字符，0=关闭合并） | `1000` |
 | `PAPER_TOOLS_MERGE_MAX` | 翻译单元目标长度上限（字符，0=不限制） | `1500` |
-| `PAPER_TOOLS_CITE_SEARCH` | 引用搜索引擎（google/bing/duckduckgo/semantic_scholar/arxiv） | `bing` |
+| `PAPER_TOOLS_CITE_SEARCH` | 引用搜索引擎（google/bing/duckduckgo/semantic_scholar/arxiv；`none`=关闭搜索外链，无直链引用退化为纯文本） | `bing` |
 | `PAPER_TOOLS_CITE_DISPLAY` | 引用显示模式（short/title） | `short` |
 | `PAPER_TOOLS_NAME_MODE` | 输出文件命名方式（id/title/title_zh） | `id` |
 | `PAPER_TOOLS_TOKEN_REPORT` | 翻译结束后在日志输出 token 用量与费用估算（1/true 开启） | `false` |
@@ -122,7 +122,7 @@ python main.py md-export "D:/papers/paper.zh.md" --format portable
 | `PAPER_TOOLS_EXPORT_FORMATS` | 额外导出格式（docx/pdf/docx_pdf/all，逗号分隔；实验中 experimental） | 空 |
 | `PAPER_TOOLS_OUTPUT_MD` | 导出额外格式时是否仍输出 `.zh.md`（1/true 默认） | `true` |
 | `PAPER_TOOLS_SKIP_TRANSLATE` | 跳过翻译，仅解析并输出论文英文原文（1/true；开启后无需 API Key） | `false` |
-| `PAPER_TOOLS_INPUT` | 待翻译的 arxiv 链接或 ID（命令行/INPUT 常量未提供时的回退） | 空 |
+| `PAPER_TOOLS_INPUT` | 待翻译论文输入：arXiv 链接/ID、Springer 链接/DOI、或本地 HTML 路径（命令行/`input_` 常量未提供时的回退） | 空 |
 | `PAPER_TOOLS_SUMMARY_MAX_CHARS` | 立场摘要截断上限（字符，0=不截断） | `0` |
 | `PAPER_TOOLS_RESUME_MODE` | 断点续译模式：`ask`(终端询问) / `auto`(自动恢复) / `never`(从头重翻) | `ask` |
 | `PAPER_TOOLS_OVERWRITE` | 输出文件覆盖策略：`ask`(终端询问) / `always`(直接覆盖) / `never`(跳过写入)；CLI 可用 `--overwrite`/`--no-overwrite` | `ask` |
@@ -173,11 +173,13 @@ paper-tools/
 │   │   ├── pricing.py                   #   DeepSeek 价目表动态获取（LLM 抽取 + 规则兜底）与本地缓存
 │   │   └── pricing_prompts.yaml         #   价目表抽取 prompt 模板
 │   └── tools/                           # 工具目录（每个子目录是一个独立工具）
-│       ├── arxiv_translate/             #   工具：arxiv 论文翻译
+│       ├── html_translate/              #   工具：论文 HTML 翻译（arXiv / Springer / 本地网页）
 │       │   ├── README.md                #     工具详细文档
 │       │   ├── main.py                  #     独立入口（可直接 IDE 运行）
-│       │   ├── pipeline.py              #     翻译流水线（下载→解析→翻译→写出）
-│       │   ├── parser.py                #     ar5iv HTML 解析器
+│       │   ├── pipeline.py              #     翻译流水线（识别来源→取 HTML→解析→翻译→写出）
+│       │   ├── sources.py               #     来源识别与抽象（arXiv / Springer / 本地 HTML）
+│       │   ├── parser.py                #     ar5iv（LaTeXML）HTML 解析器
+│       │   ├── springer.py              #     Springer Nature Link 文章解析器
 │       │   └── other/                   #     补充资料（不参与运行，仅供人工参考）
 │       │       └── 论文翻译提示词.md      #       独立提示词：可复制到任意对话式 LLM 手动翻译论文
 │       ├── pdf_translate/               #   工具：本地 PDF 论文翻译

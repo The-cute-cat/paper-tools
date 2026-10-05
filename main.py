@@ -1,13 +1,13 @@
 """paper-tools 统一命令行入口。
 
 用法：
-    python main.py arxiv-translate <arxiv链接或ID> [--out 目录] [--model xxx]
-    python main.py arxiv-translate 2605.26158v1
-    python main.py arxiv-translate https://link.springer.com/article/10.1007/s10506-025-09437-x
-    python main.py arxiv-translate D:/papers/saved-article.html   # 本地保存的网页
+    python main.py html-translate <论文链接/ID/本地HTML> [--out 目录] [--model xxx]
+    python main.py html-translate 2605.26158v1
+    python main.py html-translate https://link.springer.com/article/10.1007/s10506-025-09437-x
+    python main.py html-translate D:/papers/saved-article.html   # 本地保存的网页
 
 可用工具：
-    arxiv-translate   下载论文 HTML（arXiv / Springer Nature Link / 本地 HTML）并翻译为中文 markdown
+    html-translate    下载论文 HTML（arXiv / Springer Nature Link / 本地 HTML）并翻译为中文 markdown
     pdf-translate     本地 PDF 逐页视觉提取并翻译为中文 markdown
     md-export         把本地 markdown 转换为 Word / PDF（网络图片、公式与图表）
                       例：python main.py md-export paper.zh.md [--format docx|pdf|all]
@@ -31,14 +31,14 @@ import sys
 
 from paper_tools.config import get_settings
 from paper_tools.logging_setup import setup_logging
-from paper_tools.tools import arxiv_translate
+from paper_tools.tools import html_translate
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="paper-tools", description="论文相关实用工具集合")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("arxiv-translate",
+    p = sub.add_parser("html-translate", aliases=["arxiv-translate"],
                        help="下载论文 HTML（arXiv / Springer / 本地 HTML）并翻译为中文 markdown")
     p.add_argument("input",
                    help="arXiv 链接/ID（如 2605.26158v1）、Springer 文章链接或 DOI"
@@ -88,6 +88,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
 
+    # 子命令别名归一：html-translate 的旧名 arxiv-translate 仍兼容
+    # （argparse 会把 args.command 置为用户实际输入的那个名字）。
+    if args.command == "arxiv-translate":
+        args.command = "html-translate"
+
     # 应用配置 + 日志
     settings = get_settings()
     # 覆盖策略开关（对所有子命令生效）：CLI 显式指定 > .env 的 PAPER_TOOLS_OVERWRITE
@@ -95,7 +100,7 @@ def main(argv: list[str] | None = None) -> None:
         settings.overwrite_mode = "always"
     elif getattr(args, "no_overwrite", None):
         settings.overwrite_mode = "never"
-    if args.command == "arxiv-translate":
+    if args.command == "html-translate":
         if args.out:
             settings.output_dir = __import__("pathlib").Path(args.out)
         if args.model:
@@ -137,8 +142,8 @@ def main(argv: list[str] | None = None) -> None:
                       or settings.translate_skip,
                       resume=not args.no_resume)
             logger.info(f"结果文件: {out}")
-        elif args.command == "arxiv-translate":
-            out = arxiv_translate.run(args.input)
+        elif args.command == "html-translate":
+            out = html_translate.run(args.input)
             logger.info(f"结果文件: {out}")
         elif args.command == "md-export":
             from paper_tools.tools.md_export import run as md_run

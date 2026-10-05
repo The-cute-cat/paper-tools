@@ -1,6 +1,6 @@
 """用户终端交互：输出文件覆盖确认。
 
-arxiv-translate / pdf-translate 在写出结果前共用 confirm_overwrite：
+html-translate / pdf-translate 在写出结果前共用 confirm_overwrite：
   * overwrite_mode=always —— 直接覆盖；
   * overwrite_mode=never  —— 跳过写入（保留现有文件）；
   * overwrite_mode=ask（默认）—— 终端询问。注意不用 isatty() 预判

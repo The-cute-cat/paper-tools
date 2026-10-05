@@ -1,9 +1,11 @@
-"""arxiv 论文翻译工具 —— 可直接用 IDE 运行的入口。
+"""论文 HTML 翻译工具（html-translate）—— 可直接用 IDE 运行的入口。
+
+支持来源：arXiv（ar5iv / LaTeXML HTML）、Springer Nature Link 文章页、本地保存的网页。
 
 运行方式（任选其一）：
     1. 在 IDE 中右键本文件 -> Run / Debug（无需命令行参数）
-    2. 命令行：python paper_tools/tools/arxiv_translate/main.py
-    3. 包模式：python -m paper_tools.tools.arxiv_translate.main
+    2. 命令行：python paper_tools/tools/html_translate/main.py
+    3. 包模式：python -m paper_tools.tools.html_translate.main
 
 无需命令行参数：直接修改下方 `if __name__ == "__main__":` 里的常量即可。
 """
@@ -18,17 +20,21 @@ if str(_PROJECT_ROOT) not in sys.path:
 
 from paper_tools.config import get_settings  # noqa: E402
 from paper_tools.logging_setup import setup_logging  # noqa: E402
-from paper_tools.tools.arxiv_translate.pipeline import run  # noqa: E402
+from paper_tools.tools.html_translate.pipeline import run  # noqa: E402
 
 
 def main() -> None:
     # 应用配置 + 日志
     settings = get_settings()
     logger = setup_logging(settings.log_level)
-    logger.info("arxiv 论文翻译工具启动")
+    logger.info("论文 HTML 翻译工具启动")
 
     # ===== 在这里填写参数 =====
-    input_ = ""  # arxiv 链接或 ID，例如 "https://arxiv.org/abs/2605.26158v1" 或 "2605.26158v1"
+    # 论文输入：arXiv 链接/ID、Springer 链接/DOI、或本地 HTML 路径
+    # 例如 "https://arxiv.org/abs/2605.26158v1"、"2605.26158v1"、
+    #      "https://link.springer.com/article/10.1007/s10506-025-09437-x"、
+    #      "D:/papers/saved-article.html"
+    input_ = ""
     api_key = ""            # 留空则用 .env / 环境变量里的 DEEPSEEK_API_KEY
     model = ""              # 留空则用配置里的默认模型（deepseek-flash）
     out_dir = ""            # 留空则用配置里的默认输出目录（项目根/output）
@@ -83,10 +89,10 @@ def main() -> None:
     if str(translate_skip).strip().lower() in ("1", "true", "yes", "on"):
         settings.translate_skip = True
 
-    # 待翻译论文：优先用 main.py 的 INPUT 常量；若为空则回退到 .env 的 PAPER_TOOLS_INPUT
-    input_arg = input_ if input_ else settings.arxiv_input
+    # 待翻译论文：优先用上面的 input_ 常量；若为空则回退到 .env 的 PAPER_TOOLS_INPUT
+    input_arg = input_ if input_ else settings.html_input
     if not input_arg:
-        logger.error("未指定待翻译论文：请在 main.py 的 INPUT 常量填写，或在 .env 设置 PAPER_TOOLS_INPUT。")
+        logger.error("未指定待翻译论文：请在 main.py 的 input_ 常量填写，或在 .env 设置 PAPER_TOOLS_INPUT。")
         sys.exit(1)
 
     if not settings.translate_skip and not settings.llm.api_key:
