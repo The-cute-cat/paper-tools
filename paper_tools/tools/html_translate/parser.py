@@ -687,11 +687,14 @@ def _rich_text(tag: Tag) -> str:
                         for cc in c.children:
                             _walk_child(cc)
             return
-        if "ltx_Math" in cls:
+        if name == "math" or "ltx_Math" in cls or "ltx_math_unparsed" in cls:
+            # 与 _rich_text 同步：ltx_math_unparsed 也是公式，不能落进通用遍历
             tex = _tex_of(node)
             if tex:
                 disp = _as_str(node.get("display")) == "block" and not _looks_like_inline_math(tex)
                 parts.append(f"\n$$\n{tex}\n$$\n" if disp else f"${tex}$")
+            return
+        if name in ("annotation", "annotation-xml"):
             return
         if name in ("sub", "sup"):
             # 数学上下标（如 HD<sub>max</sub> → $HD_{max}$），ar5iv 常将表头指标的下标
@@ -814,7 +817,16 @@ def _plain_text(node: Tag | NavigableString, *, wrap_math: bool = False) -> str:
     if "ltx_ERROR" in cls:
         # LaTeXML 环境转换错误标记（如损坏的 {wrapfigure}）——不是论文内容
         return ""
-    if "ltx_Math" in cls:
+    if name in ("annotation", "annotation-xml"):
+        # <math> 内的 TeX 副本：只在 _tex_of 中读取，绝不能参与通用遍历，
+        # 否则会与呈现节点重复输出（见下方 math 分支的历史 bug）。
+        return ""
+    if name == "math" or "ltx_Math" in cls or "ltx_math_unparsed" in cls:
+        # 必须同时匹配 class="ltx_math_unparsed"：LaTeXML 遇到不支持的宏
+        # （如 \coloneqq）时会把整个公式降级成该 class 的 <math>，
+        # 此前只认 ltx_Math，于是走通用遍历 → 呈现节点被压成裸文字
+        # "si,𝒱tgt≔𝒥(qi,…)" 再跟上 annotation 里的原始 LaTeX，双重泄漏
+        # （2026-10 实测：Transfer Attack Success Rate 段落出现整串 TeX）。
         tex = _tex_of(node)
         if not tex:
             return ""
@@ -2532,21 +2544,29 @@ def _span_tabular_to_markdown(tab: Tag) -> str:
     return "\n".join(lines)
 
 
-def _math_to_markdown_in_table(table: Tag) -> None:
-    """把 HTML 直出表格内的 <math> 换成 $...$（行内）/ $$...$$（行间）公式。
+def _simplify_table_math(table: Tag) -> None:
+    """精简 HTML 直出表格内的 <math>：去掉语义包装，保留可渲染的 MathML 呈现。
 
-    正文走 _rich_text 时公式已转为 LaTeX，但复杂表格保留原始 HTML，其中的
-    LaTeXML <math> 元素（含 <semantics>/<annotation>）会原样进入 markdown：
-    渲染器没有 MathML 支持，只能看到空的 <math> 标签或裸符号，公式语义全丢
-    （2026-10 审计：T4 的 → 与 T7 的 70.0_{\\pm 3.00} 共 86 处）。
+    为什么这里**不能**像正文那样换成 ``$...$``：表格走"HTML 直出"路径，整段以
+    raw HTML 写进 markdown，而 CommonMark 规定 raw HTML 块内部不再解析 markdown
+    —— ``$\\rightarrow$`` 不会被任何渲染器（Typora / Obsidian / GitHub）当公式
+    处理，只会字面显示成 "$\\rightarrow$"（2026-10 实测）。MathML 是浏览器原生
+    呈现格式，因此保留 <math> 的呈现子节点，只删掉两部分纯冗余：
+      * <semantics> 包装层（无呈现作用）；
+      * <annotation> / <annotation-xml>：同一公式的 TeX / 其它编码副本，
+        内容与呈现节点重复，占 MathML 体积一半以上。
+    ``alttext`` 属性里保留了原 LaTeX，供复制与检索使用。
     """
     for math_tag in table.find_all("math"):
-        tex = _tex_of(math_tag)
-        if not tex:
+        # LaTeXML 私有的 intent 属性对渲染无作用，只会污染源文件
+        math_tag.attrs.pop("intent", None)
+        for ann in math_tag.find_all(["annotation", "annotation-xml"]):
+            ann.decompose()
+        for sem in math_tag.find_all("semantics"):
+            sem.unwrap()
+        # 呈现节点被清空（原公式只有 annotation、没有呈现内容）时，退化为空标签
+        if not math_tag.get_text(strip=True) and not math_tag.find(["img", "mspace", "mphantom"]):
             math_tag.decompose()
-            continue
-        display = _as_str(math_tag.get("display")) == "block" and not _looks_like_inline_math(tex)
-        math_tag.replace_with(NavigableString(f"\n$$\n{tex}\n$$\n" if display else f"${tex}$"))
 
 
 def _sanitize_table_links(table: Tag) -> None:
@@ -2559,26 +2579,43 @@ def _sanitize_table_links(table: Tag) -> None:
         （条目被渲染成纯段落），保留就会成为点不动的死链 → 按 _BIB_MAP
         换成文献外链，无外链时退化为纯文本；
       * 单元格上的 id 属性没有任何用途（不参与锚点解析），一并去掉。
+
+    注意：这里**不能**把 <a> 改写成 markdown 的 ``[文字](url)``。表格走的是
+    "HTML 直出"路径（<table> 原样保留），而 CommonMark 规定 raw HTML 块内部
+    不再解析 markdown —— 改写后的链接语法会连同 URL、title 一起被当成字面
+    文本显示在单元格里（2026-10 回归）。因此只就地改 href。
     """
     for cite in table.find_all("cite"):
         cite.unwrap()
     for a in table.find_all("a"):
         href = _as_str(a.get("href")) or ""
-        text = a.get_text(" ", strip=True)
-        title = _as_str(a.get("title")) or ""
-        url = ""
         if href.startswith("#"):
-            info = _BIB_MAP.get(href) or {}
-            url = info.get("url") or ""
-            title = re.sub(r",\s*\d{4}[a-z]?\s*$", "", info.get("title") or "").strip() or title
+            info = _BIB_MAP.get(href)
+            if info is not None:
+                url = info.get("url") or ""
+                if url:
+                    a["href"] = url
+                    title = re.sub(r",\s*\d{4}[a-z]?\s*$", "",
+                                   info.get("title") or "").strip() or _as_str(a.get("title")) or ""
+                    if title:
+                        a["title"] = title
+                    elif a.has_attr("title"):
+                        del a["title"]
+                else:
+                    a.unwrap()
+            elif href in _EXISTING_IDS:
+                continue          # 指向正文里确实存在、且会输出锚点的 id，保留
+            else:
+                a.unwrap()        # 无对应条目的死锚点
         elif href.startswith(("http://", "https://")):
-            url = href
-        if url and text:
-            link = f'[{text}]({url} "{title}")' if title else f"[{text}]({url})"
-            a.replace_with(NavigableString(link))
-        elif text:
-            a.replace_with(NavigableString(text))
+            continue
+        elif a.get_text(strip=True):
+            a.unwrap()
         else:
+            a.decompose()
+    # 去掉退化为纯文本后留下的空 <a>（unwrap 后不会残留，此处兜底）
+    for a in table.find_all("a"):
+        if not a.get_text(strip=True):
             a.decompose()
     for tag in table.find_all(True):
         if tag is table:
@@ -2619,7 +2656,7 @@ def _clean_table_html(table: Tag) -> None:
       * 其余 ltx_* 类名（ltx_td/ltx_align_center/ltx_text/ltx_border_t…）全部删除；
       * 清掉因此失去全部属性的空 <span> 包装，减少无意义标签。
     """
-    _math_to_markdown_in_table(table)
+    _simplify_table_math(table)
     _sanitize_table_links(table)
     for span in table.find_all("span"):
         cls = span.get("class") or []
@@ -2668,6 +2705,12 @@ def _clean_table_html(table: Tag) -> None:
             break
 
 
+# HTML 直出表格统一套在带有该样式的 <div> 里：表格按内容撑宽，超出正文栏宽时由
+# 这个块级容器出横向滚动条。必须给容器一个确定的宽度（width:100%），否则容器
+# 宽度 auto 会与内容同宽，永远不触发溢出，滚动条不出现。
+_TABLE_SCROLL_STYLE = "overflow-x:auto;width:100%;"
+
+
 def _collect_table_text(tbl: Tag) -> str:
     """将 ar5iv 表格转为 markdown 或 HTML 字符串。
 
@@ -2675,13 +2718,13 @@ def _collect_table_text(tbl: Tag) -> str:
       如有"双层表头"则用 <br> 堆叠保留信息。
     复杂表格（任一 cell 含 colspan>1 或 rowspan>1、或含"分组标识行"
       即单 cell + colspan>=2）：改走 HTML 路径，输出原始 <table>
-      HTML 字符串。GFM 允许 raw HTML 嵌入，markdown 渲染器会保留
-      colspan/rowspan 合并、双层表头、分组行等所有原结构；
-      pipeline 翻译阶段单独走"按 cell 翻译"路径，不会损坏结构。
+      HTML 字符串（外面再套一层滚动容器 <div>）。GFM 允许 raw HTML 嵌入，
+      markdown 渲染器会保留 colspan/rowspan 合并、双层表头、分组行等所有
+      原结构；pipeline 翻译阶段单独走"按 cell 翻译"路径，不会损坏结构。
 
-    返回值仅为一个字符串，pipeline 通过"是否以 '<table' 开头"
-    判断走哪种 cell 翻译通道；两种路径都把字符串也用作最终的
-    block.raw 直接落地（markdown 路径→ GFM；HTML 路径 → raw HTML）。
+    返回值仅为一个字符串，pipeline 通过"是否含 '<table'"判断走哪种 cell
+    翻译通道；两种路径都把字符串也用作最终的 block.raw 直接落地
+    （markdown 路径 → GFM；HTML 路径 → raw HTML）。
     """
     # 提取真正的 <table> 元素。注意：不能简单地用
     # `tbl.find(class_="ltx_tabular")`，因为部分论文会把多行描述文本用
@@ -2751,8 +2794,8 @@ def _collect_table_text(tbl: Tag) -> str:
         # 极易撑爆页面。本处理：
         #   1) 先把 ltx_transformed_outer 上的 style 全部去掉（不再受其 width/vertical-align 控制）
         #   2) 把 ltx_transformed_inner 上的 transform:... 样式也去掉（避免 Typora 二次缩放）
-        #   3) 对列数 ≥ 10 的超宽表格，外层加 <div style="overflow-x:auto"> 包裹并把
-        #      table 自身的 display 改为 block（让块级盒子撑出滚动条，避免 inline-block 拉宽）
+        #   3) 统一在最外层套一个滚动容器 <div style="overflow-x:auto">，超宽时
+        #      由它出横向滚动条（详见下方 _TABLE_SCROLL_STYLE 注释）
         for deco_cls in ("ltx_transformed_outer", "ltx_transformed_inner"):
             for deco in html_table.find_all(class_=deco_cls):
                 if deco.has_attr("style"):
@@ -2769,29 +2812,15 @@ def _collect_table_text(tbl: Tag) -> str:
         for deco in html_table.find_all(class_="ltx_transformed_outer"):
             if deco.has_attr("style"):
                 del deco["style"]
-        # 列数判定：扫描所有行取最大 colspan 累加（含 rowspan 的子表头也可能增加列数）。
-        # 仅看第一行不够：Table 6（Monocular depth）的第一行只有 8 列，但实际表格
-        # 后续行扩展到 12 列，整体仍会溢出视口。
-        col_count = 0
-        for tr in _table_rows(html_table):
-            row_cols = 0
-            for c in _row_cells(tr):
-                try:
-                    row_cols += int(_as_str(c.get("colspan")) or 1)
-                except (ValueError, TypeError):
-                    row_cols += 1
-            col_count = max(col_count, row_cols)
-        if col_count >= 10:
-            # 超宽表：把 table 自身改为 block 显示（脱离 inline-block 的拉宽行为）
-            existing_style = html_table.get("style") or ""
-            html_table["style"] = (
-                f"display:block;overflow-x:auto;max-width:100%;{existing_style}"
-            ).strip()
         _clean_table_html(html_table)
-        html = str(html_table)
-        # 防止 Typora 把独占一行的 GFM 表格分隔线误判；表格 HTML 块前后
-        # 加空行并非必须（GFM 块级 HTML 由空行分隔），但 remove 掉前后
-        # 的可能空白更稳。
+        # 统一套滚动容器：超宽表格由外层 div 出横向滚动条，不再溢出屏幕。
+        # 不能把 overflow-x 加在 <table> 自身上 —— table 是独立格式化上下文，
+        # 会无视自身 overflow 按内容撑宽（实测 Typora 下就是整表冲出页面、
+        # 且不出现滚动条，2026-10）。滚动容器必须是外层块级元素。
+        html = f'<div style="{_TABLE_SCROLL_STYLE}">\n{str(html_table).strip()}\n</div>'
+        # 块内绝不能出现空行：CommonMark 的 HTML 块以空行结束，一旦出现空行，
+        # 后面半张表就会被当 markdown 解析，结构全毁。
+        html = re.sub(r"\n[ \t]*\n+", "\n", html)
         return html.strip() + "\n"
 
     # ===== 后续是简单表格 markdown 路径（保持原行为）=====

@@ -5,6 +5,7 @@
 """
 
 import re
+import sys
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1148,6 +1149,17 @@ def _strip_padding_cells(table_html: str) -> str:
     return str(soup)
 
 
+def _cell_placeholder(ri: int, ci: int) -> str:
+    """HTML 表格 cell 的占位符。
+
+    必须**不含 ``<`` / ``>``**：占位符作为文本节点写进表格后，skeleton 会被
+    ``str(tag)`` 序列化成 HTML，尖括号会被转义成 ``&lt;&lt;&lt;TCELL_0_1&gt;&gt;&gt;``，
+    回填时的 ``str.replace(placeholder, ...)`` 就再也匹配不上，译文全部丢失、
+    表格里只剩占位符残骸（2026-10 定位）。``@`` 不在 HTML 转义范围内。
+    """
+    return f"@@TCELL_{ri}_{ci}@@"
+
+
 def _translate_html_table(
     table_html: str,
     translator: LLMTranslator,
@@ -1155,16 +1167,20 @@ def _translate_html_table(
     summary: str = "",
 ) -> str:
     """对 HTML <table> 字符串做 cell 级别翻译，逐 cell 用 ASCII 占位符
-    `<<<TCELL_R_C>>>` 替换原文，批量翻译后再回填。保留 colspan/rowspan/
+    `@@TCELL_R_C@@` 替换原文，批量翻译后再回填。保留 colspan/rowspan/
     <thead>/<tbody>/双层表头/分组标识行等所有结构。
     """
     raw = table_html.strip()
-    if not (raw.startswith("<table") or "<table" in raw[:32]):
+    # HTML 路径的表格外面套了一层滚动容器 <div>，因此不能用"以 <table 开头"判断
+    if "<table" not in raw[:400]:
         return table_html
     soup = BeautifulSoup(raw, "html.parser")
     table = soup.find("table")
     if table is None:
         return table_html
+    # 回填时要把外层滚动容器一起带上，否则译文里的超宽表格会丢掉横向滚动条
+    parent = table.parent
+    wrapper = parent if isinstance(parent, Tag) and parent is not soup else None
 
     # 注意：<tr> 位于 <thead>/<tbody> 之下，recursive=False 永远取不到任何行，
     # 曾导致 HTML 路径的复杂表格在译文里整表保持英文。这里取属于本表的行，
@@ -1178,7 +1194,7 @@ def _translate_html_table(
             inner_text = cell.get_text(" ", strip=True)
             if not _cell_is_translatable(inner_text):
                 continue
-            placeholder = f"<<<TCELL_{ri}_{ci}>>>"
+            placeholder = _cell_placeholder(ri, ci)
             translatable_cells.append((ri, ci, cell))
             placeholder_to_text[placeholder] = inner_text
 
@@ -1189,16 +1205,16 @@ def _translate_html_table(
 
     # 先把所有可译 cell 文本替换为占位符，避免 LLM 输出把 cell 间混淆。
     for ri, ci, cell in translatable_cells:
-        ph = f"<<<TCELL_{ri}_{ci}>>>"
-        # 提取 cell 内部：保留所有 HTML（strong/b/sup/...），只在最深文本节点上
-        # 做替换。简化做法：序列化 cell HTML、把最末一个文本节点外的内容剥掉。
-        # 实际更稳的方法：把 cell 内容用一个 sentinel nested tag 包裹。
-        # 我们采用：直接清掉 cell 的所有文本节点，只留一个文本节点 = ph。
+        ph = _cell_placeholder(ri, ci)
+        # 清掉 cell 的内容，只留一个文本节点 = 占位符（译文回填后再还原）。
+        # 注意必须对**子节点**调用 extract()：写成 cell.extract() 会把整个单元格
+        # 从表格里摘掉，占位符落在游离节点上，序列化后的 skeleton 里既没有占位符
+        # 也没有内容 —— 表现为该行/该格在译文里直接消失（2026-10 定位）。
         for child in list(cell.contents):
-            cell.extract()
+            child.extract()
         cell.append(soup.new_string(ph))
 
-    skeleton = str(table)
+    skeleton = str(wrapper) if wrapper is not None else str(table)
     translatable_count = len(placeholder_to_text)
 
     # 把 skeleton 里的占位符切出供 LLM 翻译。
@@ -1326,7 +1342,8 @@ def _translate_tables(translator: LLMTranslator, blocks: list[Block],
             continue
         table_md = block.meta.get("table_md") or ""
         if table_md:
-            is_html = table_md.lstrip().startswith("<table")
+            # HTML 路径的表格外层有滚动容器 <div>，靠"是否含 <table"判断
+            is_html = "<table" in table_md[:400]
             tasks.append((i, table_md, is_html))
         elif block.text.strip():
             tasks.append((i, block.text, False))
