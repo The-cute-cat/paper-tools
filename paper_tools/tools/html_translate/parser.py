@@ -62,6 +62,22 @@ def _cite_search_url(query: str, engine: str | None = None) -> str | None:
 # 该映射在 parse_arxiv_html 开头按当前 soup 重建，避免跨文件调用串味。
 _BIB_MAP: dict[str, dict] = {}
 
+# 裸 arXiv 编号（"2307.15043" / "2307.15043v2" / 旧式 "hep-th/9901001"）。
+# LaTeXML 有时只输出编号而不给 <a>，需要据此补出文献页 URL。
+_ARXIV_ID_RE = re.compile(
+    r"^(?:arXiv:)?(\d{4}\.\d{4,5}|[a-z][a-z-]*(?:\.[A-Z]{2})?/\d{7})(v\d+)?$",
+    re.IGNORECASE,
+)
+
+
+def _arxiv_url(ident: str) -> str | None:
+    """把裸 arXiv 编号补成文献页 URL；不是编号时返回 None（不猜测）。"""
+    match = _ARXIV_ID_RE.match((ident or "").strip())
+    if not match:
+        return None
+    return f"https://arxiv.org/abs/{match.group(1)}{match.group(2) or ''}"
+
+
 # 文档中真实存在的 id 集合，以及被 <a href="#..."> 内部链接引用的 id 集合。
 # 用于：① 给标题/图表等块补 <a id="...">，让内部引用可跳转；② 引用目标不存在时
 # 把链接退化为纯文本，避免 markdown 里留下死链（2026-10 审计）。
@@ -119,6 +135,14 @@ def _build_bib_map(soup: "BeautifulSoup") -> dict[str, dict]:
             m = re.search(r"https?://\S+", item.get_text(" ", strip=True))
             if m:
                 url = m.group(0).rstrip(".,;)]")
+        if not url:
+            # 部分条目只给出 arXiv 编号（"External Links: 2307.15043"），没有 <a>。
+            # 此时补成文献页 URL，否则正文引用只能退化成搜索引擎查询链接
+            # （2026-10 审计：12 处引用指向 bing.com 而非原论文）。
+            m = re.search(r"external links?\s*[:：]?\s*([\w./-]+)",
+                          item.get_text(" ", strip=True), re.IGNORECASE)
+            if m:
+                url = _arxiv_url(m.group(1))
         bib_map["#" + bid] = {"title": title, "url": url}
     return bib_map
 
@@ -302,6 +326,31 @@ def _img_size(tag: "Tag", base_width: int = 600) -> tuple[int, int] | None:
     if w_i <= 0 or h_i <= 0:
         return None
     return w_i, h_i
+
+
+def _figure_label(fig: "Tag | None") -> str:
+    """取图/表的编号标签（"Figure 2" / "Table 4" / "(a)"），用作 <img alt>。
+
+    此前所有图片的 alt 都硬编码成 "figure"，既不能帮助读屏软件，也无法在图片
+    加载失败时提示读者这是哪张图。ar5iv 的 caption 里始终带有
+    <span class="ltx_tag ltx_tag_figure">Figure 2: </span>，直接复用即可。
+    """
+    if fig is None:
+        return ""
+    for cls in ("ltx_tag_figure", "ltx_tag_table"):
+        tag = fig.find(class_=cls)
+        if tag is not None:
+            text = re.sub(r"\s+", " ", tag.get_text(" ", strip=True)).strip(" :：")
+            if text:
+                return text
+    return ""
+
+
+def _figure_alt(node: "Tag", default: str = "figure") -> str:
+    """node（img/object）所属图/表的编号标签；找不到时退回 default。"""
+    own = set(node.get("class") or [])
+    fig = node if own & {"ltx_figure", "ltx_table"} else node.find_parent(["figure", "table"])
+    return _figure_label(fig) or default
 
 
 def _html_escape_attr(s: str) -> str:
@@ -1065,9 +1114,8 @@ def parse_arxiv_html(
             src = _as_str(g.get("src")) or _as_str(g.get("data"))
             if not src:
                 continue
-            size = _img_size(g) if g.name == "img" else None
             blocks.append(Block(kind="figure", text="",
-                                raw=_html_img("figure", src, size),
+                                raw=_html_img(_figure_alt(g), src, _img_size(g)),
                                 meta={"src": src, "local_src": src,
                                       "html_id": _html_id_of(g)}))
     elif soup.title:
@@ -1332,11 +1380,68 @@ def _emit_orphan_para(div: Tag, blocks: list[Block],
             _emit_list(sub, blocks)
 
 
+_EXTERNAL_LINKS_PREFIX_RE = re.compile(r"^\s*external links?\s*[:：]\s*", re.IGNORECASE)
+# 数值型文献编号（"[12]" / "12" / "[3–5]"）；作者-年份风格（"Zou et al. (2023)"）不算编号
+_NUMERIC_BIB_TAG_RE = re.compile(r"^\[?\s*(\d+(?:\s*[–\-]\s*\d+)?)\s*\]?$")
+
+
+def _bib_external_links(block: Tag) -> str:
+    """把 "External Links: 2310.08419, Link" 元数据块转成一条可点击的短链接。
+
+    原样输出会得到 ``External Links: 2310.08419, [Link](https://arxiv.org/abs/…)
+    ``——"External Links" 标签与无意义的 "Link" 都是 LaTeXML 的元数据噪声
+    （2026-10 审计：全篇泄漏 38 处）。这里只保留 arXiv/DOI 标识符本身，
+    挂在真实外链上；找不到标识符时退回 URL 文本。
+    """
+    links = [a for a in block.find_all("a", href=True)
+             if isinstance(a.get("href"), str)
+             and a["href"].startswith(("http://", "https://"))]
+    text = _EXTERNAL_LINKS_PREFIX_RE.sub("", block.get_text(" ", strip=True))
+    for a in links:
+        visible = a.get_text(" ", strip=True)
+        if visible:
+            text = text.replace(visible, " ")
+    ident = re.sub(r"\s+", " ", text).strip(" .,;:，；、")
+    if not links:
+        # 只有编号没有 <a>：按 arXiv 编号补出文献页；无法识别时保留编号原文
+        url = _arxiv_url(ident)
+        return f"[arXiv:{ident}]({url})" if url else ident
+    # LaTeXML 先输出 Document(DOI) 再输出 Link，取最后一个以绕过坏 DOI 链接
+    url = links[-1]["href"]
+    if not ident:
+        return f"[{url}]({url})"
+    if "arxiv.org" in url and re.fullmatch(r"\d{4}\.\d{4,5}(?:v\d+)?", ident):
+        ident = f"arXiv:{ident}"
+    return f"[{ident}]({url})"
+
+
+def _join_bib_parts(parts: list[str]) -> str:
+    """拼接文献条目的各 bibblock，并在缺句点的块之间补上分隔。
+
+    LaTeXML 把作者串与标题拆成两个 ltx_bibblock，作者块通常没有句点，
+    直接空格相拼会得到 "… and E. Wong Jailbreaking black-box llms"（审计
+    2026-10：作者串与标题无分隔）。
+    """
+    out = ""
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        if not out:
+            out = part
+            continue
+        out += (". " if re.search(r"[A-Za-z0-9)\]\"”'’]$", out) else " ") + part
+    return out
+
+
 def _append_bibliography(soup: "BeautifulSoup", blocks: list[Block]) -> None:
     """回收 References 整节（历史上被整节丢弃，导致正文引用锚点悬空）。
 
-    条目内保留外部链接（"External Links: ... Link"），但剔除 "Cited by: §..."
-    反向索引块——那是 arXiv 页面的附加索引，不属于文献条目内容。
+    每条文献输出为一个独立段落：
+      * 用 ``[n]`` 编号（LaTeXML 的 ltx_tag_bibitem；作者-年份风格不重复输出）；
+      * 剔除 "Cited by: §..." 反向索引块与 "External Links:" 元数据噪声，
+        后者收敛成一条可点击的 arXiv/DOI 链接；
+      * 块之间缺句点时补 ". "，避免作者串与标题粘成一句。
     """
     bib = soup.find("section", class_="ltx_bibliography")
     if bib is None:
@@ -1344,21 +1449,35 @@ def _append_bibliography(soup: "BeautifulSoup", blocks: list[Block]) -> None:
     blocks.append(Block(kind="heading", level=2, text="References", raw="References",
                         meta={"html_id": _html_id_of(bib)}))
     for li in bib.find_all("li", class_="ltx_bibitem"):
+        label = ""
+        tag_el = li.find(class_="ltx_tag_bibitem")
+        if tag_el is not None:
+            tag_text = re.sub(r"\s+", " ", _plain_text(tag_el)).strip()
+            numeric = _NUMERIC_BIB_TAG_RE.match(tag_text)
+            if numeric:
+                label = f"[{numeric.group(1)}]"
         parts: list[str] = []
         for b in li.find_all(class_="ltx_bibblock"):
-            if b.get_text(" ", strip=True).lower().startswith("cited by"):
+            text = b.get_text(" ", strip=True)
+            if "ltx_bib_cited" in (b.get("class") or []) or text.lower().startswith("cited by"):
+                continue
+            if _EXTERNAL_LINKS_PREFIX_RE.match(text):
+                link = _bib_external_links(b)
+                if link:
+                    parts.append(link)
                 continue
             rich = _rich_text(b).strip()
             if rich:
                 parts.append(rich)
-        if not parts:
+        entry = _join_bib_parts(parts)
+        if not entry:
             continue
-        entry = " ".join(parts)
         # 剔除"双重编码"的坏链：本页 Document 链接被渲染成
         # https://dx.doi.org/https%3A//doi.org/...，写进 markdown 无意义且不可点。
         # 只去掉链接外壳、保留可见文字（同条目通常还有正常的 Link 外链）。
         entry = re.sub(r"\[([^\]]+)\]\((?:https?://)[^)\s]*%3[Aa][^)\s]*\)", r"\1", entry)
-        blocks.append(Block(kind="list_item", level=0, text=entry, raw="- " + entry,
+        entry = f"{label} {entry}" if label else entry
+        blocks.append(Block(kind="paragraph", level=0, text=entry, raw=entry,
                             meta={"html_id": _html_id_of(li)}))
 
 
@@ -1440,10 +1559,10 @@ def _emit_text_box(span: Tag, blocks: list[Block]) -> None:
         if not src:
             continue
         # src 已在 parse_arxiv_html 预处理阶段归一化（本地路径或完整 URL）
-        size = _img_size(g) if g.name == "img" else None
+        # object(SVG) 同样带 width/height，不能只对 img 取尺寸。
         graphics.append(Block(
             kind="figure", text="",
-            raw=_html_img("figure", src, size),
+            raw=_html_img(_figure_alt(g), src, _img_size(g)),
             meta={"src": src, "local_src": src, "html_id": _html_id_of(g)}))
 
     if not real_ps and not graphics:
@@ -1614,10 +1733,9 @@ def _walk_section(sec: Tag, blocks: list[Block], img_mapping: dict[str, str],
                     if src:
                         render_src = src if src.startswith("http") else (
                             base_url.rstrip("/") + "/" + src.lstrip("/"))
-                        size = _img_size(sub) if sub.name == "img" else None
                         blocks.append(Block(
                             kind="figure", text="",
-                            raw=_html_img("figure", render_src, size),
+                            raw=_html_img(_figure_alt(sub), render_src, _img_size(sub)),
                             meta={"src": src, "local_src": render_src,
                                   "html_id": _html_id_of(sub)}))
                     continue
@@ -1946,34 +2064,40 @@ def _figure_body_to_markdown(fig: Tag) -> str:
     return "\n\n".join(parts).strip()
 
 
+def _append_caption_block(figure: Tag, blocks: list[Block]) -> bool:
+    """把「并列子图/子表」外层容器自己的总 caption 追加为一个独立块。
+
+    用于 ltx_flex_figure / ltx_flex_table 这类"多个 panel + 一个总标题"的结构：
+    panel 各自有 caption（"(a) …"），外层的 "Figure N: …" / "Table N: …" 是
+    直接子节点，必须单独输出，否则总标题整条丢失（2026-10 审计：Table 9 只剩
+    (a)(b)(c) 三个子标题）。
+    """
+    # 注意：不能用 find(recursive=True) —— 那会匹配到子 panel 的 caption。
+    outer_caption = figure.find("figcaption", class_="ltx_caption", recursive=False)
+    if outer_caption is None:
+        all_caps = figure.find_all(class_="ltx_caption", recursive=False)
+        outer_caption = all_caps[-1] if all_caps else None
+    if outer_caption is None:
+        return False
+    outer_text = _rich_text(outer_caption).strip()
+    if not outer_text:
+        return False
+    # 引用块语法 `> ...`，多行也用 `> ` 前缀
+    raw_cap = "\n".join(f"> {ln}" for ln in outer_text.split("\n") if ln.strip())
+    if not raw_cap:
+        return False
+    # 使用 kind="figure" 而不是 heading/text：
+    # 1) heading 会让 caption 进入 markdown 大纲被渲染为大标题，破坏文章结构；
+    # 2) text 会让 LLM 把图注当正文翻译；
+    # figure 类与子 panel caption 同流，直接走 raw 输出，不进大纲。
+    blocks.append(Block(kind="figure", text=outer_text, raw=raw_cap,
+                        meta={"caption": outer_text,
+                              "anchor": _find_referenced_anchor(figure)}))
+    return True
+
+
 def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
                    base_url: str = "") -> None:
-    def _append_figure_caption_block(figure: Tag, out_blocks: list[Block]) -> None:
-        """查找 fig 的总 caption 并以 figure 块追加到 blocks（不进入翻译/大纲）。"""
-        outer_caption = figure.find("figcaption", class_="ltx_caption", recursive=False)
-        # 注意：find("figcaption", recursive=True) 也会匹配到子 panel 的 figcaption，
-        # 因此需要用 recursive=False 限定在 fig 的直接 figcaption。
-        if outer_caption is None:
-            # 兜底：可能外层 figcaption 不是 fig 直接子节点
-            all_caps = figure.find_all("figcaption", class_="ltx_caption", recursive=False)
-            outer_caption = all_caps[-1] if all_caps else None
-        if outer_caption is not None:
-            outer_text = _rich_text(outer_caption).strip()
-            if outer_text:
-                # 引用块语法 `> ...`，多行也用 `> ` 前缀
-                raw_cap = "\n".join(
-                    f"> {ln}" for ln in outer_text.split("\n") if ln.strip()
-                )
-                if raw_cap:
-                    # 使用 kind="figure" 而不是 heading/text：
-                    # 1) heading 会让 caption 进入 markdown 大纲被渲染为大标题，
-                    #    破坏文章结构；2) text 会让 LLM 翻译该图注英文；
-                    #    figure 类与子 panel caption 同流，直接走 raw 输出，
-                    #    不进翻译也不进大纲，仅作为图注说明显示。
-                    out_blocks.append(Block(kind="figure", text=outer_text, raw=raw_cap,
-                                            meta={"caption": outer_text,
-                                                  "anchor": _find_referenced_anchor(figure)}))
-
     # ar5iv 中"并列多图"结构：一个外层 <figure class="ltx_figure"> 包了一个
     # ltx_flex_figure 容器，内部并排放了多个 <figure class="ltx_figure_panel">，
     # 每个 panel 是独立的子图（含自己的 <img> + figcaption）。若直接对外层
@@ -1989,7 +2113,7 @@ def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
         # 最后再追加外层总 caption（否则会出现"图注在图片之前"的错位）。
         for panel in panels:
             _append_figure(panel, blocks, img_mapping, base_url)
-        _append_figure_caption_block(fig, blocks)
+        _append_caption_block(fig, blocks)
         return
 
     # ar5iv 中"图网格"结构：<figure class="ltx_figure"> 直接包了一个 <table class="ltx_tabular">，
@@ -2048,29 +2172,30 @@ def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
                 else:
                     render_src = src if src.startswith("http") else (base_url.rstrip("/") + "/" + src.lstrip("/"))
                 blocks.append(Block(kind="figure", text="",
-                                    raw=_html_img("figure", render_src, size),
+                                    raw=_html_img(_figure_label(fig) or "figure", render_src, size),
                                     meta={"src": src, "local_src": render_src,
                                           "html_id": _html_id_of(fig),
                                           "anchor": _find_referenced_anchor(fig)}))
             # 外层总 caption（"Figure 10: …"）以引用块形式追加，顺序在所有子图之后
-            _append_figure_caption_block(fig, blocks)
+            _append_caption_block(fig, blocks)
             return
 
     # ar5iv 对较大/矢量图（如阈值敏感性分析的 SVG）使用 <object data="*.svg"> 嵌入，
     # 而不是 <img src="*.png">。<object> 在浏览器中渲染正常但不在 fig.find("img") 范围内，
     # 必须同时兼容这两种资源嵌入方式，否则会产生"caption 在但图缺失"的现象。
     src: str | None = None
+    media: Optional[Tag] = None   # 实际承载图片的元素（img 或 object），用于取尺寸
     img = fig.find("img")
     if img is not None:
         s = _as_str(img.get("src"))
         if s:
-            src = s
+            src, media = s, img
     if not src:
         obj = fig.find("object")
         if obj is not None:
             s = _as_str(obj.get("data"))
             if s:
-                src = s
+                src, media = s, obj
     if not src:
         # 不是图片/OBJECT 资源，可能是「纯文本 figure」（如带边框的提示词模板、
         # 算法伪代码文字框）。此时把主体文本转成 markdown，避免只剩 caption。
@@ -2103,7 +2228,8 @@ def _append_figure(fig: Tag, blocks: list[Block], img_mapping: dict[str, str],
     # caption 可能是多行（标签 + 描述），合并成单行引用避免 markdown 引用断裂
     cap_text = cap_text.replace("\n", " ").strip()
     blocks.append(Block(kind="figure", text=_plain_text(caption) if caption else "",
-                        raw=((_html_img("figure", render_src, _img_size(img) if img is not None else None) + "\n\n")
+                        raw=((_html_img(_figure_label(fig) or "figure", render_src,
+                                        _img_size(media) if media is not None else None) + "\n\n")
                              if render_src else "")
                              + (f"> {cap_text}" if cap_text else ""),
                         meta={"src": src, "local_src": render_src, "caption": cap_text,
@@ -2255,13 +2381,40 @@ def _listing_line_text(tag: Tag) -> str:
     return text.strip()
 
 
+def _own_table_of(node: Tag) -> Optional[Tag]:
+    """返回 node 所属的最近祖先 <table>；node 本身是 table 时返回其父级表格。"""
+    parent = node.parent if isinstance(node, Tag) else None
+    while isinstance(parent, Tag):
+        if parent.name == "table":
+            return parent
+        parent = parent.parent
+    return None
+
+
+def _table_rows(table: Tag) -> list[Tag]:
+    """table **自身**的行，排除单元格内嵌套表格的行。
+
+    LaTeXML 会把"单元格内换行"的表头渲染成嵌套表格：
+    ``<td><table class="ltx_tabular"><tr><td>Open-source</td></tr>
+    <tr><td>Attacker LLM</td></tr></table></td>``。
+    若用 ``find_all("tr")`` 递归收集，这些嵌套行会被当成外层表格的数据行，
+    导致 7 列的表被撑成 19 列、``<br>`` 变成列分隔符（2026-10 审计 T1/T10）。
+    """
+    return [tr for tr in table.find_all("tr") if _own_table_of(tr) is table]
+
+
+def _row_cells(tr: Tag) -> list[Tag]:
+    """tr 的直接单元格，排除单元格内嵌套表格的单元格。"""
+    return [c for c in tr.find_all(["td", "th"], recursive=False)]
+
+
 def _is_rule_row(tr: Tag) -> bool:
     """识别 LaTeX 表格的横线装饰行（\\toprule / \\midrule / \\bottomrule）。
 
     ar5iv 会把这些横线渲染成仅含 <span class="ltx_rule"> 的全宽 cell 行，
     文本为空或只有不间断空格。若保留，markdown/HTML 表格都会多出一行。
     """
-    cells = tr.find_all(["td", "th"])
+    cells = _row_cells(tr)
     if not cells:
         return False
     for cell in cells:
@@ -2379,6 +2532,83 @@ def _span_tabular_to_markdown(tab: Tag) -> str:
     return "\n".join(lines)
 
 
+def _math_to_markdown_in_table(table: Tag) -> None:
+    """把 HTML 直出表格内的 <math> 换成 $...$（行内）/ $$...$$（行间）公式。
+
+    正文走 _rich_text 时公式已转为 LaTeX，但复杂表格保留原始 HTML，其中的
+    LaTeXML <math> 元素（含 <semantics>/<annotation>）会原样进入 markdown：
+    渲染器没有 MathML 支持，只能看到空的 <math> 标签或裸符号，公式语义全丢
+    （2026-10 审计：T4 的 → 与 T7 的 70.0_{\\pm 3.00} 共 86 处）。
+    """
+    for math_tag in table.find_all("math"):
+        tex = _tex_of(math_tag)
+        if not tex:
+            math_tag.decompose()
+            continue
+        display = _as_str(math_tag.get("display")) == "block" and not _looks_like_inline_math(tex)
+        math_tag.replace_with(NavigableString(f"\n$$\n{tex}\n$$\n" if display else f"${tex}$"))
+
+
+def _sanitize_table_links(table: Tag) -> None:
+    """净化表格里的引用/锚点标签：<cite> 展开、内部引用改外链、去掉死锚点。
+
+    ar5iv 表格单元格里的文献引用是
+    ``<cite>(<a href="#bib.bib11" title="">Zou et al., 2023</a>)</cite>``：
+      * ``<cite>`` 在 markdown 渲染器里没有样式，纯噪声 → 展开；
+      * ``href="#bib.xxx"`` 指向的参考文献条目在输出中不带 ``<a id>``
+        （条目被渲染成纯段落），保留就会成为点不动的死链 → 按 _BIB_MAP
+        换成文献外链，无外链时退化为纯文本；
+      * 单元格上的 id 属性没有任何用途（不参与锚点解析），一并去掉。
+    """
+    for cite in table.find_all("cite"):
+        cite.unwrap()
+    for a in table.find_all("a"):
+        href = _as_str(a.get("href")) or ""
+        text = a.get_text(" ", strip=True)
+        title = _as_str(a.get("title")) or ""
+        url = ""
+        if href.startswith("#"):
+            info = _BIB_MAP.get(href) or {}
+            url = info.get("url") or ""
+            title = re.sub(r",\s*\d{4}[a-z]?\s*$", "", info.get("title") or "").strip() or title
+        elif href.startswith(("http://", "https://")):
+            url = href
+        if url and text:
+            link = f'[{text}]({url} "{title}")' if title else f"[{text}]({url})"
+            a.replace_with(NavigableString(link))
+        elif text:
+            a.replace_with(NavigableString(text))
+        else:
+            a.decompose()
+    for tag in table.find_all(True):
+        if tag is table:
+            continue
+        if tag.has_attr("id"):
+            del tag["id"]
+
+
+def _normalize_cell_styles(table: Tag) -> None:
+    """归一化 cell/span 的内联样式：``--ltx-bg-color`` → ``background-color``。
+
+    LaTeXML 用 CSS 自定义属性传递单元格底色（``style="--ltx-bg-color:#EFEFEF;"``），
+    单独定义的自定义属性在 markdown 渲染器里不产生任何视觉效果，只是噪声；
+    换成标准属性后颜色语义就能真正渲染出来（2026-10 审计：T6 有 198 处）。
+    其余排版类属性（padding/vertical-align/border-*）对 markdown 无意义，删除。
+    """
+    for tag in table.find_all(True):
+        if not tag.has_attr("style"):
+            continue
+        style = _as_str(tag.get("style")) or ""
+        style = re.sub(r"--ltx-bg-color\s*:", "background-color:", style, flags=re.IGNORECASE)
+        # 只保留颜色相关声明；其余排版声明（padding/vertical-align/width…）对 markdown 无意义
+        kept = [d.strip() for d in style.split(";")
+                if d.strip() and "color" in d.split(":")[0].lower()]
+        if kept:
+            tag["style"] = ";".join(kept) + ";"
+        else:
+            del tag["style"]
+
+
 def _clean_table_html(table: Tag) -> None:
     """净化「HTML 直出」表格：映射语义标签 + 清除 ltx_* 装饰类名。
 
@@ -2389,6 +2619,8 @@ def _clean_table_html(table: Tag) -> None:
       * 其余 ltx_* 类名（ltx_td/ltx_align_center/ltx_text/ltx_border_t…）全部删除；
       * 清掉因此失去全部属性的空 <span> 包装，减少无意义标签。
     """
+    _math_to_markdown_in_table(table)
+    _sanitize_table_links(table)
     for span in table.find_all("span"):
         cls = span.get("class") or []
         bold = "ltx_font_bold" in cls
@@ -2417,10 +2649,15 @@ def _clean_table_html(table: Tag) -> None:
             del tag["class"]
     # 清掉单元格上的纯排版 style（padding/vertical-align 等，对 markdown 无意义）；
     # 含 color 的样式保留（用于保留表格里的颜色标注）。
+    _normalize_cell_styles(table)
+    # 内层 span 与所在单元格背景色完全相同时，这层 span 只是重复声明，展开掉
     for cell in table.find_all(["td", "th"]):
-        style = _as_str(cell.get("style"))
-        if style and "color" not in style.lower():
-            del cell["style"]
+        cell_style = _as_str(cell.get("style"))
+        if not cell_style:
+            continue
+        for span in cell.find_all("span"):
+            if list(span.attrs) == ["style"] and _as_str(span.get("style")) == cell_style:
+                span.unwrap()
     for _ in range(3):
         changed = False
         for span in table.find_all("span"):
@@ -2469,7 +2706,7 @@ def _collect_table_text(tbl: Tag) -> str:
 
     # 剔除 LaTeX 横线装饰行（\toprule / \midrule / \bottomrule），避免表格首尾/中间
     # 出现空白行；剔除后再重新判定复杂度，可能让更多简单表格走 markdown 路径。
-    for tr in list(html_table.find_all("tr")):
+    for tr in _table_rows(html_table):
         if _is_rule_row(tr):
             tr.decompose()
     # 横线行被移除后可能留下空的 <thead>/<tfoot>，一并清理避免渲染器产生空行。
@@ -2479,7 +2716,7 @@ def _collect_table_text(tbl: Tag) -> str:
 
     # 复杂度先判定：任一 cell 含 colspan>1 或 rowspan>1 → HTML 路径。
     has_complex = False
-    for cell in html_table.find_all(["td", "th"]):
+    for cell in [c for tr in _table_rows(html_table) for c in _row_cells(tr)]:
         try:
             cs = int(_as_str(cell.get("colspan")) or 1)
         except (ValueError, TypeError):
@@ -2536,9 +2773,9 @@ def _collect_table_text(tbl: Tag) -> str:
         # 仅看第一行不够：Table 6（Monocular depth）的第一行只有 8 列，但实际表格
         # 后续行扩展到 12 列，整体仍会溢出视口。
         col_count = 0
-        for tr in html_table.find_all("tr"):
+        for tr in _table_rows(html_table):
             row_cols = 0
-            for c in tr.find_all(["td", "th"]):
+            for c in _row_cells(tr):
                 try:
                     row_cols += int(_as_str(c.get("colspan")) or 1)
                 except (ValueError, TypeError):
@@ -2587,11 +2824,11 @@ def _collect_table_text(tbl: Tag) -> str:
     # 第一遍：解析每行 cells + 标记表头 + 统计 max_cols（取所有非分组行中 colspan=1 cell 数最大值）
     raw_rows: list[tuple[list[tuple[str, int, int]], bool]] = []
     max_cols = 0
-    for tr in html_table.find_all("tr"):
+    for tr in _table_rows(html_table):
         cls = " ".join(tr.get("class") or [])
         is_header = "ltx_thead" in cls or "ltx_row_header" in cls
         row: list[tuple[str, int, int]] = []
-        for td in tr.find_all(["td", "th"]):
+        for td in _row_cells(tr):
             text = _cell_text(td)
             cs = max(int(_as_str(td.get("colspan")) or 1), 1)
             rs = max(int(_as_str(td.get("rowspan")) or 1), 1)
@@ -2920,10 +3157,18 @@ def _append_table(tbl: Tag, blocks: list[Block]) -> None:
     # 后续多张表被吞掉。遇到这种结构时分别处理每个 panel。
     panels = tbl.find_all("figure", class_="ltx_figure_panel", recursive=True)
     if len(panels) > 1:
+        emitted = 0
         for panel in panels:
             # panel 内若有真正的 <table>，当作独立表处理；否则视为空容器跳过
             if panel.find("table") is not None:
+                before = len(blocks)
                 _append_table(panel, blocks)
+                emitted += len(blocks) - before
+        # 外层总标题（"Table 9: …"）不属于任何单个 panel，必须单独补一次，
+        # 否则只剩 (a)(b)(c) 三个子标题、读者不知道这是哪张表。顺序在各子表之后，
+        # 与"表注置于表下方"的惯例一致。
+        if emitted:
+            _append_caption_block(tbl, blocks)
         return
     # 单面板：panel 本身就是 table，递归回来后 tbl 不再含 figure_panel，
     # 正常走下面逻辑即可。
@@ -2931,6 +3176,10 @@ def _append_table(tbl: Tag, blocks: list[Block]) -> None:
     caption = tbl.find(class_="ltx_caption")
     cap_text = _rich_text(caption) if caption else ""
     table_md = _collect_table_text(tbl)
+    # 完全空的 <table>（LaTeXML 偶尔为版面留白生成一个空 ltx_tabular）不应产出
+    # 一个只有占位符 "(表格)" 的块，否则正文里会凭空多出一行垃圾。
+    if not table_md and not cap_text.strip() and not tbl.get_text(strip=True):
+        return
     # raw 同时保留表格结构与 caption，便于翻译与最终输出。
     # 学术规范：表说明（表注）置于表格下方。
     raw_parts = []

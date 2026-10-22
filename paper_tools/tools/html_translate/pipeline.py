@@ -21,7 +21,7 @@ from ...core.glossary import Glossary, KEEP_AS_IS, Term, WRONG_VARIANT_MAP
 from ...core.translator import LLMTranslator, TABLE_UNTRANSLATABLE_MARKER
 from ...core.user_io import confirm_overwrite
 from ...logging_setup import get_logger
-from .parser import Block
+from .parser import Block, _row_cells, _table_rows
 from .sources import detect_source, parse_arxiv_id  # noqa: F401  (parse_arxiv_id 保留导出)
 
 logger = get_logger()
@@ -1166,11 +1166,14 @@ def _translate_html_table(
     if table is None:
         return table_html
 
-    rows = table.find_all("tr", recursive=False)
+    # 注意：<tr> 位于 <thead>/<tbody> 之下，recursive=False 永远取不到任何行，
+    # 曾导致 HTML 路径的复杂表格在译文里整表保持英文。这里取属于本表的行，
+    # 同时排除单元格内嵌套表格（多行表头）的行。
+    rows = _table_rows(table)
     translatable_cells: list[tuple[int, int, Tag]] = []
     placeholder_to_text: dict[str, str] = {}
     for ri, row in enumerate(rows):
-        cells = row.find_all(["td", "th"], recursive=False)
+        cells = _row_cells(row)
         for ci, cell in enumerate(cells):
             inner_text = cell.get_text(" ", strip=True)
             if not _cell_is_translatable(inner_text):
