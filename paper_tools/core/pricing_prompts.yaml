@@ -24,7 +24,7 @@ user: |
       {
         "api_name": "deepseek-flash",
         "display_name": "DeepSeek-V4.1-Flash",
-        "aliases": ["deepseek-v4-flash", "deepseek-v4-flash-vision-exp"],
+        "aliases": ["deepseek-v4-flash"],
         "tiers": {
           "idle": {"cache_hit": 0.02, "cache_miss": 1.0, "output": 4.0},
           "peak": {"cache_hit": 0.04, "cache_miss": 2.0, "output": 8.0}
@@ -37,7 +37,7 @@ user: |
   1. 价格表中每个模型占一列，与表头「模型」行的列顺序一一对应；为每个模型输出一个 models 元素。
   2. api_name：填页面明确指示「可实际用于 API 调用」的模型名（通常在表头「模型」行，或脚注的「模型名请使用 xxx」）。若页面未指明，则取「模型版本」行名称转小写并用 - 连接。必须是小写 ASCII 模型名，不含空格与括号。
   3. display_name：「模型版本」行的官方名称（如 DeepSeek-V4.1-Flash）。
-  4. aliases：页面中提到的、仍然可调用或与之等价的其它模型名（例如脚注「旧模型名 deepseek-v4-flash、deepseek-v4-flash-vision-exp 仍可调用」中的两个名字），不含 api_name 自身；没有则为 []。
+  4. aliases：页面中提到的、仍然可调用或与之等价的其它模型名（例如脚注「旧模型名 deepseek-v4-flash 仍可调用」中的名字），不含 api_name 自身；没有则为 []。
   5. tiers 的键：页面区分「空闲时段 / 高峰时段」两档时用 idle 与 peak；只给一档时用 default。
   6. 每个 tier 含三类价格，单位人民币元/百万 tokens，只填数字（去掉「元」）：
      cache_hit = 输入·缓存命中；cache_miss = 输入·缓存未命中；output = 输出。

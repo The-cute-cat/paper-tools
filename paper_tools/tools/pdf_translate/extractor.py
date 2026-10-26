@@ -332,13 +332,9 @@ class VisionExtractor:
                 )
 
 
-# 视觉模型更名兼容：官方说明旧模型名 deepseek-v4-flash-vision-exp 的请求仍由
-# DeepSeek-V4.1-Flash（即 deepseek-flash）提供服务，因此更名前已缓存的逐页识别
-# 结果依然有效，不应因改名而全部重算。
-_VISION_MODEL_ALIASES = {
-    "deepseek-flash": "deepseek-v4-flash-vision-exp",
-    "deepseek-v4-flash-vision-exp": "deepseek-flash",
-}
+# 视觉模型的历史名（已停用）。更名前用它写入的逐页识别缓存键仍然接受，
+# 避免升级后整本 PDF 重算；新缓存一律按 settings.pdf_vision_model 计算。
+_LEGACY_VISION_MODELS = frozenset({"deepseek-v4-flash-vision-exp"})
 
 
 def _extraction_cache_keys(digest: str, page_number: int, carry: str,
@@ -350,8 +346,8 @@ def _extraction_cache_keys(digest: str, page_number: int, carry: str,
 
     * max_tokens 只限制失败响应，不影响一份已经完整并通过校验的结果，因此不应
       让调大上限导致前面所有成功页面失效（兼容参与哈希的旧版 16384 键）；
-    * 视觉模型更名（见 ``_VISION_MODEL_ALIASES``）：实际服务方是同一模型，因此
-      更名前用旧模型名写入的键也一并接受，避免整本 PDF 重算；
+    * 视觉模型更名（见 ``_LEGACY_VISION_MODELS``）：旧名已停用，但更名前用它
+      写入的键仍一并接受，避免整本 PDF 重算；
     * 旧版无 ``v2`` 前缀、但 max_tokens 参与哈希的键。
     """
     def key_of(model_name: str, limit: int | None = None,
@@ -366,9 +362,7 @@ def _extraction_cache_keys(digest: str, page_number: int, carry: str,
                        limit, page_text_hint, asset_ids]
         return hashlib.sha256(json.dumps(payload, ensure_ascii=False).encode()).hexdigest()
 
-    model_names = {settings.pdf_vision_model}
-    if alias := _VISION_MODEL_ALIASES.get(settings.pdf_vision_model):
-        model_names.add(alias)
+    model_names = {settings.pdf_vision_model} | _LEGACY_VISION_MODELS
 
     current = key_of(settings.pdf_vision_model)
     legacy: set[str] = set()

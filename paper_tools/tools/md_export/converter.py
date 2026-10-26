@@ -24,10 +24,12 @@
   - 后端可在 本地 mermaid-cli / 在线 mermaid.ink 之间选择（见 config 的
     PAPER_TOOLS_MD_MERMAID），渲染失败则回退为普通代码块，不中断转换。
 
+语法解析由 md_parser（markdown-it-py）负责，本模块只负责渲染。
+
 支持的语法：标题、段落（含行尾两空格硬换行）、有序/无序列表（两级嵌套）、
 任务列表 - [ ] / - [x]、GFM 表格（含列对齐 :--- / :--: / ---:）、引用块、
 围栏/缩进代码块、分隔线、行内样式（粗体/斜体/行内代码/链接/删除线）、
-HTML <img> 与 <br>、引用式链接 [text][ref]。
+HTML <img> 与 <br>、引用式链接 [text][ref]、脚注 [^1]。
 """
 
 from __future__ import annotations
@@ -44,58 +46,25 @@ from ...core.exporter import (
     _MONO_FONT_CANDIDATES,
     _find_font,
     _parse_table_rows,
-    _split_gfm_cells,
     _strip_inline,
 )
 from ...core.user_io import confirm_overwrite
 from ...core.math_render import render_math_to_png
 from ...core.diagram_render import diagram_kind, render_diagram_to_png
 from ...logging_setup import get_logger
+from .md_parser import Seg, _parse_inline, parse_markdown
 
 logger = get_logger()
 
 # ──────────────────────────────────────────────
-# 行内片段（inline segment）模型与解析
+# 解析后端（Markdown 语法解析见 md_parser.py）
 # ──────────────────────────────────────────────
 
-
-@dataclass
-class Seg:
-    """行内片段：kind ∈ text/code/math/img/br。"""
-    kind: str
-    text: str = ""          # 文本内容 / 公式 LaTeX 源码 / 图片 src
-    bold: bool = False
-    italic: bool = False
-    strike: bool = False
-    href: str = ""          # 链接目标（text 片段可能来自链接）
-    alt: str = ""           # 图片 alt
-    display: bool = False   # math 片段是否为 display 公式
-
-
-# 行内 token 正则（顺序即优先级；先匹配的起始位置优先）
-_TOKEN_RE = re.compile(
-    r"(?P<img>!\[(?P<img_alt>[^\]]*)\]\(\s*<?(?P<img_src>[^)\s]+)>?(?:\s+\"[^\"]*\")?\s*\))"
-    r"|(?P<himg><img\b[^>]*?>)"
-    r"|(?P<math_dd>\$\$(?!\s)(?P<mdd>[^$]+?)\$\$)"
-    r"|(?P<math_p>\\\((?P<mp>.+?)\\\))"
-    r"|(?P<math_b>\\\[(?P<mb>.+?)\\\])"
-    r"|(?P<math_i>\$(?!\s)(?P<mi>(?:[^$\n\\]|\\.)+?)\$(?!\d))"
-    r"|(?P<code>`(?P<code_t>[^`\n]+)`)"
-    r"|(?P<bold>\*\*(?P<bold_t>[^*\n]+?)\*\*|__(?P<bold_u>[^_\n]+?)__)"
-    r"|(?P<strike>~~(?P<strike_t>.+?)~~)"
-    r"|(?P<italic>\*(?P<it_t>[^*\n]+?)\*|(?<![0-9A-Za-z])_(?P<it_u>[^_\n]+?)_(?![0-9A-Za-z]))"
-    r"|(?P<link>\[(?P<link_t>[^\]]*)\]\((?P<link_h>[^)\s]+)\))"
-    r"|(?P<brtag><br\s*/?>)",
-    re.I,
-)
-
-# 残留的简单 HTML 标签清理（保留标签内文本）
-_HTML_TAG_RE = re.compile(
-    r"</?(?:b|i|em|strong|sub|sup|u|s|span|div|p|font|small|center|mark|kbd|code|a)\b[^>]*>",
-    re.I,
-)
-
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+# 以下两条供 portable 导出使用：它直接对源文本做定点替换，不经过语法解析
+_FENCE_RE = re.compile(r"^ {0,3}(```+|~~~+)\s*([A-Za-z0-9_+\-]*)\s*$")
+_REF_DEF_RE = re.compile(r"^ {0,3}\[([^\]]+)\]:\s*(\S+)")
 
 
 def _pdf_code_font(pdf, text: str) -> str:
@@ -124,328 +93,6 @@ _PDF_SYMBOL_MAP = str.maketrans({
 def _pdf_safe_text(text: str) -> str:
     """PDF 写入前的字形安全替换。"""
     return text.translate(_PDF_SYMBOL_MAP)
-
-
-def _clean_text(t: str) -> str:
-    return _HTML_TAG_RE.sub("", t)
-
-
-def _parse_inline(text: str, bold: bool = False, italic: bool = False,
-                  strike: bool = False, href: str = "") -> list[Seg]:
-    """把一行 Markdown 文本解析为行内片段列表（支持嵌套样式）。"""
-    segs: list[Seg] = []
-    pos = 0
-    for m in _TOKEN_RE.finditer(text):
-        if m.start() > pos:
-            segs.append(Seg("text", _clean_text(text[pos:m.start()]),
-                            bold, italic, strike, href))
-        pos = m.end()
-        g = m.groupdict()
-        if g["img"] is not None:
-            segs.append(Seg("img", g["img_src"], bold, italic, strike,
-                            alt=g["img_alt"] or ""))
-        elif g["himg"] is not None:
-            tag = g["himg"]
-            sm = re.search(r"src\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", tag, re.I)
-            am = re.search(r"alt\s*=\s*(\"[^\"]*\"|'[^']*')", tag, re.I)
-            src = sm.group(1).strip("\"'") if sm else ""
-            alt = am.group(1).strip("\"'") if am else ""
-            if src:
-                segs.append(Seg("img", src, bold, italic, strike, alt=alt))
-        elif g["math_dd"] is not None:
-            segs.append(Seg("math", g["mdd"].strip(), bold, italic, strike,
-                            display=True))
-        elif g["math_p"] is not None:
-            segs.append(Seg("math", g["mp"].strip(), bold, italic, strike))
-        elif g["math_b"] is not None:
-            segs.append(Seg("math", g["mb"].strip(), bold, italic, strike))
-        elif g["math_i"] is not None:
-            segs.append(Seg("math", g["mi"].strip(), bold, italic, strike))
-        elif g["code"] is not None:
-            segs.append(Seg("code", g["code_t"], bold, italic, strike))
-        elif g["bold"] is not None:
-            inner = g["bold_t"] if g["bold_t"] is not None else g["bold_u"]
-            segs.extend(_parse_inline(inner, True, italic, strike, href))
-        elif g["strike"] is not None:
-            segs.extend(_parse_inline(g["strike_t"], bold, italic, True, href))
-        elif g["italic"] is not None:
-            inner = g["it_t"] if g["it_t"] is not None else g["it_u"]
-            segs.extend(_parse_inline(inner, bold, True, strike, href))
-        elif g["link"] is not None:
-            segs.extend(_parse_inline(g["link_t"], bold, italic, strike,
-                                      g["link_h"]))
-        elif g["brtag"] is not None:
-            segs.append(Seg("br"))
-    if pos < len(text):
-        segs.append(Seg("text", _clean_text(text[pos:]), bold, italic, strike, href))
-    return segs
-
-
-# ──────────────────────────────────────────────
-# 块级结构解析
-# ──────────────────────────────────────────────
-
-_FENCE_RE = re.compile(r"^ {0,3}(```+|~~~+)\s*([A-Za-z0-9_+\-]*)\s*$")
-_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
-_HR_RE = re.compile(r"^ {0,3}([-*_])\s*(?:\1\s*){2,}$")
-_QUOTE_RE = re.compile(r"^ {0,3}>")
-_TABLE_SEP_RE = re.compile(r"^ {0,3}\|?[\s:\-|]+\|?\s*$")
-_LIST_RE = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$")
-_IMG_LINE_RE = re.compile(r"^ {0,3}!\[[^\]]*\]\([^)]+\)\s*$")
-_HTML_IMG_LINE_RE = re.compile(r"^ {0,3}<img\b", re.I)
-_REF_DEF_RE = re.compile(r"^ {0,3}\[([^\]]+)\]:\s*(\S+)")
-_REF_USE_RE = re.compile(r"(!?)\[([^\]]+)\]\[([^\]]*)\]")
-_ENV_BEGIN_RE = re.compile(
-    r"^ {0,3}\\begin\{(equation\*?|align\*?|gather\*?|eqnarray\*?|multline\*?)\}")
-_DISPLAY_DOLLAR_RE = re.compile(r"^ {0,3}\$\$")
-_HTML_BLOCK_RE = re.compile(r"^ {0,3}<(?:div|table|figure|details|sup|sub)\b", re.I)
-
-
-def _apply_refs(text: str, refmap: dict[str, str]) -> str:
-    """把引用式链接/图片 [text][ref] 展开为 [text](url)。"""
-    def _sub(m: re.Match) -> str:
-        bang, label, ref = m.group(1), m.group(2), m.group(3)
-        key = (ref.strip() or label).lower()
-        url = refmap.get(key)
-        if url:
-            return f"{bang}[{label}]({url})"
-        return m.group(0)
-    return _REF_USE_RE.sub(_sub, text)
-
-
-def _is_block_start(line: str) -> bool:
-    s = line.lstrip(" ")
-    return bool(
-        _FENCE_RE.match(line) or _HEADING_RE.match(line) or _HR_RE.match(line)
-        or _QUOTE_RE.match(line) or _DISPLAY_DOLLAR_RE.match(line)
-        or _ENV_BEGIN_RE.match(line) or _LIST_RE.match(line)
-        or _IMG_LINE_RE.match(line) or _HTML_IMG_LINE_RE.match(line)
-        or s.startswith("\\[") or s.startswith("|")
-    )
-
-
-def _join_paragraph(parts: list[tuple[str, bool]]) -> str:
-    """段落合并：CJK 相邻不加空格，否则加空格；上一行行尾两空格 → <br>。"""
-    out = ""
-    for idx, (ln, prev_hard) in enumerate(parts):
-        if idx == 0:
-            out = ln
-            continue
-        if parts[idx - 1][1]:  # 上一行以两个空格结尾 = 硬换行
-            out += "<br>" + ln
-        elif _CJK_RE.search(out[-1]) and _CJK_RE.search(ln[0]):
-            out += ln
-        else:
-            out += " " + ln
-    return out
-
-
-_TASK_RE = re.compile(r"^\[([ xX])\]\s+(.*)$")
-
-
-def _parse_table_aligns(sep_line: str, ncols: int) -> list[str]:
-    """从 GFM 分隔行解析各列对齐：:--- 左 / :--: 居中 / ---: 右。"""
-    cells = sep_line.strip().strip("|").split("|") if sep_line.strip() else []
-    aligns: list[str] = []
-    for c in cells:
-        c = c.strip()
-        if c.startswith(":") and c.endswith(":"):
-            aligns.append("center")
-        elif c.endswith(":"):
-            aligns.append("right")
-        else:
-            aligns.append("left")
-    while len(aligns) < ncols:
-        aligns.append("left")
-    return aligns[:ncols]
-
-
-def parse_markdown(text: str) -> list[dict]:
-    """把 Markdown 文本解析为块级结构列表。
-
-    每个块为 dict，kind ∈ heading/para/code/math/image/quote/list/table/hr。
-    """
-    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-
-    # 预扫描引用式链接定义 [ref]: url
-    refmap: dict[str, str] = {}
-    kept: list[str] = []
-    for ln in lines:
-        m = _REF_DEF_RE.match(ln)
-        if m:
-            refmap[m.group(1).strip().lower()] = m.group(2)
-        else:
-            kept.append(ln)
-    lines = kept
-
-    blocks: list[dict] = []
-    i, n = 0, len(lines)
-    while i < n:
-        line = lines[i]
-        stripped = line.strip()
-        if not stripped:
-            i += 1
-            continue
-
-        # 围栏代码块
-        m = _FENCE_RE.match(line)
-        if m:
-            fence, lang = m.group(1), m.group(2)
-            close_re = re.compile(
-                r"^ {0,3}" + re.escape(fence[0]) + "{" + str(len(fence)) + r",}\s*$")
-            i += 1
-            buf: list[str] = []
-            while i < n and not close_re.match(lines[i]):
-                buf.append(lines[i])
-                i += 1
-            i += 1  # 跳过结束围栏（或 EOF）
-            blocks.append({"kind": "code", "text": "\n".join(buf), "lang": lang})
-            continue
-
-        # display 公式 $$ ... $$
-        if _DISPLAY_DOLLAR_RE.match(line):
-            if len(stripped) > 4 and stripped.endswith("$$"):
-                blocks.append({"kind": "math", "text": stripped.strip("$").strip()})
-                i += 1
-                continue
-            buf = []
-            i += 1
-            while i < n and not lines[i].strip().endswith("$$"):
-                buf.append(lines[i].strip())
-                i += 1
-            if i < n:
-                buf.append(lines[i].strip()[:-2].strip())
-                i += 1
-            blocks.append({"kind": "math", "text": "\n".join(buf).strip()})
-            continue
-
-        # display 公式 \[ ... \]
-        if stripped.startswith("\\["):
-            buf = [stripped]
-            if not stripped.endswith("\\]"):
-                i += 1
-                while i < n and not lines[i].rstrip().endswith("\\]"):
-                    buf.append(lines[i].strip())
-                    i += 1
-                if i < n:
-                    buf.append(lines[i].strip())
-                    i += 1
-            else:
-                i += 1
-            t = "\n".join(buf).strip()
-            t = t.removeprefix("\\[").removesuffix("\\]").strip()
-            blocks.append({"kind": "math", "text": t})
-            continue
-
-        # display 公式 \begin{equation} ... \end{equation}
-        m = _ENV_BEGIN_RE.match(line)
-        if m:
-            env = m.group(1)
-            buf = [stripped]
-            i += 1
-            while i < n and f"\\end{{{env}}}" not in lines[i]:
-                buf.append(lines[i].strip())
-                i += 1
-            if i < n:
-                buf.append(lines[i].strip())
-                i += 1
-            blocks.append({"kind": "math", "text": "\n".join(buf).strip()})
-            continue
-
-        # 标题
-        m = _HEADING_RE.match(line)
-        if m:
-            blocks.append({"kind": "heading", "level": len(m.group(1)),
-                           "text": _apply_refs(m.group(2), refmap)})
-            i += 1
-            continue
-
-        # 分隔线
-        if _HR_RE.match(line):
-            blocks.append({"kind": "hr"})
-            i += 1
-            continue
-
-        # 引用块
-        if _QUOTE_RE.match(line):
-            buf = []
-            while i < n and (_QUOTE_RE.match(lines[i]) or
-                             (lines[i].strip() and buf and not _is_block_start(lines[i]))):
-                buf.append(re.sub(r"^ {0,3}>\s?", "", lines[i]))
-                i += 1
-            blocks.append({"kind": "quote", "children": parse_markdown("\n".join(buf))})
-            continue
-
-        # GFM 表格（首行 |...|，次行分隔行，支持列对齐）
-        if stripped.startswith("|") and i + 1 < n \
-                and _TABLE_SEP_RE.match(lines[i + 1].strip()) \
-                and "-" in lines[i + 1]:
-            rows = []
-            while i < n and lines[i].strip().startswith("|"):
-                rows.append(lines[i].strip())
-                i += 1
-            sep = rows[1] if len(rows) > 1 else ""
-            ncols = max(len(_split_gfm_cells(r)) for r in rows)
-            blocks.append({"kind": "table", "rows": rows,
-                           "aligns": _parse_table_aligns(sep, ncols)})
-            continue
-
-        # 列表（支持两级嵌套、任务列表、单行续行）
-        m = _LIST_RE.match(line)
-        if m:
-            items = []
-            while i < n:
-                mm = _LIST_RE.match(lines[i])
-                if mm:
-                    depth = min(2, len(mm.group(1)) // 2)
-                    text = _apply_refs(mm.group(3), refmap)
-                    task: bool | None = None
-                    tm = _TASK_RE.match(text)
-                    if tm:
-                        task = tm.group(1).lower() == "x"
-                        text = tm.group(2)
-                    items.append({
-                        "depth": depth,
-                        "ordered": mm.group(2)[0].isdigit(),
-                        "task": task,
-                        "text": text,
-                    })
-                    i += 1
-                elif (lines[i].strip() and items
-                      and not _is_block_start(lines[i])
-                      and len(lines[i]) - len(lines[i].lstrip(" ")) >= 2):
-                    items[-1]["text"] += " " + lines[i].strip()
-                    i += 1
-                else:
-                    break
-            blocks.append({"kind": "list", "items": items})
-            continue
-
-        # 独立成行的图片 / HTML img
-        if _IMG_LINE_RE.match(line) or _HTML_IMG_LINE_RE.match(line):
-            for seg in _parse_inline(stripped):
-                if seg.kind == "img":
-                    blocks.append({"kind": "image", "src": seg.text, "alt": seg.alt})
-            i += 1
-            continue
-
-        # HTML 块级标签：跳过标签行本身（内容按普通文本继续处理）
-        if _HTML_BLOCK_RE.match(line):
-            i += 1
-            continue
-
-        # 段落：收集到空行或块级起始（行尾两空格 = 硬换行）
-        para_parts: list[tuple[str, bool]] = [(stripped, line.endswith("  "))]
-        i += 1
-        while i < n and lines[i].strip() and not _is_block_start(lines[i]) \
-                and not _HTML_BLOCK_RE.match(lines[i]):
-            para_parts.append((lines[i].strip(), lines[i].endswith("  ")))
-            i += 1
-        blocks.append({"kind": "para",
-                       "text": _apply_refs(_join_paragraph(para_parts), refmap)})
-
-    return blocks
-
 
 # ──────────────────────────────────────────────
 # 图片与公式的本地化准备
