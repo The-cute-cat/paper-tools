@@ -157,6 +157,45 @@ class Block:
     meta: dict = field(default_factory=dict)
 
 
+# 导言区专用命令：LaTeXML 解析不了时会把它们包成 <span class="ltx_ERROR undefined">，
+# 并把整段参数原样当正文输出。这些是排版配置，不是论文内容。
+_PREAMBLE_CMD_RE = re.compile(
+    r"\\(?:"
+    r"usepackage|RequirePackage|documentclass|"
+    r"newcommand|renewcommand|providecommand|DeclareMathOperator|"
+    r"def|gdef|edef|xdef|let|"
+    r"lstset|lstnewenvironment|lstdefinelanguage|lstinputlisting|"
+    r"geometry|hypersetup|graphicspath|captionsetup|"
+    r"definecolor|colorlet|"
+    r"newenvironment|renewenvironment|"
+    r"setlength|addtolength|setcounter|"
+    r"bibliographystyle|bibliography|"
+    r"pagestyle|thispagestyle|linespread|"
+    r"newtheorem|theoremstyle|crefname|Crefname"
+    r")\b")
+
+
+def _strip_preamble_leaks(soup: "BeautifulSoup") -> None:
+    """删除 LaTeXML 没能解析、被当成正文塞进文档的导言区命令段落。
+
+    ar5iv 对 ``\\lstset`` / ``\\lstnewenvironment`` 这类**导言区配置**不做处理，
+    会把整段参数当作普通段落挂在文档开头：
+
+        <p class="ltx_p">2024 <span class="ltx_ERROR undefined">\\lstset</span>
+        escapeinside=(**), numbers=left, xleftmargin=5.0ex, …</p>
+
+    这段配置对读者毫无意义，还会被翻译器当成正文翻译（2026-10 定位：
+    2502.11054 的 lSTlisting 配置整段出现在 Abstract 之前）。只在段落里出现
+    **导言区命令**时才整段丢弃，正文里偶发的单个未定义命令保持原样。
+    """
+    for para in soup.find_all(class_="ltx_p"):
+        errors = para.find_all(class_="ltx_ERROR")
+        if not errors:
+            continue
+        if any(_PREAMBLE_CMD_RE.search(err.get_text()) for err in errors):
+            para.decompose()
+
+
 def _assign_html_ids(soup: "BeautifulSoup") -> None:
     """给每个可翻译文本容器打 data-zh-id。
 
@@ -590,8 +629,24 @@ def _fix_math_spacing(text: str) -> str:
     return "".join(out)
 
 
-def _rich_text(tag: Tag) -> str:
-    """把含行内公式/强调/链接的片段转为保留公式的 markdown 文本。"""
+_FG_COLOR_RE = re.compile(
+    r"(?:--ltx-fg-color|(?<![-a-zA-Z])color)\s*:\s*(#[0-9A-Fa-f]{3,8}|[a-zA-Z]+)")
+
+
+def _fg_color_of(tag: Tag) -> str:
+    """取元素的前景色（LaTeXML 写作 ``--ltx-fg-color``，HTML 直出表格里是 ``color``）。"""
+    style = _as_str(tag.get("style")) or ""
+    m = _FG_COLOR_RE.search(style)
+    return m.group(1) if m else ""
+
+
+def _rich_text(tag: Tag, keep_color: bool = False) -> str:
+    """把含行内公式/强调/链接的片段转为保留公式的 markdown 文本。
+
+    keep_color=True 时把 ``--ltx-fg-color`` 转成 ``<span style="color:…">``：
+    表格 cell 里常靠前景色标注「哪些词是同义替换」（如 Table 5 的案例对比），
+    纯文本提取会把这层信息抹掉。默认关闭，避免正文被大量灰色/彩色 span 淹没。
+    """
     parts: list[str] = []
 
     def walk(node: Tag | NavigableString) -> None:
@@ -733,6 +788,15 @@ def _rich_text(tag: Tag) -> str:
             for c in node.children:
                 _walk_child(c)
             parts.append("\n")
+            return
+        color = _fg_color_of(node) if keep_color else ""
+        if color:
+            start = len(parts)
+            for c in node.children:
+                _walk_child(c)
+            inner = "".join(parts[start:])
+            if inner.strip():
+                parts[start:] = [f'<span style="color:{color};">{inner}</span>']
             return
         if "ltx_emph" in cls or "ltx_font_italic" in cls or name in ("em", "i"):
             parts.append("*")
@@ -1064,6 +1128,10 @@ def parse_arxiv_html(
                 if _norm_title(h.get_text()) == html_title:
                     h["class"] = ["ltx_title", "ltx_title_document"]
                     break
+
+    # 先清掉 LaTeXML 解析失败的导言区命令段（\lstset 等），否则它们会以
+    # 整段配置文本的形式出现在正文最前面。
+    _strip_preamble_leaks(soup)
 
     # 给每个"可翻译文本容器"打一个稳定的 data-zh-id，供翻译后回写 HTML
     # （生成 .zh.html，保留原 HTML 的表格合并/颜色/图片结构）。
@@ -2283,6 +2351,9 @@ def _append_listing(fig: Tag, blocks: list[Block]) -> None:
     同时行号与代码左右对齐、可读性好。代码内容中的 `|` 会转义避免破坏表格结构。
     caption 置于表格**上方**：算法题注在源 HTML 中本就位于块顶（ltx_framed_top），
     此前被搬到块后，与原文顺序相反（2026-10 审计）。
+
+    嵌套层级用 `&nbsp;` 前缀表达（见 :func:`_split_listing_indent`）：GFM 表格会
+    trim 普通的前导空格，只有 NBSP 能在 Markdown / Typora / docx 中存活下来。
     """
     # --- caption ---
     caption = fig.find("figcaption") or fig.find(class_="ltx_caption")
@@ -2356,6 +2427,28 @@ def _append_listing(fig: Tag, blocks: list[Block]) -> None:
     ))
 
 
+# LaTeXML 的 algpseudocode 用「EN SPACE + NBSP + EM SPACE」表示**一层**缩进，
+# 视觉宽度约 3 个空格。str.strip() 会把这类 Unicode 空白整段吃掉，导致伪代码
+# 失去嵌套层级；GFM 表格又会 trim 普通前导空格，所以这里换算成 &nbsp; 前缀
+# （Markdown-it / Typora / docx 都会把它还原成一个不断行的空格）。
+_LISTING_INDENT_PROBE = "\u2002\xa0\u2003 \t"
+_LISTING_NBSP_PER_DEPTH = 4
+
+
+def _split_listing_indent(text: str) -> tuple[int, str]:
+    """把行首缩进量化为层数，返回 (层数, 去掉缩进后的文本)。"""
+    i = 0
+    while i < len(text) and text[i] in _LISTING_INDENT_PROBE:
+        i += 1
+    head = text[:i]
+    # 只认 LaTeXML 的宽空白（EN / EM SPACE）：纯 ASCII 空格沿用原来的压缩行为，
+    # 避免把普通代码行里零星的 1–2 个空格放大成一整层缩进
+    if not head or not any(c in "\u2002\u2003" for c in head):
+        return 0, text
+    # 一个缩进单元是 3 个字符，取整后至少一层
+    return max(1, round(len(head) / 3)), text[i:]
+
+
 def _listing_line_text(tag: Tag) -> str:
     """将 listing 行内容转为保留 inline 数学公式的纯文本（不用 _rich_text 以避免 ** 等标记）。"""
     parts: list[str] = []
@@ -2388,9 +2481,12 @@ def _listing_line_text(tag: Tag) -> str:
 
     walk(tag)
     text = "".join(parts)
+    depth, text = _split_listing_indent(text)
     # 压缩多余空白（代码块中不需要中英文间距调整）
-    text = re.sub(r"[ \t]+", " ", text)
-    return text.strip()
+    text = re.sub(r"[ \t]+", " ", text).strip()
+    if not text:
+        return ""
+    return "&nbsp;" * (_LISTING_NBSP_PER_DEPTH * depth) + text
 
 
 def _own_table_of(node: Tag) -> Optional[Tag]:
@@ -2492,7 +2588,7 @@ def _span_tabular_to_markdown(tab: Tag) -> str:
             while col in pending:
                 row[col] = pending[col][1]
                 col += 1
-            text = _rich_text(cell).replace("\n", " ").strip()
+            text = _rich_text(cell, keep_color=True).replace("\n", " ").strip()
             if text:
                 empty = False
             try:
@@ -2625,9 +2721,10 @@ def _sanitize_table_links(table: Tag) -> None:
 
 
 def _normalize_cell_styles(table: Tag) -> None:
-    """归一化 cell/span 的内联样式：``--ltx-bg-color`` → ``background-color``。
+    """归一化 cell/span 的内联样式：``--ltx-bg-color`` / ``--ltx-fg-color`` → 标准属性。
 
-    LaTeXML 用 CSS 自定义属性传递单元格底色（``style="--ltx-bg-color:#EFEFEF;"``），
+    LaTeXML 用 CSS 自定义属性传递单元格底色与文字颜色
+    （``style="--ltx-bg-color:#EFEFEF;"`` / ``--ltx-fg-color:#128D15;``），
     单独定义的自定义属性在 markdown 渲染器里不产生任何视觉效果，只是噪声；
     换成标准属性后颜色语义就能真正渲染出来（2026-10 审计：T6 有 198 处）。
     其余排版类属性（padding/vertical-align/border-*）对 markdown 无意义，删除。
@@ -2637,6 +2734,7 @@ def _normalize_cell_styles(table: Tag) -> None:
             continue
         style = _as_str(tag.get("style")) or ""
         style = re.sub(r"--ltx-bg-color\s*:", "background-color:", style, flags=re.IGNORECASE)
+        style = re.sub(r"--ltx-fg-color\s*:", "color:", style, flags=re.IGNORECASE)
         # 只保留颜色相关声明；其余排版声明（padding/vertical-align/width…）对 markdown 无意义
         kept = [d.strip() for d in style.split(";")
                 if d.strip() and "color" in d.split(":")[0].lower()]
@@ -2826,7 +2924,7 @@ def _collect_table_text(tbl: Tag) -> str:
     # ===== 后续是简单表格 markdown 路径（保持原行为）=====
 
     def _cell_text(cell_node: Tag) -> str:
-        rich = _rich_text(cell_node)
+        rich = _rich_text(cell_node, keep_color=True)
         # 把行内换行折叠成单个 "\n"（_rich_text 已把相邻 \n 压成单个），
         # 然后再按行去除首尾空白后用 "<br>" 拼接 —— 这样表格 cell 里的
         # 多段对话（ar5iv 常用 <span class="ltx_p"> 模拟多行）能保留可读

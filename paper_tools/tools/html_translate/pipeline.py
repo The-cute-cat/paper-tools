@@ -22,7 +22,7 @@ from ...core.glossary import Glossary, KEEP_AS_IS, Term, WRONG_VARIANT_MAP
 from ...core.translator import LLMTranslator, TABLE_UNTRANSLATABLE_MARKER
 from ...core.user_io import confirm_overwrite
 from ...logging_setup import get_logger
-from .parser import Block, _row_cells, _table_rows
+from .parser import Block, _fg_color_of, _row_cells, _table_rows
 from .sources import detect_source, parse_arxiv_id  # noqa: F401  (parse_arxiv_id 保留导出)
 
 logger = get_logger()
@@ -1160,6 +1160,47 @@ def _cell_placeholder(ri: int, ci: int) -> str:
     return f"@@TCELL_{ri}_{ci}@@"
 
 
+def _cell_uniform_color(cell: Tag) -> str:
+    """cell 内所有可见文本同属一个前景色时返回该颜色，否则返回空串。
+
+    翻译前会把 cell 清空成纯文本占位符（见 ``_translate_html_table``），cell 内
+    的着色 span 随之消失——Table 5「用颜色突出差异」正是靠它。整格同色的情况
+    可以在回填时重新包一次；一格内多种颜色的局部标注无法映射到译文词序，
+    保持无着色。
+    """
+    colors: set[str] = set()
+    for text_node in cell.find_all(string=True):
+        if not str(text_node).strip():
+            continue
+        node = text_node.parent
+        color = ""
+        while node is not None and node is not cell:
+            color = color or _fg_color_of(node)
+            node = node.parent
+        colors.add(color)
+        if len(colors) > 1:
+            return ""
+    return next(iter(colors)) if len(colors) == 1 else ""
+
+
+def _cell_colored_snippets(cell: Tag) -> list[tuple[str, str]]:
+    """收集 cell 内的局部着色片段 ``[(颜色, 原文文本), ...]``。
+
+    与整格同色不同，局部着色（如 ``CipherChat-<span color>Turbo</span>``）无法
+    整体重包。回填时改按原文文本在译文里定位：模型名、专名这类通常原样保留，
+    能唯一定位就重新包上；被翻译掉的片段无法对齐词序，保持无着色（不猜）。
+    """
+    snippets: list[tuple[str, str]] = []
+    for span in cell.find_all(True):
+        color = _fg_color_of(span)
+        if not color:
+            continue
+        text = span.get_text(" ", strip=True)
+        if text:
+            snippets.append((color, text))
+    return snippets
+
+
 def _translate_html_table(
     table_html: str,
     translator: LLMTranslator,
@@ -1188,6 +1229,10 @@ def _translate_html_table(
     rows = _table_rows(table)
     translatable_cells: list[tuple[int, int, Tag]] = []
     placeholder_to_text: dict[str, str] = {}
+    # 整格统一着色需要在回填时重新包回来（cell 已被清空成纯文本占位符）
+    placeholder_to_color: dict[str, str] = {}
+    # 局部着色片段（方法名/专名等），回填时按原文文本在译文里定位
+    placeholder_to_snippets: dict[str, list[tuple[str, str]]] = {}
     for ri, row in enumerate(rows):
         cells = _row_cells(row)
         for ci, cell in enumerate(cells):
@@ -1197,6 +1242,10 @@ def _translate_html_table(
             placeholder = _cell_placeholder(ri, ci)
             translatable_cells.append((ri, ci, cell))
             placeholder_to_text[placeholder] = inner_text
+            if color := _cell_uniform_color(cell):
+                placeholder_to_color[placeholder] = color
+            elif snippets := _cell_colored_snippets(cell):
+                placeholder_to_snippets[placeholder] = snippets
 
     if not placeholder_to_text:
         return table_html
@@ -1235,10 +1284,19 @@ def _translate_html_table(
         translated.extend([""] * (translatable_count - len(translated)))
 
     ordered_ph = placeholders[: len(translated)]
-    mapping = {
-        ph: translated[idx] if translated[idx].strip() else placeholder_to_text[ph]
-        for idx, ph in enumerate(ordered_ph)
-    }
+    mapping: dict[str, str] = {}
+    for idx, ph in enumerate(ordered_ph):
+        line = translated[idx].strip() or placeholder_to_text[ph]
+        # 翻译时 cell 被清空成纯文本，原先包裹文字的颜色 span 会一起丢失，这里补回：
+        # 整格同色的整体重包；局部着色的按原文片段在译文里唯一定位后再包。
+        if color := placeholder_to_color.get(ph):
+            line = f'<span style="color:{color};">{line}</span>'
+        else:
+            for snippet_color, snippet in placeholder_to_snippets.get(ph, []):
+                if line.count(snippet) == 1:
+                    line = line.replace(
+                        snippet, f'<span style="color:{snippet_color};">{snippet}</span>')
+        mapping[ph] = line
     for ph, line in mapping.items():
         skeleton = skeleton.replace(ph, line)
 

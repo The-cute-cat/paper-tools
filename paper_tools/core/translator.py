@@ -74,6 +74,21 @@ _REFERENCES_RE = re.compile(r"\[(\d+(?:[\s,\-\u2013\u2014]\d+)*)\]")
 # 渲染成 [作者 年份](搜索引擎url "论文名")；正是这类链接需要被保护。保护全部链接
 # 而非仅 #bib 锚点，可同时覆盖搜索引擎链接与正文普通链接。
 _LINK_RE = re.compile(r"\[[^\]\[\n]*?\]\((?:[^()\n]|\([^()\n]*\))*\)")
+# 行内 HTML 标签（<span style="color:#128D15;">、</span>、<strong>、<br/> 等）。
+# LaTeXML 的表格靠这些标签表达「哪些词是同义替换」（着色 / 加粗），模型翻译时
+# 经常把标签改写、配错对或直接删掉，轻则颜色丢失，重则 markdown 结构损坏。
+# 与引用、链接共用 references 表和 ⟦REF_Xn⟧ 占位符，restore 时原样还原。
+# 只在公式/引用/链接保护之后执行，避免吞掉 $a<b$ 里的比较符。
+#
+# 标签名走白名单、属性必须符合 name / name="value" 形态：否则正文里 `a<b 且 c>d`
+# 这类裸比较符会被误认成 <b 且 c>，凭空多出占位符（内容不会丢，但会干扰模型）。
+_HTML_TAG_ATTRS = r"""(?:\s+[A-Za-z_:][-A-Za-z0-9_:.]*(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s<>"']+))?)*"""
+_HTML_TAG_RE = re.compile(
+    r"</?(?:a|b|br|code|del|div|em|figcaption|figure|font|hr|i|img|ins|kbd|li|mark|"
+    r"ol|p|pre|s|small|span|strong|sub|sup|table|tbody|td|th|thead|tr|u|ul)\b"
+    + _HTML_TAG_ATTRS + r"\s*/?>",
+    re.IGNORECASE,
+)
 # 使用 ⟦MATH_n⟧ / ⟦REF_Xn⟧ 而非 <MATH_n>，避免被模型误当成 HTML/Markdown 标签而吃掉或改写。
 # 公式占位符的 n 为**全局唯一** id（跨所有块/合并组单调递增），而非"单块内序号"——
 # 这样在合并组（translate_group）场景下，不同子块的公式占位符不会因各自从 0 编号而冲突。
@@ -268,11 +283,12 @@ class LLMTranslator:
         合并组单调递增，由模块级计数器分配），``latex`` 为原始 LaTeX 源码，
         ``display`` 标记是否为行间公式（True=行间/$$，False=行内/$）。
 
-        引用表为 ``{id: 原文引用串, ...}``：``id`` 同样是**全局唯一**编号
-        （跨所有块/合并组单调递增），``原文引用串`` 为被保护的 ``[18]``、
-        ``[Kuhn et al., 2021](#bib.xxx)`` 等原文。这样在合并组（translate_group）
-        场景下多个子块的引用占位符互不重复，模型不会错位搬移，restore 时按 id
-        精确还原。
+        引用表为 ``{id: 原文片段, ...}``：``id`` 同样是**全局唯一**编号
+        （跨所有块/合并组单调递增），``原文片段`` 为被保护的 ``[18]``、
+        ``[Kuhn et al., 2021](#bib.xxx)`` 等引用/链接，以及表格 cell 里的行内
+        HTML 标签（``<span style="color:#128D15;">`` 这类着色、``<strong>`` 加粗）——
+        它们都是**不应被翻译改写的字面量**。这样在合并组（translate_group）场景下
+        多个子块的占位符互不重复，模型不会错位搬移，restore 时按 id 精确还原。
 
         公式表/引用表仅作为翻译时的"上下文"输入给模型（见 ``translate`` /
         ``translate_group`` 的 ``formulas`` 字段），帮助模型结合公式语义提升翻译
@@ -321,6 +337,9 @@ class LLMTranslator:
         # references 字典与 ⟦REF_Xn⟧ 占位符，restore 时原样还原，避免链接
         # （文献引用 / 普通链接）被 LLM 翻译改写而丢失。
         protected = _LINK_RE.sub(_sub_ref, protected)
+        # 行内 HTML 标签（见 _HTML_TAG_RE）。放在最后：此时公式、引用、链接都已
+        # 变成占位符，只剩真正的标签，不会把 $a<b$ 这类比较符当成标签吞掉。
+        protected = _HTML_TAG_RE.sub(_sub_ref, protected)
 
         # ── 防御性自检：占位符之外不应残留 $ ──
         cleaned = re.sub(r"⟦(?:MATH|REF)_\d+⟧", "", protected)
@@ -338,11 +357,12 @@ class LLMTranslator:
 
     @staticmethod
     def restore_math(text: str, formula_table: list[dict], references: Optional[dict[int, str]] = None) -> str:
-        """将 ⟦MATH_n⟧ 还原为公式，将 ⟦REF_Xn⟧ 还原为参考文献引用串。
+        """将 ⟦MATH_n⟧ 还原为公式，将 ⟦REF_Xn⟧ 还原为引用/链接/行内 HTML 标签。
 
         公式通过占位符中的全局 id 在 formula_table 中查表还原（公式本身未进入
-        模型，不会被改写）；引用通过全局 id 在 references 字典（id->原文）中查表
-        还原，天然支持跨块/合并组全局唯一，避免编号重复导致的错位残留。
+        模型，不会被改写）；引用与行内 HTML 标签通过全局 id 在 references 字典
+        （id->原文）中查表还原，天然支持跨块/合并组全局唯一，避免编号重复导致
+        的错位残留。
 
         同时对还原出的公式逐个做 KaTeX 兼容性清洗：原 arXiv PDF 源码可能
         包含 KaTeX 不支持/兼容性差的 LaTeX 命令（如 \\textsc{}——small caps，
